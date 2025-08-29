@@ -15,7 +15,7 @@ To maintain a healthy Sui network, Sui encourages the Sui community to bring up 
 Sui supports two types of snapshots:
 
 - **RocksDB snapshots** are a point-in-time view of a database store. This means that the snapshot keeps the state of the system at the moment it generates the snapshot, including non-pruned data, additional indices, and other data.
-- **Formal snapshots** are database agnostic with a minimalistic format, in other words they contain only the data necessary to restore a node to a valid state at the specified epoch, thus they have a much smaller storage footprint and are generally faster to restore from when compared to database snapshots. Formal snapshots are also supported natively by the Sui protocol. In this context, this means that we can cryptographically verify the contents of the formal snapshot against a commitment from the committee at the epoch we are restoring to. This verification happens automatically and by default during a Formal snapshot restore (unless explicitly bypassed). 
+- **Formal snapshots** are database agnostic with a minimalistic format. In other words, they contain only the data necessary to restore a node to a valid state at the specified epoch. Consequently, they have a much smaller storage footprint and are generally faster to restore from when compared to database snapshots. Formal snapshots are also supported natively by the Sui protocol. In this context, you can cryptographically verify the contents of the formal snapshot against a commitment from the committee at the epoch you are restoring to. This verification happens automatically and by default during a formal snapshot restore (unless explicitly bypassed). 
 
 :::info
 
@@ -24,7 +24,7 @@ Formal snapshots are not suitable for use if you are running an RPC node that do
 :::
 
 You can configure a full node snapshot to generate a state snapshot at the end of each epoch.
-A single full node can generate RocksDB snapshots, Formal snapshots, or both.
+A single full node can generate RocksDB snapshots, formal snapshots, or both.
 
 ## Formal snapshots
 
@@ -58,12 +58,12 @@ To restore from a RocksDB snapshot, follow these steps:
    ```
    - `--epoch`: The epoch that you want to download. Mysten Labs hosted buckets will only keep the last 90 epochs, you can check the most recent epoch on sui explorers like [suivision](https://suivision.xyz/) or [suiscan](https://suiscan.xyz/).
    - `--latest`: Rather than explicitly passing a epoch via `--epoch`, you can pass the `--latest` flag, which will automatically select the latest snapshot`
-   - `--network`: Network to download snapshot for. Defaults to "mainnet".
+   - `--network`: Network to download snapshot for. Defaults to `mainnet`.
    - `--path`: Path to snapshot directory on local filesystem.
    - `--no-sign-request`: If set, `--snapshot-bucket` and `--snapshot-bucket-type` are ignored, and a static Cloudflare R2 bucket is used.
    - `--snapshot-bucket`: Source snapshot bucket name, eg `mysten-mainnet-snapshots`. This cannot be used with `--no-sign-request`.
    - `--snapshot-bucket-type`: Snapshot bucket type. GCS and S3 currently supported. This cannot be used with `--no-sign-request`.
-   - `--skip-indexes`: Skips downloading the very large `indexes/` dir, used by jsonrpc on the fullnode
+   - `--skip-indexes`: Skips downloading the very large `indexes/` dir, used by jsonrpc on the full node
 
    The following environment variables are used if `--no-sign-request` is not set:
    * *AWS*: `AWS_SNAPSHOT_ACCESS_KEY_ID`, `AWS_SNAPSHOT_SECRET_ACCESS_KEY`, `AWS_SNAPSHOT_REGION`
@@ -81,12 +81,12 @@ When you restore a full node from a snapshot, write it to the path `/opt/sui/db/
 
 :::
 
-### Restoring using Formal snapshots
+### Restoring using formal snapshots
 
-To restore using a Formal snapshot, use the `sui-tool` binary. `sui-tool` can be downloaded along with other sui binaries.
+To restore using a formal snapshot, use the `sui-tool` binary. You can download `sui-tool` along with other `sui` binaries.
 See [Install Sui](../developer/getting-started/sui-install.mdx) for more details.
 
-The following steps can be used to restore a node from a Formal snapshot:
+The following steps can be used to restore a node from a formal snapshot:
 
 1. If it's running, stop the node.
 2. Run the command:
@@ -98,7 +98,7 @@ The following steps can be used to restore a node from a Formal snapshot:
    - `--epoch`: The epoch that you want to download. Mysten Labs hosted buckets will only keep the last 90 epochs, you can check the most recent epoch on sui explorers like [suivision](https://suivision.xyz/) or [suiscan](https://suiscan.xyz/).
    - `--latest`: Rather than explicitly passing a epoch via `--epoch`, you can pass the `--latest` flag, which will automatically select the latest snapshot`
    - `--genesis`: The path to the location of the network's `genesis.blob`.
-   - `--network`: Network to download snapshot for. Defaults to "mainnet".
+   - `--network`: Network to download snapshot for. Defaults to `mainnet`.
    - `--path`: Path to snapshot directory on local filesystem.
    - `--no-sign-request`: If set, `--snapshot-bucket` and `--snapshot-bucket-type` are ignored, and Cloudflare R2 is used.
    - `--snapshot-bucket`: Source snapshot bucket name, eg `mysten-mainnet-snapshots`. This cannot be used with `--no-sign-request`.
@@ -123,13 +123,18 @@ Mysten Labs hosts two tiers of snapshot storage access. **High throughput, Reque
 * These are currently hosted on Cloudflare R2, currently only in North America, but we plan on adding more regions soon.
 * Since the bucket is open to the internet, there's no need to provide any cloud credentials.
 
-### Bucket Names
+### Bucket names
+
 **S3**
+
 Testnet: `s3://mysten-testnet-snapshots/`, `s3://mysten-testnet-formal/`
+
 Mainnet: `s3://mysten-mainnet-snapshots/`,  `s3://mysten-mainnet-formal/`
 
 **GCS**
+
 Testnet: `gs://mysten-testnet-snapshots/`, `gs://mysten-testnet-formal/`
+
 Mainnet: `gs://mysten-mainnet-snapshots/`,  `gs://mysten-mainnet-formal/`
 
 ![Mysten Managed Snapshots](./images/mysten-cloud-snapshots.png "A diagram that shows the current architecture of Mysten snapshot availability")
@@ -165,7 +170,7 @@ Add an entry to the config file for `db-checkpoint-config`. Using Amazon's S3 se
    - `aws-region`: Region where bucket exists.
    - `object-store-connection-limit`: Number of simultaneous connections to the object store.
 
-### Enabling Formal snapshots
+### Enabling formal snapshots
 
  Add an entry to the config file for `state-snapshot-write-config`. Using Amazon's S3 service as an example:
    ```yaml
