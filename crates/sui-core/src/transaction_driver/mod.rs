@@ -22,10 +22,14 @@ use std::{
 
 use arc_swap::ArcSwap;
 use effects_certifier::*;
-use mysten_metrics::{monitored_future, TX_TYPE_SHARED_OBJ_TX, TX_TYPE_SINGLE_WRITER_TX};
+use mysten_metrics::{monitored_future, TxType};
 use parking_lot::Mutex;
 use sui_types::{
-    committee::EpochId, digests::TransactionDigest, messages_grpc::RawSubmitTxRequest,
+    committee::EpochId,
+    digests::TransactionDigest,
+    error::{SuiError, UserInputError},
+    messages_grpc::RawSubmitTxRequest,
+    transaction::TransactionDataAPI as _,
 };
 use tokio::{task::JoinSet, time::sleep};
 use tracing::instrument;
@@ -35,6 +39,7 @@ use crate::{
     authority_aggregator::AuthorityAggregator,
     authority_client::AuthorityAPI,
     quorum_driver::{reconfig_observer::ReconfigObserver, AuthorityAggregatorUpdatable},
+    transaction_driver::error::AggregatedRequestErrors,
     validator_client_monitor::{ValidatorClientMetrics, ValidatorClientMonitor},
 };
 use sui_config::NodeConfig;
@@ -107,7 +112,31 @@ where
         timeout_duration: Option<Duration>,
     ) -> Result<QuorumTransactionResponse, TransactionDriverError> {
         let tx_digest = request.transaction.digest();
-        let is_single_writer_tx = !request.transaction.is_consensus_tx();
+        let tx_type = if request.transaction.is_consensus_tx() {
+            TxType::SharedObject
+        } else {
+            TxType::SingleWriter
+        };
+
+        let gas_price = request.transaction.transaction_data().gas_price();
+        let reference_gas_price = self.authority_aggregator.load().reference_gas_price;
+        let amplification_factor = gas_price / reference_gas_price.max(1);
+        if amplification_factor == 0 {
+            return Err(TransactionDriverError::InvalidTransaction {
+                local_error: Some(
+                    SuiError::UserInputError {
+                        error: UserInputError::GasPriceUnderRGP {
+                            gas_price,
+                            reference_gas_price,
+                        },
+                    }
+                    .to_string(),
+                ),
+                submission_non_retriable_errors: AggregatedRequestErrors::default(),
+                submission_retriable_errors: AggregatedRequestErrors::default(),
+            });
+        }
+
         let raw_request = request.into_raw().unwrap();
         let timer = Instant::now();
 
@@ -125,18 +154,20 @@ where
             loop {
                 // TODO(fastpath): Check local state before submitting transaction
                 match self
-                    .drive_transaction_once(tx_digest, raw_request.clone(), &options)
+                    .drive_transaction_once(
+                        tx_digest,
+                        tx_type,
+                        amplification_factor,
+                        raw_request.clone(),
+                        &options,
+                    )
                     .await
                 {
                     Ok(resp) => {
                         let settlement_finality_latency = timer.elapsed().as_secs_f64();
                         self.metrics
                             .settlement_finality_latency
-                            .with_label_values(&[if is_single_writer_tx {
-                                TX_TYPE_SINGLE_WRITER_TX
-                            } else {
-                                TX_TYPE_SHARED_OBJ_TX
-                            }])
+                            .with_label_values(&[tx_type.as_str()])
                             .observe(settlement_finality_latency);
                         // Record the number of retries for successful transaction
                         self.metrics
@@ -175,7 +206,7 @@ where
                     .await
                     .unwrap_or_else(|_| {
                         // Timeout occurred, return with latest retriable error if available
-                        Err(TransactionDriverError::TimeOutWithLastRetriableError {
+                        Err(TransactionDriverError::TimeoutWithLastRetriableError {
                             last_error: latest_retriable_error.map(Box::new),
                             attempts,
                             timeout: duration,
@@ -190,17 +221,22 @@ where
     async fn drive_transaction_once(
         &self,
         tx_digest: &TransactionDigest,
+        tx_type: TxType,
+        amplification_factor: u64,
         raw_request: RawSubmitTxRequest,
         options: &SubmitTransactionOptions,
     ) -> Result<QuorumTransactionResponse, TransactionDriverError> {
         let auth_agg = self.authority_aggregator.load();
+        let amplification_factor =
+            amplification_factor.min(auth_agg.committee.num_members() as u64);
 
-        let (name, submit_txn_resp) = self
+        let (name, submit_txn_result) = self
             .submitter
             .submit_transaction(
                 &auth_agg,
                 &self.client_monitor,
                 tx_digest,
+                amplification_factor,
                 raw_request,
                 options,
             )
@@ -212,8 +248,9 @@ where
                 &auth_agg,
                 &self.client_monitor,
                 tx_digest,
+                tx_type,
                 name,
-                submit_txn_resp,
+                submit_txn_result,
                 options,
             )
             .await
@@ -254,8 +291,17 @@ where
 }
 
 // Chooses the percentage of transactions to be driven by TransactionDriver.
-pub fn choose_transaction_driver_percentage() -> u8 {
+pub fn choose_transaction_driver_percentage(
+    chain_id: Option<sui_types::digests::ChainIdentifier>,
+) -> u8 {
     // Currently, TD cannot work in mainnet.
+    if let Some(chain_identifier) = chain_id {
+        if chain_identifier.chain() == sui_protocol_config::Chain::Mainnet {
+            return 0;
+        }
+    }
+
+    // TODO(fastpath): Remove this once mfp hits mainnet
     if let Ok(chain) =
         std::env::var(sui_types::digests::SUI_PROTOCOL_CONFIG_CHAIN_OVERRIDE_ENV_VAR_NAME)
     {
@@ -272,12 +318,8 @@ pub fn choose_transaction_driver_percentage() -> u8 {
         }
     }
 
-    // Default to 50% in simtests.
-    if cfg!(msim) {
-        return 50;
-    }
-
-    0
+    // Default to 50% everywhere except mainnet
+    50
 }
 
 // Inner state of TransactionDriver.
