@@ -17,9 +17,11 @@ use crate::{
 
 use super::{
     balance::{self, Balance},
+    coin_metadata::CoinMetadata,
     dynamic_field::{DynamicField, DynamicFieldName},
     move_object::MoveObject,
     move_package::MovePackage,
+    name_service::address_to_name,
     object::{self, Object, ObjectKey},
     object_filter::{ObjectFilter, Validator as OFValidator},
 };
@@ -48,6 +50,11 @@ use super::{
         desc = "Total balance across coins owned by this address, grouped by coin type.",
     ),
     field(
+        name = "default_suins_name",
+        ty = "Result<Option<String>, RpcError<object::Error>>",
+        desc = "The domain explicitly configured as the default SuiNS name for this address."
+    ),
+    field(
         name = "multi_get_balances",
         arg(name = "keys", ty = "Vec<TypeInput>"),
         ty = "Result<Option<Vec<Balance>>, RpcError<balance::Error>>",
@@ -66,6 +73,7 @@ use super::{
 )]
 pub(crate) enum IAddressable {
     Address(Address),
+    CoinMetadata(CoinMetadata),
     DynamicField(DynamicField),
     MoveObject(MoveObject),
     MovePackage(MovePackage),
@@ -132,12 +140,20 @@ impl Address {
             .map(Some)
     }
 
+    /// The domain explicitly configured as the default SuiNS name for this address.
+    pub(crate) async fn default_suins_name(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<String>, RpcError> {
+        address_to_name(ctx, &self.scope, self.address).await
+    }
+
     /// Access a dynamic field on an object using its type and BCS-encoded name.
     pub(crate) async fn dynamic_field(
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError<object::Error>> {
+    ) -> Result<Option<DynamicField>, RpcError> {
         DynamicField::by_name(
             ctx,
             self.scope.clone(),
@@ -174,7 +190,7 @@ impl Address {
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError<object::Error>> {
+    ) -> Result<Option<DynamicField>, RpcError> {
         DynamicField::by_name(
             ctx,
             self.scope.clone(),
@@ -192,7 +208,7 @@ impl Address {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError<object::Error>> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError> {
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
                 ctx,
@@ -212,7 +228,7 @@ impl Address {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError<object::Error>> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError> {
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
                 ctx,
