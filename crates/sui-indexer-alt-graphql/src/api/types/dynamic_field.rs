@@ -36,9 +36,9 @@ use super::{
     move_type::MoveType,
     move_value::MoveValue,
     object::{self, CLive, CVersion, Object, VersionFilter},
-    object_filter::{ObjectFilter, Validator as OFValidator},
+    object_filter::{ObjectFilter, ObjectFilterValidator as OFValidator},
     owner::Owner,
-    transaction::Transaction,
+    transaction::{filter::TransactionFilter, CTransaction, Transaction},
 };
 
 pub(crate) struct DynamicField {
@@ -51,22 +51,22 @@ pub(crate) struct DynamicField {
 /// The product of deserializing the dynamic field's MoveObject contents.
 pub(crate) struct NativeField {
     /// Whether the dynamic field is a dynamic field or a dynamic object field.
-    kind: DynamicFieldType,
+    pub(crate) kind: DynamicFieldType,
 
     /// The BCS-encoded bytes of the dynamic field's name.
-    name_bytes: Vec<u8>,
+    pub(crate) name_bytes: Vec<u8>,
 
     /// The type of the dynamic field's name, like 'u64' or '0x2::kiosk::Listing'. For dynamic
     /// object fields, this type is wrapped with `0x2::dynamic_object_field::Wrapper`.
-    name_type: TypeTag,
+    pub(crate) name_type: TypeTag,
 
     /// The BCS-encoded bytes of the dynamic field's value. For a dynamic object field, this is the
     /// object's ID.
-    value_bytes: Vec<u8>,
+    pub(crate) value_bytes: Vec<u8>,
 
     /// The type of the dynamic field's value, like 'u64' or '0x2::kiosk::Listing'. For dynamic
     /// object fields, this type is `ID` (and not relevant).
-    value_type: TypeTag,
+    pub(crate) value_type: TypeTag,
 
     /// The scope under which this dynamic field is fetched. This includes any version bounds.
     scope: Scope,
@@ -76,10 +76,10 @@ pub(crate) struct NativeField {
 #[derive(InputObject)]
 pub(crate) struct DynamicFieldName {
     /// The type of the dynamic field's name, like 'u64' or '0x2::kiosk::Listing'.
-    type_: TypeInput,
+    pub(crate) type_: TypeInput,
 
     /// The Base64-encoded BCS serialization of the dynamic field's 'name'.
-    bcs: Base64,
+    pub(crate) bcs: Base64,
 }
 
 /// The value of a dynamic field (`MoveValue`) or dynamic object field (`MoveObject`).
@@ -149,6 +149,8 @@ impl DynamicField {
     }
 
     /// Access a dynamic field on an object using its type and BCS-encoded name.
+    ///
+    /// Returns `null` if a dynamic field with that name could not be found attached to this object.
     pub(crate) async fn dynamic_field(
         &self,
         ctx: &Context<'_>,
@@ -174,6 +176,8 @@ impl DynamicField {
     }
 
     /// Access a dynamic object field on an object using its type and BCS-encoded name.
+    ///
+    /// Returns `null` if a dynamic object field with that name could not be found attached to this object.
     pub(crate) async fn dynamic_object_field(
         &self,
         ctx: &Context<'_>,
@@ -329,6 +333,21 @@ impl DynamicField {
         self.super_.storage_rebate(ctx).await
     }
 
+    /// The transactions that sent objects to this object.
+    pub(crate) async fn received_transactions(
+        &self,
+        ctx: &Context<'_>,
+        first: Option<u64>,
+        after: Option<CTransaction>,
+        last: Option<u64>,
+        before: Option<CTransaction>,
+        filter: Option<TransactionFilter>,
+    ) -> Result<Option<Connection<String, Transaction>>, RpcError> {
+        self.super_
+            .received_transactions(ctx, first, after, last, before, filter)
+            .await
+    }
+
     /// The dynamic field's value, as a Move value for dynamic fields and as a MoveObject for dynamic object fields.
     async fn value(&self, ctx: &Context<'_>) -> Result<Option<DynamicFieldValue>, RpcError> {
         let Some(native) = self.native(ctx).await? else {
@@ -456,7 +475,7 @@ impl DynamicField {
     }
 
     /// Get the native dynamic field data, loading it lazily if needed.
-    async fn native(&self, ctx: &Context<'_>) -> Result<&Option<NativeField>, RpcError> {
+    pub(crate) async fn native(&self, ctx: &Context<'_>) -> Result<&Option<NativeField>, RpcError> {
         self.native
             .get_or_try_init(async || {
                 let Some(value) = self.super_.contents(ctx).await? else {

@@ -1,12 +1,22 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use async_graphql::{connection::Connection, Context, Object};
+use anyhow::anyhow;
+use async_graphql::{connection::Connection, Context, Object, Result};
 use futures::future::try_join_all;
-use sui_types::digests::ChainIdentifier;
+use sui_indexer_alt_reader::fullnode_client::{Error::GrpcExecutionError, FullnodeClient};
+use sui_types::{digests::ChainIdentifier, transaction::TransactionData};
 
 use crate::{
-    error::RpcError,
+    api::{
+        mutation::TransactionInputError,
+        scalars::base64::Base64,
+        types::{
+            epoch::CEpoch, simulation_result::SimulationResult,
+            transaction_effects::TransactionEffects,
+        },
+    },
+    error::{bad_user_input, upcast, RpcError},
     pagination::{Page, PaginationConfig},
     scope::Scope,
 };
@@ -26,14 +36,14 @@ use super::{
         move_type::{self, MoveType},
         name_service::name_to_address,
         object::{self, Object, ObjectKey, VersionFilter},
-        object_filter::{ObjectFilter, Validator as OFValidator},
+        object_filter::{ObjectFilter, ObjectFilterValidator as OFValidator},
         protocol_configs::ProtocolConfigs,
         service_config::ServiceConfig,
         transaction::{
             filter::{TransactionFilter, TransactionFilterValidator as TFValidator},
             CTransaction, Transaction,
         },
-        transaction_effects::TransactionEffects,
+        zklogin::{self, ZkLoginIntentScope, ZkLoginVerifyResult},
     },
 };
 
@@ -131,6 +141,23 @@ impl Query {
     ) -> Result<Option<Epoch>, RpcError> {
         let scope = self.scope(ctx)?;
         Epoch::fetch(ctx, scope, epoch_id).await
+    }
+
+    /// Paginate epochs that are in the network.
+    async fn epochs(
+        &self,
+        ctx: &Context<'_>,
+        first: Option<u64>,
+        after: Option<CEpoch>,
+        last: Option<u64>,
+        before: Option<CEpoch>,
+    ) -> Result<Option<Connection<String, Epoch>>, RpcError> {
+        let scope = self.scope(ctx)?;
+        let pagination: &PaginationConfig = ctx.data()?;
+        let limits = pagination.limits("Query", "epochs");
+        let page = Page::from_params(limits, first, after, last, before)?;
+
+        Epoch::paginate(ctx, &scope, page).await
     }
 
     /// Paginate events that are emitted in the network, optionally filtered by event filters.
@@ -525,6 +552,70 @@ impl Query {
         type_: TypeInput,
     ) -> Result<Option<MoveType>, RpcError<move_type::Error>> {
         MoveType::canonicalize(type_.into(), self.scope(ctx)?).await
+    }
+
+    /// Simulate a transaction to preview its effects without executing it on chain.
+    ///
+    /// - `transactionDataBcs` contains the BCS-encoded transaction data (Base64-encoded).
+    ///
+    /// Unlike `executeTransaction`, this does not require signatures since the transaction is not committed to the blockchain. This allows for previewing transaction effects, estimating gas costs, and testing transaction logic without spending gas or requiring valid signatures.
+    async fn simulate_transaction(
+        &self,
+        ctx: &Context<'_>,
+        transaction_data_bcs: Base64,
+    ) -> Result<SimulationResult, RpcError<TransactionInputError>> {
+        let fullnode_client: &FullnodeClient = ctx.data()?;
+
+        // Parse transaction data from BCS
+        let tx_data: TransactionData = {
+            let bytes: &Vec<u8> = &transaction_data_bcs.0;
+            bcs::from_bytes(bytes)
+                .map_err(|err| bad_user_input(TransactionInputError::InvalidTransactionBcs(err)))?
+        };
+
+        // Simulate transaction - no signatures needed
+        match fullnode_client.simulate_transaction(tx_data.clone()).await {
+            Ok(response) => {
+                let scope = self.scope(ctx)?;
+                SimulationResult::from_simulation_response(scope, response, tx_data).map_err(upcast)
+            }
+            Err(GrpcExecutionError(status)) => Ok(SimulationResult {
+                effects: None,
+                events: None,
+                outputs: None,
+                error: Some(status.to_string()),
+            }),
+            Err(other_error) => Err(anyhow!(other_error)
+                .context("Failed to simulate transaction")
+                .into()),
+        }
+    }
+
+    /// Verify a zkLogin signature os from the given `author`.
+    ///
+    /// Returns a `ZkLoginVerifyResult` where `success` is `true` and `error` is empty if the signature is valid. If the signature is invalid, `success` is `false` and `error` contains the relevant error message.
+    ///
+    /// - `bytes` are either the bytes of a serialized personal message, or `TransactionData`, Base64-encoded.
+    /// - `signature` is a serialized zkLogin signature, also Base64-encoded.
+    /// - `intentScope` indicates whether `bytes` are to be parsed as a personal message or `TransactionData`.
+    /// - `author` is the signer's address.
+    async fn verify_zk_login_signature(
+        &self,
+        ctx: &Context<'_>,
+        bytes: Base64,
+        signature: Base64,
+        intent_scope: ZkLoginIntentScope,
+        author: SuiAddress,
+    ) -> Result<ZkLoginVerifyResult, RpcError<zklogin::Error>> {
+        zklogin::verify_signature(
+            ctx,
+            self.scope(ctx)?,
+            bytes,
+            signature,
+            intent_scope,
+            author,
+        )
+        .await
     }
 }
 
