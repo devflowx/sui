@@ -3977,6 +3977,10 @@ type Validator implements IAddressable {
 	"""
 	address: SuiAddress!
 	"""
+	The number of epochs for which this validator has been below the low stake threshold.
+	"""
+	atRisk: UInt53
+	"""
 	Fetch the total balance for coins with marker type `coinType` (e.g. `0x2::sui::SUI`), owned by this address.
 	
 	If the address does not own any coins of that type, a balance of zero is returned.
@@ -4102,6 +4106,21 @@ type ValidatorAggregatedSignature {
 	signersMap: [Int!]!
 }
 
+type ValidatorConnection {
+	"""
+	A list of edges.
+	"""
+	edges: [ValidatorEdge!]!
+	"""
+	A list of nodes.
+	"""
+	nodes: [Validator!]!
+	"""
+	Information to aid in pagination.
+	"""
+	pageInfo: PageInfo!
+}
+
 """
 The credentials related fields associated with a validator.
 """
@@ -4117,13 +4136,27 @@ type ValidatorCredentials {
 }
 
 """
+An edge in a connection.
+"""
+type ValidatorEdge {
+	"""
+	A cursor for use in pagination
+	"""
+	cursor: String!
+	"""
+	The item at the end of the edge
+	"""
+	node: Validator!
+}
+
+"""
 Representation of `0x3::validator_set::ValidatorSet`.
 """
 type ValidatorSet {
 	"""
 	The current list of active validators.
 	"""
-	activeValidators: [Validator!]
+	activeValidators(first: Int, after: String, last: Int, before: String): ValidatorConnection!
 	"""
 	Object ID of the `Table` storing the inactive staking pools.
 	"""
