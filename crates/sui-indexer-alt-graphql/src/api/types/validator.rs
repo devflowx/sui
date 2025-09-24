@@ -19,7 +19,7 @@ use crate::{
             object_filter::{ObjectFilter, ObjectFilterValidator as OFValidator},
         },
     },
-    error::RpcError,
+    error::{upcast, RpcError},
     scope::Scope,
 };
 
@@ -27,6 +27,7 @@ use crate::{
 pub(crate) struct Validator {
     super_: Address,
     native: ValidatorV1,
+    at_risk: u64,
 }
 
 /// The credentials related fields associated with a validator.
@@ -162,19 +163,21 @@ impl Validator {
         Some(self.native.metadata.project_url.clone())
     }
 
-    // todo (ewall)
-    // /// The validator's current valid `Cap` object. Validators can delegate
-    // /// the operation ability to another address. The address holding this `Cap` object
-    // /// can then update the reference gas price and tallying rule on behalf of the validator.
-    // async fn operation_cap(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<MoveObject>> {
-    //     MoveObject::query(
-    //         ctx,
-    //         self.operation_cap_id(),
-    //         Object::latest_at(self.checkpoint_viewed_at),
-    //     )
-    //         .await
-    //         .extend()
-    // }
+    /// The validator's current valid `Cap` object. Validators can delegate the operation ability to another address.
+    /// The address holding this `Cap` object can then update the reference gas price and tallying rule on behalf of the validator.
+    async fn operation_cap(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<MoveObject>, RpcError<Error>> {
+        let address = Address::with_address(
+            self.super_.scope.clone(),
+            self.native.operation_cap_id.bytes.into(),
+        );
+        let Some(object) = address.as_object(ctx).await? else {
+            return Ok(None);
+        };
+        object.as_move_object(ctx).await.map_err(upcast)
+    }
 
     /// The ID of this validator's `0x3::staking_pool::StakingPool`.
     async fn staking_pool_id(&self) -> SuiAddress {
@@ -267,12 +270,10 @@ impl Validator {
         Some(self.native.next_epoch_commission_rate)
     }
 
-    // todo (ewall)
-    // /// The number of epochs for which this validator has been below the
-    // /// low stake threshold.
-    // async fn at_risk(&self) -> Option<UInt53> {
-    //     self.at_risk.map(UInt53::from)
-    // }
+    /// The number of epochs for which this validator has been below the low stake threshold.
+    async fn at_risk(&self) -> Option<UInt53> {
+        Some(self.at_risk.into())
+    }
 
     // todo (ewall)
     // /// The addresses of other validators this validator has reported.
@@ -315,10 +316,11 @@ impl Validator {
 }
 
 impl Validator {
-    pub(crate) fn from_validator_v1(scope: Scope, native: ValidatorV1) -> Self {
+    pub(crate) fn from_validator_v1(scope: Scope, native: ValidatorV1, at_risk: u64) -> Self {
         Self {
             super_: Address::with_address(scope, native.metadata.sui_address),
             native,
+            at_risk,
         }
     }
 }
