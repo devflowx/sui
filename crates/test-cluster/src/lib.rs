@@ -1,74 +1,86 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use futures::{future::join_all, StreamExt};
+use fastcrypto_zkp::bn254::zk_login::JwkId;
+use futures::future::join_all;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use mysten_common::ZipDebugEqIteratorExt;
 use mysten_common::fatal;
-use rand::{distributions::*, rngs::OsRng, seq::SliceRandom};
-use std::collections::HashMap;
+use rand::{Rng, distributions::*, rngs::OsRng, seq::SliceRandom};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sui_config::genesis::Genesis;
+use sui_config::node::FundsWithdrawSchedulerType;
 use sui_config::node::{AuthorityOverloadConfig, DBCheckpointConfig, RunWithRange};
 use sui_config::{Config, ExecutionCacheConfig, SUI_CLIENT_CONFIG, SUI_NETWORK_CONFIG};
 use sui_config::{NodeConfig, PersistedConfig, SUI_KEYSTORE_FILENAME};
 use sui_core::authority_aggregator::AuthorityAggregator;
 use sui_core::authority_client::NetworkAuthorityClient;
-use sui_json_rpc_types::{
-    SuiExecutionStatus, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse,
-    TransactionFilter,
-};
+use sui_core::transaction_driver::SubmitTransactionOptions;
 use sui_keys::keystore::{AccountKeystore, FileBasedKeystore, Keystore};
 use sui_node::SuiNodeHandle;
 use sui_protocol_config::{Chain, ProtocolVersion};
-use sui_sdk::apis::QuorumDriverApi;
+use sui_rpc_api::Client;
+use sui_rpc_api::client::ExecutedTransaction;
 use sui_sdk::sui_client_config::{SuiClientConfig, SuiEnv};
 use sui_sdk::wallet_context::WalletContext;
 use sui_sdk::{SuiClient, SuiClientBuilder};
 use sui_swarm::memory::{Swarm, SwarmBuilder};
 use sui_swarm_config::genesis_config::{
-    AccountConfig, GenesisConfig, ValidatorGenesisConfig, DEFAULT_GAS_AMOUNT,
+    AccountConfig, DEFAULT_GAS_AMOUNT, GenesisConfig, ValidatorGenesisConfig,
 };
 use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::{
-    GlobalStateHashV2EnabledCallback, GlobalStateHashV2EnabledConfig, ProtocolVersionsConfig,
-    SupportedProtocolVersionsCallback,
+    FundsWithdrawSchedulerTypeConfig, GlobalStateHashV2EnabledCallback,
+    GlobalStateHashV2EnabledConfig, ProtocolVersionsConfig, SupportedProtocolVersionsCallback,
+    ValidatorObserverConfigCallback,
 };
 use sui_swarm_config::node_config_builder::{FullnodeConfigBuilder, ValidatorConfigBuilder};
 use sui_test_transaction_builder::TestTransactionBuilder;
+use sui_types::authenticator_state::get_authenticator_state;
 use sui_types::base_types::ConciseableName;
 use sui_types::base_types::{AuthorityName, ObjectID, ObjectRef, SuiAddress};
 use sui_types::committee::CommitteeTrait;
 use sui_types::committee::{Committee, EpochId};
 use sui_types::crypto::KeypairTraits;
 use sui_types::crypto::SuiKeyPair;
+use sui_types::digests::{ChainIdentifier, TransactionDigest};
+use sui_types::effects::TransactionEffectsAPI;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
-use sui_types::error::SuiResult;
-use sui_types::message_envelope::Message;
+use sui_types::error::{SuiErrorKind, SuiResult};
+use sui_types::messages_grpc::{
+    RawSubmitTxRequest, SubmitTxRequest, SubmitTxResult, SubmitTxType, WaitForEffectsRequest,
+    WaitForEffectsResponse,
+};
 use sui_types::object::Object;
-use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::sui_system_state::SuiSystemState;
 use sui_types::sui_system_state::SuiSystemStateTrait;
+use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::supported_protocol_versions::SupportedProtocolVersions;
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
-use sui_types::transaction::{
-    CertifiedTransaction, Transaction, TransactionData, TransactionDataAPI, TransactionKind,
-};
-use tokio::time::{timeout, Instant};
+use sui_types::transaction::{Transaction, TransactionData};
+use tokio::sync::broadcast;
+use tokio::time::{Instant, timeout};
 use tokio::{task::JoinHandle, time::sleep};
+use tonic::IntoRequest;
 use tracing::{error, info};
 
-mod test_indexer_handle;
+pub mod addr_balance_test_env;
 
 const NUM_VALIDATOR: usize = 4;
+// Keep direct test submissions bounded like the production TransactionOrchestrator.
+const TRANSACTION_FINALITY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct FullNodeHandle {
     pub sui_node: SuiNodeHandle,
+    #[deprecated = "use grpc_client"]
     pub sui_client: SuiClient,
+    #[deprecated = "use grpc_client"]
     pub rpc_client: HttpClient,
+    pub grpc_client: Client,
     pub rpc_url: String,
 }
 
@@ -78,11 +90,15 @@ impl FullNodeHandle {
         let rpc_client = HttpClientBuilder::default().build(&rpc_url).unwrap();
 
         let sui_client = SuiClientBuilder::default().build(&rpc_url).await.unwrap();
+        let grpc_client = Client::new(&rpc_url).unwrap();
 
         Self {
             sui_node,
+            #[allow(deprecated)]
             sui_client,
+            #[allow(deprecated)]
             rpc_client,
+            grpc_client,
             rpc_url,
         }
     }
@@ -92,34 +108,27 @@ pub struct TestCluster {
     pub swarm: Swarm,
     pub wallet: WalletContext,
     pub fullnode_handle: FullNodeHandle,
-    indexer_handle: Option<test_indexer_handle::IndexerHandle>,
-    transaction_driver_percentage: Option<u8>,
 }
 
 impl TestCluster {
+    #[deprecated = "use grpc_client()"]
     pub fn rpc_client(&self) -> &HttpClient {
-        self.indexer_handle
-            .as_ref()
-            .map(|h| &h.rpc_client)
-            .unwrap_or(&self.fullnode_handle.rpc_client)
+        #[allow(deprecated)]
+        &self.fullnode_handle.rpc_client
     }
 
+    #[deprecated = "use grpc_client()"]
     pub fn sui_client(&self) -> &SuiClient {
-        self.indexer_handle
-            .as_ref()
-            .map(|h| &h.sui_client)
-            .unwrap_or(&self.fullnode_handle.sui_client)
+        #[allow(deprecated)]
+        &self.fullnode_handle.sui_client
+    }
+
+    pub fn grpc_client(&self) -> Client {
+        self.fullnode_handle.grpc_client.clone()
     }
 
     pub fn rpc_url(&self) -> &str {
-        self.indexer_handle
-            .as_ref()
-            .map(|h| h.rpc_url.as_str())
-            .unwrap_or(&self.fullnode_handle.rpc_url)
-    }
-
-    pub fn quorum_driver_api(&self) -> &QuorumDriverApi {
-        self.sui_client().quorum_driver_api()
+        &self.fullnode_handle.rpc_url
     }
 
     pub fn wallet(&mut self) -> &WalletContext {
@@ -159,8 +168,12 @@ impl TestCluster {
             .with(|node| node.state().epoch_store_for_testing().committee().clone())
     }
 
-    pub fn transaction_driver_percentage(&self) -> Option<u8> {
-        self.transaction_driver_percentage
+    pub fn get_sui_system_state(&self) -> SuiSystemState {
+        self.fullnode_handle.sui_node.with(|node| {
+            node.state()
+                .get_sui_system_state_object_for_testing()
+                .unwrap()
+        })
     }
 
     /// Convenience method to start a new fullnode in the test cluster.
@@ -170,6 +183,15 @@ impl TestCluster {
                 .build(&mut OsRng, self.swarm.config()),
         )
         .await
+    }
+
+    /// The observer fullnode of the cluster, when built with `with_observer_fullnode()`.
+    /// The cluster deliberately does not hold a node handle for the observer: a handle
+    /// keeps the running instance (and its open stores) alive, which prevents the
+    /// simulator from restarting the node after a crash. Acquire a fresh handle via
+    /// `Node::get_node_handle()` at the point of use and drop it promptly.
+    pub fn observer_node(&self) -> Option<&sui_swarm::memory::Node> {
+        self.swarm.observer_nodes().next()
     }
 
     pub async fn start_fullnode_from_config(&mut self, config: NodeConfig) -> FullNodeHandle {
@@ -243,17 +265,20 @@ impl TestCluster {
     }
 
     pub async fn get_reference_gas_price(&self) -> u64 {
-        self.sui_client()
-            .governance_api()
+        self.grpc_client()
             .get_reference_gas_price()
             .await
             .expect("failed to get reference gas price")
     }
 
+    pub fn get_chain_identifier(&self) -> ChainIdentifier {
+        ChainIdentifier::from(*self.swarm.config().genesis.checkpoint().digest())
+    }
+
     pub async fn get_object_from_fullnode_store(&self, object_id: &ObjectID) -> Option<Object> {
         self.fullnode_handle
             .sui_node
-            .with_async(|node| async { node.state().get_object(object_id).await })
+            .with_async(|node| async { node.state().get_object(object_id) })
             .await
     }
 
@@ -472,6 +497,56 @@ impl TestCluster {
             .expect("timed out waiting for reconfiguration to complete");
     }
 
+    /// Waits until every node advances to a strictly higher epoch than the one it is at when this is
+    /// called. Unlike `wait_for_epoch_all_nodes`, which matches a target epoch exactly, this only
+    /// requires forward progress, so it is safe when the cluster catches up through several epochs at
+    /// once (e.g. recovering from a stall) and would blow past any fixed target.
+    pub async fn wait_for_next_epoch_all_nodes(&self) {
+        let handles: Vec<_> = self
+            .swarm
+            .all_nodes()
+            .map(|node| node.get_node_handle().unwrap())
+            .collect();
+        let tasks: Vec<_> = handles
+            .iter()
+            .map(|handle| {
+                handle.with_async(|node| async {
+                    let start_epoch = node.state().epoch_store_for_testing().epoch();
+                    let mut retries = 0;
+                    loop {
+                        let epoch = node.state().epoch_store_for_testing().epoch();
+                        if epoch > start_epoch {
+                            if let Some(agg) = node.clone_authority_aggregator() {
+                                // Fullnode: also wait for its auth aggregator to reconfigure.
+                                if agg.committee.epoch() > start_epoch {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        retries += 1;
+                        if retries % 5 == 0 {
+                            tracing::warn!(validator=?node.state().name.concise(), "Waiting {:?}s for an epoch beyond {:?}; currently at {:?}", retries, start_epoch, epoch);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        timeout(Duration::from_secs(40), join_all(tasks))
+            .await
+            .expect("timed out waiting for all nodes to advance an epoch");
+    }
+
+    pub fn subscribe_to_epoch_change(&self) -> broadcast::Receiver<SuiSystemState> {
+        // fullnode_handle is not part of swarm and cannot be dropped / killed
+        self.fullnode_handle
+            .sui_node
+            .with(|node| node.subscribe_to_epoch_change())
+    }
+
     /// Upgrade the network protocol version, by restarting every validator with a new
     /// supported versions.
     /// Note that we don't restart the fullnode here, and it is assumed that the fulnode supports
@@ -512,29 +587,40 @@ impl TestCluster {
         }
     }
 
+    /// Wait until the on-chain authenticator state contains any active JWK.
     pub async fn wait_for_authenticator_state_update(&self) {
-        timeout(
-            Duration::from_secs(60),
-            self.fullnode_handle.sui_node.with_async(|node| async move {
-                let mut txns = node.state().subscription_handler.subscribe_transactions(
-                    TransactionFilter::ChangedObject(ObjectID::from_hex_literal("0x7").unwrap()),
-                );
-                let state = node.state();
+        self.wait_for_authenticator_state_update_for_providers(&[])
+            .await;
+    }
 
-                while let Some(tx) = txns.next().await {
-                    let digest = *tx.transaction_digest();
-                    let tx = state
-                        .get_transaction_cache_reader()
-                        .get_transaction_block(&digest)
-                        .unwrap();
-                    match &tx.data().intent_message().value.kind() {
-                        TransactionKind::EndOfEpochTransaction(_) => (),
-                        TransactionKind::AuthenticatorStateUpdate(_) => break,
-                        _ => panic!("{:?}", tx),
-                    }
+    /// Wait until the on-chain authenticator state contains all the given JWK ids.
+    pub async fn wait_for_authenticator_state_update_for_providers(&self, jwk_ids: &[JwkId]) {
+        timeout(Duration::from_secs(60), async {
+            loop {
+                let active: Vec<JwkId> = self.fullnode_handle.sui_node.with(|node| {
+                    get_authenticator_state(node.state().get_object_store())
+                        .ok()
+                        .flatten()
+                        .map(|state| {
+                            state
+                                .active_jwks
+                                .iter()
+                                .map(|active| active.jwk_id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+                let ready = if jwk_ids.is_empty() {
+                    !active.is_empty()
+                } else {
+                    jwk_ids.iter().all(|id| active.contains(id))
+                };
+                if ready {
+                    return;
                 }
-            }),
-        )
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
         .await
         .expect("Timed out waiting for authenticator state update");
     }
@@ -591,35 +677,380 @@ impl TestCluster {
     pub async fn sign_and_execute_transaction(
         &self,
         tx_data: &TransactionData,
-    ) -> SuiTransactionBlockResponse {
+    ) -> ExecutedTransaction {
         let tx = self.wallet.sign_transaction(tx_data).await;
         self.execute_transaction(tx).await
+    }
+
+    /// Sign and execute the transaction via direct validator submission, bypassing the fullnode.
+    pub async fn sign_and_execute_transaction_directly(
+        &self,
+        tx_data: &TransactionData,
+    ) -> SuiResult<(TransactionDigest, TransactionEffects)> {
+        let mut res = self
+            .sign_and_execute_txns_in_soft_bundle(std::slice::from_ref(tx_data))
+            .await?;
+        assert_eq!(res.len(), 1);
+        Ok(res.pop().unwrap())
+    }
+
+    /// Execute an already-signed transaction via direct validator submission, bypassing the fullnode.
+    pub async fn execute_transaction_directly(
+        &self,
+        tx: &Transaction,
+    ) -> SuiResult<(TransactionDigest, TransactionEffects)> {
+        let mut res = self
+            .execute_signed_txns_in_soft_bundle(std::slice::from_ref(tx))
+            .await?;
+        assert_eq!(res.len(), 1);
+        Ok(res.pop().unwrap())
+    }
+
+    /// Sign and execute multiple transactions in a soft bundle.
+    /// Soft bundles allow submitting multiple transactions together with best-effort
+    /// ordering if they use the same gas price. Transactions in a soft bundle can be
+    /// individually rejected or deferred without affecting other transactions.
+    ///
+    /// NOTE: This is a simplified implementation that processes transactions individually.
+    /// For true soft bundle submission, the test file should use the raw gRPC client directly
+    /// with tonic, as shown in test_soft_bundle_different_gas_payers.
+    pub async fn sign_and_execute_txns_in_soft_bundle(
+        &self,
+        txns: &[TransactionData],
+    ) -> SuiResult<Vec<(TransactionDigest, TransactionEffects)>> {
+        // Sign all transactions
+        let signed_txs: Vec<Transaction> =
+            futures::future::join_all(txns.iter().map(|tx| self.wallet.sign_transaction(tx))).await;
+
+        self.execute_signed_txns_in_soft_bundle(&signed_txs).await
+    }
+
+    pub async fn execute_signed_txns_in_soft_bundle(
+        &self,
+        signed_txs: &[Transaction],
+    ) -> SuiResult<Vec<(TransactionDigest, TransactionEffects)>> {
+        let digests: Vec<_> = signed_txs.iter().map(|tx| *tx.digest()).collect();
+
+        let request = RawSubmitTxRequest {
+            transactions: signed_txs
+                .iter()
+                .map(|tx| bcs::to_bytes(tx).unwrap().into())
+                .collect(),
+            submit_type: SubmitTxType::SoftBundle.into(),
+        };
+
+        let agg = self.authority_aggregator();
+        let clients = &agg.authority_clients;
+        // Use seeded RNG for deterministic but varying validator selection in simtests
+        let index = rand::thread_rng().gen_range(0..clients.len());
+        let (_, safe_client) = clients.iter().nth(index).unwrap();
+        let mut validator_client = safe_client
+            .authority_client()
+            .get_client_for_testing()
+            .unwrap();
+
+        let result = validator_client
+            .submit_transaction(request.into_request())
+            .await
+            .map(tonic::Response::into_inner)?;
+        assert_eq!(result.results.len(), signed_txs.len());
+
+        let mut executed_results = vec![None; signed_txs.len()];
+        let mut submitted_positions = Vec::new();
+        for (index, raw_result) in result.results.into_iter().enumerate() {
+            let submit_result: SubmitTxResult = raw_result.try_into()?;
+            match submit_result {
+                SubmitTxResult::Executed { details, .. } => {
+                    let data = details.ok_or_else(|| SuiErrorKind::GenericAuthorityError {
+                        error: "Expected execution details".to_string(),
+                    })?;
+                    executed_results[index] = Some((digests[index], data.effects));
+                }
+                SubmitTxResult::Rejected { error } => {
+                    return Err(error);
+                }
+                SubmitTxResult::Submitted { consensus_position } => {
+                    submitted_positions.push((index, consensus_position));
+                }
+            }
+        }
+
+        let wait_futures: Vec<_> = submitted_positions
+            .iter()
+            .map(|(index, position)| {
+                let request = WaitForEffectsRequest {
+                    transaction_digest: Some(digests[*index]),
+                    consensus_position: Some(*position),
+                    include_details: true,
+                    ping_type: None,
+                };
+                safe_client.wait_for_effects(request, None)
+            })
+            .collect();
+
+        let wait_responses = join_all(wait_futures).await;
+        for ((index, _), response) in submitted_positions.into_iter().zip_debug_eq(wait_responses) {
+            match response? {
+                WaitForEffectsResponse::Executed { details, .. } => {
+                    let data = details.ok_or_else(|| SuiErrorKind::GenericAuthorityError {
+                        error: "Expected execution details".to_string(),
+                    })?;
+                    executed_results[index] = Some((digests[index], data.effects));
+                }
+                WaitForEffectsResponse::Rejected { error } => {
+                    return Err(error.unwrap_or_else(|| {
+                        SuiErrorKind::GenericAuthorityError {
+                            error: "Transaction was rejected".to_string(),
+                        }
+                        .into()
+                    }));
+                }
+                WaitForEffectsResponse::Expired { .. } => {
+                    return Err(SuiErrorKind::TransactionExpired.into());
+                }
+            }
+        }
+
+        // Effects were already obtained from the validator above. Wait for the
+        // rpc fullnode to settle the transactions in an executed checkpoint and
+        // for its embedded rpc-store index to catch up, so callers that query
+        // the fullnode (e.g. RPC for owned objects or balances) after this
+        // returns observe these transactions. The embedded indexer follows the
+        // tip asynchronously and is not a blocker for execution, so the index
+        // wait is required for read-after-write consistency.
+        self.wait_for_tx_settlement(&digests).await;
+
+        executed_results
+            .into_iter()
+            .map(|result| {
+                result.ok_or_else(|| {
+                    SuiErrorKind::GenericAuthorityError {
+                        error: "Missing execution result".to_string(),
+                    }
+                    .into()
+                })
+            })
+            .collect()
+    }
+
+    /// Execute signed transactions in a soft bundle and return results for each transaction.
+    /// Unlike `execute_signed_txns_in_soft_bundle`, this method handles conflicting transactions
+    /// where some may be executed and others rejected.
+    ///
+    /// Returns a vector of (digest, WaitForEffectsResponse) for each transaction.
+    pub async fn execute_soft_bundle_with_conflicts(
+        &self,
+        signed_txs: &[Transaction],
+    ) -> SuiResult<Vec<(TransactionDigest, WaitForEffectsResponse)>> {
+        let digests: Vec<_> = signed_txs.iter().map(|tx| *tx.digest()).collect();
+
+        let request = RawSubmitTxRequest {
+            transactions: signed_txs
+                .iter()
+                .map(|tx| bcs::to_bytes(tx).unwrap().into())
+                .collect(),
+            submit_type: SubmitTxType::SoftBundle.into(),
+        };
+
+        let authority_aggregator = self.authority_aggregator();
+        let (_, safe_client) = authority_aggregator
+            .authority_clients
+            .iter()
+            .next()
+            .unwrap();
+        let mut validator_client = safe_client
+            .authority_client()
+            .get_client_for_testing()
+            .unwrap();
+
+        let result = validator_client
+            .submit_transaction(request.into_request())
+            .await
+            .map(tonic::Response::into_inner)?;
+        assert_eq!(result.results.len(), signed_txs.len());
+
+        // Extract consensus positions from submission results
+        let mut consensus_positions = Vec::new();
+        for (i, raw_result) in result.results.iter().enumerate() {
+            let submit_result: SubmitTxResult = raw_result.clone().try_into()?;
+            match submit_result {
+                SubmitTxResult::Submitted { consensus_position } => {
+                    consensus_positions.push(consensus_position);
+                }
+                SubmitTxResult::Executed { .. } => {
+                    panic!(
+                        "Transaction {} was already executed during submission",
+                        i + 1
+                    );
+                }
+                SubmitTxResult::Rejected { error } => {
+                    return Err(error);
+                }
+            }
+        }
+
+        // Wait for effects using consensus positions
+        let wait_futures: Vec<_> = digests
+            .iter()
+            .zip_debug_eq(consensus_positions.iter())
+            .map(|(digest, position)| {
+                let request = WaitForEffectsRequest {
+                    transaction_digest: Some(*digest),
+                    consensus_position: Some(*position),
+                    include_details: false,
+                    ping_type: None,
+                };
+                safe_client.wait_for_effects(request, None)
+            })
+            .collect();
+
+        let responses = futures::future::join_all(wait_futures).await;
+
+        let results: SuiResult<Vec<_>> = digests
+            .into_iter()
+            .zip_debug_eq(responses)
+            .map(|(digest, response)| Ok((digest, response?)))
+            .collect();
+
+        results
+    }
+
+    pub async fn wait_for_tx_settlement(&self, digests: &[TransactionDigest]) {
+        Self::wait_for_tx_settlement_on_handles(
+            std::slice::from_ref(&self.fullnode_handle.sui_node),
+            digests,
+        )
+        .await;
+    }
+
+    /// Like `wait_for_tx_settlement`, but waits on every node (all validators and fullnodes)
+    /// instead of only the rpc fullnode. Nodes can execute the same checkpoint at different
+    /// times, so the rpc fullnode having settled a transaction does not imply every validator
+    /// has. Use this when a subsequent step may interact with an arbitrary validator (e.g. a
+    /// soft bundle is submitted to a randomly chosen validator) and that validator must have
+    /// already applied the settlement of `digests`.
+    pub async fn wait_for_tx_settlement_all_nodes(&self, digests: &[TransactionDigest]) {
+        let handles = self.all_node_handles();
+        Self::wait_for_tx_settlement_on_handles(&handles, digests).await;
+    }
+
+    /// Waits, concurrently across `handles`, until every transaction in `digests` has settled
+    /// on that node: the transaction's checkpoint is present in the node's store and that
+    /// checkpoint has been executed (which is when the transaction's settlement is visible).
+    async fn wait_for_tx_settlement_on_handles(
+        handles: &[SuiNodeHandle],
+        digests: &[TransactionDigest],
+    ) {
+        let waits = handles.iter().map(|handle| async move {
+            let max_checkpoint_seq = handle
+                .with_async(|node| async move {
+                    let state = node.state();
+                    // wait until the transactions are in checkpoints on this node
+                    let checkpoint_seqs = state
+                        .epoch_store_for_testing()
+                        .transactions_executed_in_checkpoint_notify(digests.to_vec())
+                        .await
+                        .unwrap();
+
+                    // then wait until the highest of those checkpoints is executed on this node
+                    let max_checkpoint_seq = checkpoint_seqs.into_iter().max().unwrap();
+                    state
+                        .checkpoint_store
+                        .notify_read_executed_checkpoint(max_checkpoint_seq)
+                        .await;
+                    max_checkpoint_seq
+                })
+                .await;
+
+            // The embedded rpc-store indexes asynchronously, decoupled from
+            // checkpoint execution, so a settled transaction is not yet visible
+            // through the live index surface (owned objects, balances). Wait
+            // for the live cohort to catch up so subsequent index reads
+            // observe it.
+            Self::wait_for_rpc_index_on_handle(handle, max_checkpoint_seq, false).await;
+        });
+        join_all(waits).await;
+    }
+
+    /// Wait until the embedded rpc-store on `handle` has indexed through
+    /// `checkpoint`. No-op for a node without an embedded store (a validator,
+    /// or a fullnode with indexing disabled).
+    ///
+    /// Unlike the legacy synchronous `rpc-index`, the embedded indexer follows
+    /// the tip asynchronously and is not a blocker for checkpoint execution, so
+    /// reads of the index surface must wait for it explicitly.
+    async fn wait_for_rpc_index_on_handle(
+        handle: &SuiNodeHandle,
+        checkpoint: u64,
+        wait_for_history: bool,
+    ) {
+        // Skip nodes without an embedded index; there is nothing to wait for.
+        if handle.with(|node| node.embedded_rpc_store().is_none()) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (live_committed, history_committed) = handle.with(|node| {
+                node.embedded_rpc_store()
+                    .map(|embedded| {
+                        (
+                            embedded.live_committed_checkpoint(),
+                            embedded.history_committed_checkpoint(),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            });
+            if live_committed.is_some_and(|c| c >= checkpoint)
+                && (!wait_for_history || history_committed.is_some_and(|c| c >= checkpoint))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the embedded rpc-store to index checkpoint \
+                 {checkpoint} (live committed = {live_committed:?}, \
+                 history committed = {history_committed:?})",
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until the rpc fullnode's embedded rpc-store has indexed through its
+    /// current highest executed checkpoint. Call after building the cluster so
+    /// genesis data is queryable through index surfaces before tests issue
+    /// their first index reads. No-op when the fullnode has indexing disabled.
+    pub async fn wait_for_rpc_index_ready(&self) {
+        let handle = &self.fullnode_handle.sui_node;
+        let highest_executed = handle.with(|node| {
+            node.state()
+                .get_checkpoint_store()
+                .get_highest_executed_checkpoint_seq_number()
+                .expect("db error")
+                .unwrap_or(0)
+        });
+        Self::wait_for_rpc_index_on_handle(handle, highest_executed, true).await;
     }
 
     /// Execute a transaction on the network and wait for it to be executed on the rpc fullnode.
     /// Also expects the effects status to be ExecutionStatus::Success.
     /// This function is recommended for transaction execution since it most resembles the
     /// production path.
-    pub async fn execute_transaction(&self, tx: Transaction) -> SuiTransactionBlockResponse {
+    pub async fn execute_transaction(&self, tx: Transaction) -> ExecutedTransaction {
         self.wallet.execute_transaction_must_succeed(tx).await
     }
 
     /// Different from `execute_transaction` which returns RPC effects types, this function
-    /// returns raw effects, events and extra objects returned by the validators,
-    /// aggregated manually (without authority aggregator).
+    /// returns raw effects and events from the transaction driver.
     /// It also does not check whether the transaction is executed successfully.
-    /// In order to keep the fullnode up-to-date so that latter queries can read consistent
-    /// results, it calls execute_transaction_may_fail again which goes through fullnode.
-    /// This is less efficient and verbose, but can be used if more details are needed
-    /// from the execution results, and if the transaction is expected to fail.
+    /// Before returning, it waits for the transaction to settle on the fullnode so that
+    /// subsequent queries there read consistent results.
     pub async fn execute_transaction_return_raw_effects(
         &self,
         tx: Transaction,
     ) -> anyhow::Result<(TransactionEffects, TransactionEvents)> {
-        let results = self
-            .submit_transaction_to_validators(tx.clone(), &self.get_validator_pubkeys())
-            .await?;
-        self.wallet.execute_transaction_may_fail(tx).await.unwrap();
+        let digest = *tx.digest();
+        let results = self.submit_and_execute(tx, None).await?;
+        self.wait_for_tx_settlement(&[digest]).await;
         Ok(results)
     }
 
@@ -629,78 +1060,33 @@ impl TestCluster {
             .with(|node| node.clone_authority_aggregator().unwrap())
     }
 
-    pub async fn create_certificate(
+    /// Submit a transaction through the transaction driver and wait for finality.
+    /// Returns the raw transaction effects and events without checking execution status.
+    pub async fn submit_and_execute(
         &self,
         tx: Transaction,
         client_addr: Option<SocketAddr>,
-    ) -> anyhow::Result<CertifiedTransaction> {
-        let agg = self.authority_aggregator();
-        Ok(agg
-            .process_transaction(tx, client_addr)
-            .await?
-            .into_cert_for_testing())
-    }
-
-    /// Execute a transaction on specified list of validators, and bypassing authority aggregator.
-    /// This allows us to obtain the return value directly from validators, so that we can access more
-    /// information directly such as the original effects, events and extra objects returned.
-    /// This also allows us to control which validator to send certificates to, which is useful in
-    /// some tests.
-    pub async fn submit_transaction_to_validators(
-        &self,
-        tx: Transaction,
-        pubkeys: &[AuthorityName],
     ) -> anyhow::Result<(TransactionEffects, TransactionEvents)> {
-        let agg = self.authority_aggregator();
-        let certificate = agg
-            .process_transaction(tx, None)
-            .await?
-            .into_cert_for_testing();
-        let replies = loop {
-            let futures: Vec<_> = agg
-                .authority_clients
-                .iter()
-                .filter_map(|(name, client)| {
-                    if pubkeys.contains(name) {
-                        Some(client)
-                    } else {
-                        None
-                    }
-                })
-                .map(|client| {
-                    let cert = certificate.clone();
-                    async move { client.handle_certificate_v2(cert, None).await }
-                })
-                .collect();
+        let transaction_driver = self.fullnode_handle.sui_node.with(|node| {
+            node.transaction_orchestrator()
+                .expect("fullnode must have a transaction orchestrator")
+                .transaction_driver()
+                .clone()
+        });
+        let response = transaction_driver
+            .drive_transaction(
+                SubmitTxRequest::new_transaction(tx),
+                SubmitTransactionOptions {
+                    forwarded_client_addr: client_addr,
+                    ..Default::default()
+                },
+                Some(TRANSACTION_FINALITY_TIMEOUT),
+            )
+            .await?;
 
-            let replies: Vec<_> = futures::future::join_all(futures)
-                .await
-                .into_iter()
-                .filter(|result| match result {
-                    Err(e) => !e.to_string().contains("deadline has elapsed"),
-                    _ => true,
-                })
-                .collect();
-
-            if !replies.is_empty() {
-                break replies;
-            }
-        };
-        let replies: SuiResult<Vec<_>> = replies.into_iter().collect();
-        let replies = replies?;
-        let mut all_effects = HashMap::new();
-        let mut all_events = HashMap::new();
-        for reply in replies {
-            let effects = reply.signed_effects.into_data();
-            all_effects.insert(effects.digest(), effects);
-            all_events.insert(reply.events.digest(), reply.events);
-            // reply.fastpath_input_objects is unused.
-        }
-        assert_eq!(all_effects.len(), 1);
-        assert_eq!(all_events.len(), 1);
         Ok((
-            all_effects.into_values().next().unwrap(),
-            all_events.into_values().next().unwrap(),
+            response.effects.effects,
+            response.events.unwrap_or_default(),
         ))
     }
 
@@ -742,13 +1128,9 @@ impl TestCluster {
             .await
             .transfer_sui(Some(amount), receiver)
             .build();
-        let effects = self
-            .sign_and_execute_transaction(&tx)
-            .await
-            .effects
-            .unwrap();
-        assert_eq!(&SuiExecutionStatus::Success, effects.status());
-        effects.created().first().unwrap().object_id()
+        let effects = self.sign_and_execute_transaction(&tx).await.effects;
+        assert!(effects.status().is_ok());
+        effects.created().first().unwrap().0.0
     }
 
     #[cfg(msim)]
@@ -850,15 +1232,23 @@ pub struct TestClusterBuilder {
     fullnode_policy_config: Option<PolicyConfig>,
     fullnode_fw_config: Option<RemoteFirewallConfig>,
 
-    max_submit_position: Option<usize>,
-    submit_delay_step_override_millis: Option<u64>,
     validator_global_state_hash_v2_enabled_config: GlobalStateHashV2EnabledConfig,
+    validator_funds_withdraw_scheduler_type_config: FundsWithdrawSchedulerTypeConfig,
 
-    indexer_backed_rpc: bool,
+    rpc_config: Option<sui_config::RpcConfig>,
 
     chain_override: Option<Chain>,
 
-    transaction_driver_percentage: Option<u8>,
+    execution_time_observer_config: Option<sui_config::node::ExecutionTimeObserverConfig>,
+
+    validator_observer_config: Option<ValidatorObserverConfigCallback>,
+
+    observer_fullnode: bool,
+
+    state_sync_config: Option<sui_config::p2p::StateSyncConfig>,
+
+    peer_deny_sync_config_callback:
+        Option<sui_swarm_config::network_config_builder::PeerDenySyncConfigCallback>,
 
     #[cfg(msim)]
     inject_synthetic_execution_time: bool,
@@ -890,16 +1280,71 @@ impl TestClusterBuilder {
             fullnode_run_with_range: None,
             fullnode_policy_config: None,
             fullnode_fw_config: None,
-            max_submit_position: None,
-            submit_delay_step_override_millis: None,
             validator_global_state_hash_v2_enabled_config: GlobalStateHashV2EnabledConfig::Global(
                 true,
             ),
-            indexer_backed_rpc: false,
-            transaction_driver_percentage: None,
+            validator_funds_withdraw_scheduler_type_config:
+                FundsWithdrawSchedulerTypeConfig::PerValidator(Arc::new(|idx| {
+                    if idx % 2 == 0 {
+                        FundsWithdrawSchedulerType::Eager
+                    } else {
+                        FundsWithdrawSchedulerType::Naive
+                    }
+                })),
+            rpc_config: None,
+            execution_time_observer_config: None,
+            validator_observer_config: None,
+            observer_fullnode: false,
+            state_sync_config: None,
+            peer_deny_sync_config_callback: None,
             #[cfg(msim)]
             inject_synthetic_execution_time: false,
         }
+    }
+
+    pub fn with_state_sync_config(mut self, config: sui_config::p2p::StateSyncConfig) -> Self {
+        self.state_sync_config = Some(config);
+        self
+    }
+
+    /// Per-validator hook for `peer_deny_sync_config`. The closure receives this
+    /// validator's authority name and the slice of all genesis-committee authority
+    /// names, so callers can compute an allowlist that references peers (e.g.
+    /// "trust everyone but myself").
+    pub fn with_peer_deny_sync_config_per_validator(
+        mut self,
+        f: sui_swarm_config::network_config_builder::PeerDenySyncConfigCallback,
+    ) -> Self {
+        self.peer_deny_sync_config_callback = Some(f);
+        self
+    }
+
+    pub fn with_execution_time_observer_config(
+        mut self,
+        config: sui_config::node::ExecutionTimeObserverConfig,
+    ) -> Self {
+        self.execution_time_observer_config = Some(config);
+        self
+    }
+
+    pub fn with_validator_observer_config(mut self, c: ValidatorObserverConfigCallback) -> Self {
+        self.validator_observer_config = Some(c);
+        self
+    }
+
+    /// Adds a fullnode to the cluster that syncs as a consensus observer, subscribed to the
+    /// first validator. Unless a validator observer config is provided, the first validator
+    /// gets its observer server enabled. The observer is available via
+    /// `TestCluster::observer_node()`.
+    ///
+    /// The first validator must end up with its observer server enabled, which `build()`
+    /// validates: a callback passed to `with_validator_observer_config` must return
+    /// `Some(_)` for index 0, and a prebuilt network config passed to `set_network_config`
+    /// must already enable the observer server on the first validator (the callback is not
+    /// applied to prebuilt network configs).
+    pub fn with_observer_fullnode(mut self) -> Self {
+        self.observer_fullnode = true;
+        self
     }
 
     pub fn with_fullnode_run_with_range(mut self, run_with_range: Option<RunWithRange>) -> Self {
@@ -987,6 +1432,10 @@ impl TestClusterBuilder {
     }
 
     pub fn with_epoch_duration_ms(mut self, epoch_duration_ms: u64) -> Self {
+        assert!(
+            epoch_duration_ms >= 10000,
+            "Epoch duration must be at least 10s (10000ms) to avoid flaky tests. Got {epoch_duration_ms}ms."
+        );
         self.get_or_init_genesis_config()
             .parameters
             .epoch_duration_ms = epoch_duration_ms;
@@ -1098,21 +1547,8 @@ impl TestClusterBuilder {
         self
     }
 
-    pub fn with_max_submit_position(mut self, max_submit_position: usize) -> Self {
-        self.max_submit_position = Some(max_submit_position);
-        self
-    }
-
-    pub fn with_submit_delay_step_override_millis(
-        mut self,
-        submit_delay_step_override_millis: u64,
-    ) -> Self {
-        self.submit_delay_step_override_millis = Some(submit_delay_step_override_millis);
-        self
-    }
-
-    pub fn with_indexer_backed_rpc(mut self) -> Self {
-        self.indexer_backed_rpc = true;
+    pub fn with_rpc_config(mut self, config: sui_config::RpcConfig) -> Self {
+        self.rpc_config = Some(config);
         self
     }
 
@@ -1127,13 +1563,6 @@ impl TestClusterBuilder {
         self
     }
 
-    /// Percentage of transactions going through TransactionDriver, instead of QuorumDriver.
-    /// Can be overridden by setting the TRANSACTION_DRIVER environment variable.
-    pub fn transaction_driver_percentage(mut self, percent: u8) -> Self {
-        self.transaction_driver_percentage = Some(percent);
-        self
-    }
-
     pub async fn build(mut self) -> TestCluster {
         // All test clusters receive a continuous stream of random JWKs.
         // If we later use zklogin authenticated transactions in tests we will need to supply
@@ -1141,7 +1570,7 @@ impl TestClusterBuilder {
         #[cfg(msim)]
         if !self.default_jwks {
             sui_node::set_jwk_injector(Arc::new(|_authority, provider| {
-                use fastcrypto_zkp::bn254::zk_login::{JwkId, JWK};
+                use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
                 use rand::Rng;
 
                 // generate random (and possibly conflicting) id/key pairings.
@@ -1164,52 +1593,77 @@ impl TestClusterBuilder {
             }));
         }
 
-        let mut temp_data_ingestion_dir = None;
-        let mut data_ingestion_path = None;
-
-        if self.indexer_backed_rpc {
-            if self.data_ingestion_dir.is_none() {
-                temp_data_ingestion_dir = Some(mysten_common::tempdir().unwrap());
-                self.data_ingestion_dir = Some(
-                    temp_data_ingestion_dir
-                        .as_ref()
-                        .unwrap()
-                        .path()
-                        .to_path_buf(),
+        if self.observer_fullnode {
+            // The observer fullnode subscribes to the first validator, so its observer server
+            // must be enabled. Validate this up front to fail with an actionable error instead
+            // of a deep panic in `observer_peer_record` when the observer's config is built.
+            if let Some(network_config) = &self.network_config {
+                // A prebuilt network config bypasses the validator observer config callback,
+                // so it must already have the observer server enabled.
+                let observer_enabled = network_config
+                    .validator_configs()
+                    .first()
+                    .and_then(|c| c.consensus_config())
+                    .and_then(|c| c.parameters.as_ref())
+                    .and_then(|p| p.observer.server_port)
+                    .is_some();
+                assert!(
+                    observer_enabled,
+                    "with_observer_fullnode() requires the first validator's observer server \
+                     to be enabled, but the network config passed to set_network_config() does \
+                     not enable it. Enable the observer server on the first validator when \
+                     building the network config."
                 );
-                assert!(self.data_ingestion_dir.is_some());
+            } else if let Some(cb) = &self.validator_observer_config {
+                assert!(
+                    cb(0).is_some(),
+                    "with_observer_fullnode() requires the validator observer config callback \
+                     to enable the observer server on the first validator (index 0)."
+                );
+            } else {
+                self.validator_observer_config = Some(Arc::new(|idx| {
+                    (idx == 0).then(consensus_config::ObserverParameters::default)
+                }));
             }
-            assert!(self.data_ingestion_dir.is_some());
-            data_ingestion_path = Some(self.data_ingestion_dir.as_ref().unwrap().to_path_buf());
         }
 
-        let swarm = self.start_swarm().await.unwrap();
-        let working_dir = swarm.dir();
+        let mut swarm = self.start_swarm().await.unwrap();
+        let working_dir = swarm.dir().to_path_buf();
 
         let fullnode = swarm.fullnodes().next().unwrap();
         let json_rpc_address = fullnode.config().json_rpc_address;
         let fullnode_handle =
             FullNodeHandle::new(fullnode.get_node_handle().unwrap(), json_rpc_address).await;
 
-        let (rpc_url, indexer_handle) = if self.indexer_backed_rpc {
-            let handle = test_indexer_handle::IndexerHandle::new(
-                fullnode_handle.rpc_url.clone(),
-                temp_data_ingestion_dir,
-                data_ingestion_path.unwrap(),
-            )
+        if self.observer_fullnode {
+            // Boxed so the frame (NodeConfig by value, held across the await) lives on
+            // the heap instead of inflating build()'s state machine for every caller,
+            // most of which never enable the observer. Unoptimized async frames are
+            // large enough that this tips borderline test binaries over the 2 MiB
+            // tokio worker stack.
+            Box::pin(async {
+                let mut config = swarm
+                    .get_fullnode_config_builder()
+                    .with_observer_subscribed_to_validator(0)
+                    .build(&mut OsRng, swarm.config());
+                // An observer that halts at a checkpoint range boundary defeats its purpose.
+                config.run_with_range = None;
+                // Deliberately drop the returned node handle: holding it would keep the
+                // instance alive across a crash and prevent the simulator from restarting
+                // the node. Access the observer via `TestCluster::observer_node()`.
+                swarm.spawn_new_node(config).await;
+            })
             .await;
-            (handle.rpc_url.clone(), Some(handle))
-        } else {
-            (fullnode_handle.rpc_url.clone(), None)
-        };
+        }
 
         let mut wallet_conf: SuiClientConfig =
             PersistedConfig::read(&working_dir.join(SUI_CLIENT_CONFIG)).unwrap();
         wallet_conf.envs.push(SuiEnv {
             alias: "localnet".to_string(),
-            rpc: rpc_url,
+            rpc: fullnode_handle.rpc_url.clone(),
             ws: None,
             basic_auth: None,
+            chain_id: None,
         });
         wallet_conf.active_env = Some("localnet".to_string());
 
@@ -1221,15 +1675,18 @@ impl TestClusterBuilder {
         let wallet_conf = swarm.dir().join(SUI_CLIENT_CONFIG);
         let wallet = WalletContext::new(&wallet_conf).unwrap();
 
-        let transaction_driver_percentage = self.transaction_driver_percentage;
-
-        TestCluster {
+        let cluster = TestCluster {
             swarm,
             wallet,
             fullnode_handle,
-            indexer_handle,
-            transaction_driver_percentage,
-        }
+        };
+
+        // The embedded rpc-store indexes the tip asynchronously, so genesis
+        // data is not queryable through every index surface the instant the node
+        // is up. Wait for it before handing the cluster to tests.
+        cluster.wait_for_rpc_index_ready().await;
+
+        cluster
     }
 
     /// Start a Swarm and set up WalletConfig
@@ -1242,6 +1699,9 @@ impl TestClusterBuilder {
             )
             .with_global_state_hash_v2_enabled_config(
                 self.validator_global_state_hash_v2_enabled_config.clone(),
+            )
+            .with_funds_withdraw_scheduler_type_config(
+                self.validator_funds_withdraw_scheduler_type_config.clone(),
             )
             .with_fullnode_count(1)
             .with_fullnode_supported_protocol_versions_config(
@@ -1285,6 +1745,10 @@ impl TestClusterBuilder {
         if let Some(fullnode_rpc_port) = self.fullnode_rpc_port {
             builder = builder.with_fullnode_rpc_port(fullnode_rpc_port);
         }
+
+        if let Some(rpc_config) = &self.rpc_config {
+            builder = builder.with_fullnode_rpc_config(rpc_config.clone());
+        }
         if let Some(num_unpruned_validators) = self.num_unpruned_validators {
             builder = builder.with_num_unpruned_validators(num_unpruned_validators);
         }
@@ -1301,26 +1765,36 @@ impl TestClusterBuilder {
             builder = builder.with_data_ingestion_dir(data_ingestion_dir);
         }
 
-        if let Some(max_submit_position) = self.max_submit_position {
-            builder = builder.with_max_submit_position(max_submit_position);
+        if let Some(state_sync_config) = self.state_sync_config.clone() {
+            builder = builder.with_state_sync_config(state_sync_config);
         }
 
-        if let Some(submit_delay_step_override_millis) = self.submit_delay_step_override_millis {
-            builder =
-                builder.with_submit_delay_step_override_millis(submit_delay_step_override_millis);
+        if let Some(cb) = self.peer_deny_sync_config_callback.clone() {
+            builder = builder.with_peer_deny_sync_config_per_validator(cb);
         }
 
         if self.disable_fullnode_pruning {
             builder = builder.with_disable_fullnode_pruning();
         }
 
-        #[cfg(msim)]
-        if self.inject_synthetic_execution_time {
-            use sui_config::node::ExecutionTimeObserverConfig;
+        if let Some(validator_observer_config) = self.validator_observer_config.take() {
+            builder = builder.with_validator_observer_config(validator_observer_config);
+        }
 
-            let mut config = ExecutionTimeObserverConfig::default();
-            config.inject_synthetic_execution_time = Some(true);
-            builder = builder.with_execution_time_observer_config(config);
+        #[cfg(msim)]
+        {
+            if let Some(mut config) = self.execution_time_observer_config.clone() {
+                if self.inject_synthetic_execution_time {
+                    config.inject_synthetic_execution_time = Some(true);
+                }
+                builder = builder.with_execution_time_observer_config(config);
+            } else if self.inject_synthetic_execution_time {
+                use sui_config::node::ExecutionTimeObserverConfig;
+
+                let mut config = ExecutionTimeObserverConfig::default();
+                config.inject_synthetic_execution_time = Some(true);
+                builder = builder.with_execution_time_observer_config(config);
+            }
         }
 
         let mut swarm = builder.build();

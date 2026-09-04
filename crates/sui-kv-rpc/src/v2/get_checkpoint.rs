@@ -1,20 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use sui_kvstore::{BigTableClient, KeyValueStoreReader};
+use sui_kvstore::{BigTableClient, CheckpointData, KeyValueStoreReader};
 use sui_rpc::field::{FieldMask, FieldMaskTree, FieldMaskUtil};
-use sui_rpc::merge::Merge;
 use sui_rpc::proto::sui::rpc::v2::get_checkpoint_request::CheckpointId;
 use sui_rpc::proto::sui::rpc::v2::{Checkpoint, GetCheckpointRequest, GetCheckpointResponse};
 use sui_rpc_api::{
-    proto::google::rpc::bad_request::FieldViolation, CheckpointNotFoundError, ErrorReason, RpcError,
+    CheckpointNotFoundError, ErrorReason, RpcError, proto::google::rpc::bad_request::FieldViolation,
 };
 use sui_types::digests::CheckpointDigest;
 
-pub const READ_MASK_DEFAULT: &str = "sequence_number,digest";
+use crate::bigtable_client::BigTableClient as LimitedBigTableClient;
+use crate::config::{PipelineStage, ResolvedStageConfig, StagesConfig};
+use crate::render;
+use crate::resolve;
+
+pub const READ_MASK_DEFAULT: &str = sui_rpc_api::read_mask_defaults::CHECKPOINT;
 
 pub async fn get_checkpoint(
     mut client: BigTableClient,
+    limited_client: LimitedBigTableClient,
+    stages: &StagesConfig,
+    service_info_watermark_pipelines: &[&str],
     request: GetCheckpointRequest,
 ) -> Result<GetCheckpointResponse, RpcError> {
     let read_mask = {
@@ -28,6 +35,8 @@ pub async fn get_checkpoint(
         })?;
         FieldMaskTree::from(read_mask)
     };
+    let needs_full = resolve::needs_transactions_or_objects(&read_mask);
+    let columns = resolve::list_checkpoint_columns(&read_mask, needs_full);
     let checkpoint = match request.checkpoint_id {
         Some(CheckpointId::Digest(digest)) => {
             let digest = digest.parse::<CheckpointDigest>().map_err(|e| {
@@ -36,44 +45,75 @@ pub async fn get_checkpoint(
                     .with_reason(ErrorReason::FieldInvalid)
             })?;
             client
-                .get_checkpoint_by_digest(digest)
+                .get_checkpoint_by_digest_filtered(digest, Some(&columns))
                 .await?
                 .ok_or(CheckpointNotFoundError::digest(digest.into()))?
         }
         Some(CheckpointId::SequenceNumber(sequence_number)) => client
-            .get_checkpoints(&[sequence_number])
+            .get_checkpoints_filtered(&[sequence_number], Some(&columns))
             .await?
             .pop()
             .ok_or(CheckpointNotFoundError::sequence_number(sequence_number))?,
-        None => {
-            let sequence_number = client.get_latest_checkpoint().await?;
-            client
-                .get_checkpoints(&[sequence_number])
-                .await?
-                .pop()
-                .ok_or(CheckpointNotFoundError::sequence_number(sequence_number))?
-        }
         _ => {
-            let sequence_number = client.get_latest_checkpoint().await?;
+            // Bound "latest" by the same pipeline set `GetServiceInfo` uses, not just the base
+            // checkpoints pipeline: when the List APIs are enabled, their list-index pipelines
+            // can lag behind the base pipeline, and callers resolving "latest" this way (e.g. to
+            // bound a subsequent List API call) need it to reflect what the List APIs can
+            // actually serve, not a checkpoint they haven't indexed yet.
+            let sequence_number = client
+                .get_watermark_for_pipelines(service_info_watermark_pipelines)
+                .await?
+                .and_then(|wm| wm.checkpoint_hi_inclusive)
+                .ok_or(CheckpointNotFoundError::sequence_number(0))?;
             client
-                .get_checkpoints(&[sequence_number])
+                .get_checkpoints_filtered(&[sequence_number], Some(&columns))
                 .await?
                 .pop()
                 .ok_or(CheckpointNotFoundError::sequence_number(sequence_number))?
         }
     };
-    let mut message = Checkpoint::default();
-    let summary: sui_sdk_types::CheckpointSummary = checkpoint.summary.try_into()?;
-    let signatures: sui_sdk_types::ValidatorAggregatedSignature = checkpoint.signatures.into();
-    message.merge(&summary, &read_mask);
-    message.merge(signatures, &read_mask);
 
-    if read_mask.contains(Checkpoint::CONTENTS_FIELD.name) {
-        message.merge(
-            sui_sdk_types::CheckpointContents::try_from(checkpoint.contents)?,
+    let message = if needs_full {
+        let transactions_stage = stages.stage(PipelineStage::Transactions);
+        let objects_stage = stages.stage(PipelineStage::Objects);
+        resolve_full_checkpoint(
+            limited_client,
+            checkpoint,
             &read_mask,
-        );
-    }
-    // TODO: handle Checkpoint::TRANSACTIONS_FIELD submask
+            transactions_stage,
+            objects_stage,
+        )
+        .await?
+    } else {
+        render::checkpoint_to_response(checkpoint, &read_mask)?
+    };
     Ok(GetCheckpointResponse::new(message))
+}
+
+/// Heavy path: resolve the checkpoint's transactions and (when requested)
+/// objects from BigTable, then render the full proto `Checkpoint`.
+async fn resolve_full_checkpoint(
+    limited_client: LimitedBigTableClient,
+    checkpoint: CheckpointData,
+    read_mask: &FieldMaskTree,
+    transactions_stage: ResolvedStageConfig,
+    objects_stage: ResolvedStageConfig,
+) -> Result<Checkpoint, RpcError> {
+    let cp_seq = checkpoint
+        .summary
+        .as_ref()
+        .map(|s| s.sequence_number)
+        .ok_or_else(|| RpcError::new(tonic::Code::Internal, "checkpoint summary column missing"))?;
+
+    let (_, cp_data, txs, objects) = resolve::resolve_checkpoint(
+        limited_client,
+        read_mask,
+        transactions_stage,
+        objects_stage,
+        cp_seq,
+        checkpoint,
+    )
+    .await?;
+
+    render::render_full_checkpoint(cp_data, txs, objects, read_mask)
 }

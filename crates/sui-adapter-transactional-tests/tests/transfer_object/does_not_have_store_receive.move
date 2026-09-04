@@ -88,11 +88,11 @@ module test::m {
 
 //# run test::m::mint_cup --sender A --type-args u64
 
-//# view-object 6,0
-
 //# view-object 6,1
 
-//# programmable --sender A --inputs object(6,1) receiving(6,0)
+//# view-object 6,0
+
+//# programmable --sender A --inputs object(6,0) receiving(6,1)
 //> 0: test::m::receive_cup<u64>(Input(0), Input(1));
 //> 1: test::m::destroy_cup<u64>(Result(0));
 
@@ -111,6 +111,8 @@ module test::m {
 //# programmable --sender A --inputs object(10,0) receiving(10,1)
 //> 0: test::m::parent_uid(Input(0));
 //> 1: sui::transfer::receive<test::m::S>(Result(0), Input(1));
+//> 2: sui::object::delete(Result(0));
+//> 3: test::m::destroy_s(Result(1));
 
 // Now publish one with store. We should:
 // 1. Not be able to call `receive` to receive it.
@@ -125,6 +127,8 @@ module test::m {
 //# programmable --sender A --inputs object(15,0) receiving(15,1)
 //> 0: test::m::parent_uid(Input(0));
 //> 1: sui::transfer::receive<test::m::Store>(Result(0), Input(1));
+//> 2: sui::object::delete(Result(0));
+//> 3: test::m::destroy_store(Result(1));
 
 // Can receive it via a direct `public_receive` call since `Store` has the `store` ability.
 //# programmable --sender A --inputs object(15,0) receiving(15,1)

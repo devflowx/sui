@@ -3,43 +3,41 @@
 
 use crate::{
     artifacts::{Artifact, ArtifactManager},
-    data_stores::{
-        data_store::DataStore, file_system_store::FileSystemStore, in_memory_store::InMemoryStore,
-        read_through_store::ReadThroughStore,
-    },
     displays::Pretty,
-    replay_interface::{ReadDataStore, SetupStore, StoreSummary},
     replay_txn::replay_transaction,
+    summary_metrics::TotalMetrics,
 };
-use anyhow::{anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use move_package_alt::schema::EnvironmentName;
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    str::FromStr,
+    time::Duration,
 };
 use sui_config::sui_config_dir;
+use sui_data_store::{
+    Node, ReadDataStore, SetupStore, StoreSummary,
+    stores::{DataStore, FileSystemStore, InMemoryStore, ReadThroughStore},
+};
 use sui_json_rpc_types::SuiTransactionBlockEffects;
-use sui_types::{effects::TransactionEffects, supported_protocol_versions::Chain};
+use sui_types::effects::TransactionEffects;
 // Disambiguate external tracing crate from local `crate::tracing` module using absolute path.
-use ::tracing::{debug, error, info, info_span, warn, Instrument};
+use ::tracing::{Instrument, debug, error, info_span, warn};
 
 pub mod artifacts;
-#[path = "data-stores/mod.rs"]
-pub mod data_stores;
 pub mod displays;
 pub mod execution;
-pub mod replay_interface;
+pub mod package_tools;
 pub mod replay_txn;
 pub mod summary_metrics;
 pub mod tracing;
 
 const DEFAULT_OUTPUT_DIR: &str = ".replay";
-const MAINNET_GQL_URL: &str = "https://graphql.mainnet.sui.io/graphql";
-const TESTNET_GQL_URL: &str = "https://graphql.testnet.sui.io/graphql";
 const CONFIG_FILE_NAME: &str = "replay.toml";
 
 // Arguments to the replay tool.
@@ -56,10 +54,69 @@ const CONFIG_FILE_NAME: &str = "replay.toml";
     rename_all = "kebab-case"
 )]
 pub struct Config {
+    #[command(subcommand)]
+    pub command: Option<Command>,
     #[command(flatten)]
     pub replay_stable: ReplayConfigStable,
     #[command(flatten)]
     pub replay_experimental: ReplayConfigExperimental,
+}
+
+/// Subcommands for the replay tool
+#[derive(Parser, Clone, Debug)]
+pub enum Command {
+    /// Rebuild a package from cache and source
+    RebuildPackage {
+        /// Package ID to rebuild
+        #[arg(long = "pkg-id")]
+        package_id: String,
+
+        /// Path to package source directory
+        #[arg(long = "pkg-src")]
+        package_source: PathBuf,
+
+        /// Output path for rebuilt package binary. If not specified, replaces the package in cache
+        #[arg(short = 'o', long = "output")]
+        output_path: Option<PathBuf>,
+
+        /// RPC of the fullnode used to fetch the package
+        #[arg(short = 'n', long = "node", default_value = "mainnet")]
+        node: Node,
+
+        /// Environment to use to rebuild the package
+        #[arg(short = 'e', long = "build-env", default_value = "mainnet")]
+        env: EnvironmentName,
+    },
+
+    /// Extract a package from cache to a file
+    ExtractPackage {
+        /// Package ID to extract
+        #[arg(long = "pkg-id")]
+        package_id: String,
+
+        /// Output path for extracted package binary
+        #[arg(short = 'o', long = "output")]
+        output_path: PathBuf,
+
+        /// RPC of the fullnode cache to extract from
+        #[arg(short = 'n', long = "node", default_value = "mainnet")]
+        node: Node,
+    },
+
+    /// Overwrite a package in cache with a provided package file
+    OverwritePackage {
+        /// Package ID to overwrite
+        #[arg(long = "pkg-id")]
+        package_id: String,
+
+        /// Path to the package file to write
+        #[arg(long = "pkg-path")]
+        package_path: PathBuf,
+
+        /// RPC of the fullnode cache to write to
+        #[arg(short = 'n', long = "node", default_value = "mainnet")]
+        node: Node,
+    },
 }
 
 /// Arguments for replay (used for both CLI and config file)
@@ -95,6 +152,12 @@ pub struct ReplayConfigStable {
     /// should be overwritten or an error raised if they already exist.
     #[arg(long = "overwrite", num_args = 0, default_missing_value = "true")]
     pub overwrite: Option<bool>,
+
+    /// Skip writing replay artifacts (transaction data, effects, gas report, cache summary,
+    /// move call info, trace) to disk. Useful for performance profiling where artifact
+    /// serialization would otherwise dominate the trace.
+    #[arg(long = "skip-artifacts", num_args = 0, default_missing_value = "true")]
+    pub skip_artifacts: Option<bool>,
 }
 
 /// Arguments for replay used for internal processing
@@ -108,6 +171,7 @@ pub struct ReplayConfigStableInternal {
     pub output_dir: Option<PathBuf>,
     pub show_effects: bool,
     pub overwrite: bool,
+    pub skip_artifacts: bool,
 }
 
 impl Default for ReplayConfigStableInternal {
@@ -124,6 +188,7 @@ impl Default for ReplayConfigStableInternal {
             output_dir: None,
             show_effects: true,
             overwrite: false,
+            skip_artifacts: false,
         }
     }
 }
@@ -148,9 +213,18 @@ pub struct ReplayConfigExperimental {
     /// - gql-only: remote GraphQL only
     /// - fs-then-gql: FileSystem primary with GraphQL fallback
     /// - fs-only: FileSystem only
+    /// - inmem-fs: InMemory -> FileSystem
     /// - inmem-fs-gql: InMemory -> FileSystem -> GraphQL (default)
     #[arg(long = "store-mode", value_enum, default_value_t = StoreMode::GqlOnly)]
     pub store_mode: StoreMode,
+
+    /// Include execution and total time in transaction output.
+    #[arg(long = "track-time", default_value = "false")]
+    pub track_time: bool,
+
+    /// Cache executors across transactions within the same epoch.
+    #[arg(long = "cache-executor", default_value = "false")]
+    pub cache_executor: bool,
 }
 
 impl Default for ReplayConfigExperimental {
@@ -159,6 +233,8 @@ impl Default for ReplayConfigExperimental {
             node: Node::Mainnet,
             verbose: false,
             store_mode: StoreMode::GqlOnly,
+            track_time: false,
+            cache_executor: false,
         }
     }
 }
@@ -171,67 +247,15 @@ pub enum StoreMode {
     FsThenGql,
     #[value(name = "fs-only")]
     FsOnly,
+    #[value(name = "inmem-fs")]
+    InmemFs,
     #[value(name = "inmem-fs-gql")]
     InmemFsGql,
 }
 
-/// Enum around rpc gql endpoints.
-#[derive(Clone, Debug)]
-pub enum Node {
-    Mainnet,
-    Testnet,
-    // TODO: define once we have stable end points.
-    //       Use `Custom` for now.
-    // Devnet,
-    Custom(String),
-}
-
-impl Node {
-    pub fn chain(&self) -> Chain {
-        match self {
-            Node::Mainnet => Chain::Mainnet,
-            Node::Testnet => Chain::Testnet,
-            // Node::Devnet => Chain::Unknown,
-            Node::Custom(_) => Chain::Unknown,
-        }
-    }
-
-    pub fn rpc_url(&self) -> &str {
-        match self {
-            Node::Mainnet => MAINNET_GQL_URL,
-            Node::Testnet => TESTNET_GQL_URL,
-            // Node::Devnet => "",
-            Node::Custom(url) => url.as_str(),
-        }
-    }
-
-    pub fn node_dir(&self) -> &str {
-        match self {
-            Node::Mainnet => "mainnet",
-            Node::Testnet => "testnet",
-            // Node::Devnet => "devnet",
-            // TODO: custom provides a URL which has to be translated to a valid directory name
-            Node::Custom(_) => "custom",
-        }
-    }
-}
-
-impl FromStr for Node {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "mainnet" => Ok(Node::Mainnet),
-            "testnet" => Ok(Node::Testnet),
-            // "devnet" => Ok(Node::Devnet),
-            _ => Ok(Node::Custom(s.to_string())),
-        }
-    }
-}
-
 /// Load replay configuration from ~/.sui/sui_config/replay.toml file.
 /// Returns default config (all fields set to None) if file cannot be found or read.
-pub fn load_config_file() -> anyhow::Result<ReplayConfigStable> {
+pub fn load_config_file() -> Result<ReplayConfigStable> {
     let config_dir = match sui_config_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -302,6 +326,11 @@ pub fn merge_configs(
             .overwrite
             .or(file_config.overwrite)
             .unwrap_or(default_config.overwrite),
+
+        skip_artifacts: cli_config
+            .skip_artifacts
+            .or(file_config.skip_artifacts)
+            .unwrap_or(default_config.skip_artifacts),
     }
 }
 
@@ -309,21 +338,25 @@ pub async fn handle_replay_config(
     stable_config: &ReplayConfigStableInternal,
     experimental_config: &ReplayConfigExperimental,
     version: &str,
-) -> anyhow::Result<PathBuf> {
+) -> Result<PathBuf> {
     let ReplayConfigStableInternal {
         digest,
         digests_path,
-        mut terminate_early,
+        terminate_early,
         trace,
         output_dir,
         show_effects: _, // used in the caller
         overwrite: overwrite_existing,
+        skip_artifacts,
     } = &stable_config;
+    let mut terminate_early = *terminate_early;
 
     let ReplayConfigExperimental {
         node,
         verbose,
         store_mode,
+        track_time,
+        cache_executor,
     } = experimental_config;
 
     let output_root_dir = if let Some(dir) = output_dir {
@@ -378,10 +411,14 @@ pub async fn handle_replay_config(
                 &gql_store,
                 &output_root_dir,
                 &digests,
+                node,
                 *overwrite_existing,
                 *trace,
                 *verbose,
                 terminate_early,
+                *track_time,
+                *cache_executor,
+                *skip_artifacts,
             )
             .await?;
         }
@@ -395,10 +432,14 @@ pub async fn handle_replay_config(
                 &store,
                 &output_root_dir,
                 &digests,
+                node,
                 *overwrite_existing,
                 *trace,
                 *verbose,
                 terminate_early,
+                *track_time,
+                *cache_executor,
+                *skip_artifacts,
             )
             .await?;
         }
@@ -409,10 +450,34 @@ pub async fn handle_replay_config(
                 &fs_store,
                 &output_root_dir,
                 &digests,
+                node,
                 *overwrite_existing,
                 *trace,
                 *verbose,
                 terminate_early,
+                *track_time,
+                *cache_executor,
+                *skip_artifacts,
+            )
+            .await?;
+        }
+        StoreMode::InmemFs => {
+            let fs_store = FileSystemStore::new(node.clone())
+                .map_err(|e| anyhow!("Failed to create file system store: {:?}", e))?;
+            let in_memory_store = InMemoryStore::new(node.clone());
+            let store = ReadThroughStore::new(in_memory_store, fs_store);
+            run_replay(
+                &store,
+                &output_root_dir,
+                &digests,
+                node,
+                *overwrite_existing,
+                *trace,
+                *verbose,
+                terminate_early,
+                *track_time,
+                *cache_executor,
+                *skip_artifacts,
             )
             .await?;
         }
@@ -428,10 +493,14 @@ pub async fn handle_replay_config(
                 &store,
                 &output_root_dir,
                 &digests,
+                node,
                 *overwrite_existing,
                 *trace,
                 *verbose,
                 terminate_early,
+                *track_time,
+                *cache_executor,
+                *skip_artifacts,
             )
             .await?;
         }
@@ -444,22 +513,72 @@ async fn run_replay<S>(
     data_store: &S,
     output_root_dir: &Path,
     digests: &[String],
+    node: &Node,
     overwrite_existing: bool,
     trace: bool,
     verbose: bool,
     terminate_early: bool,
-) -> anyhow::Result<()>
+    track_time: bool,
+    cache_executor: bool,
+    skip_artifacts: bool,
+) -> Result<()>
 where
     S: ReadDataStore + StoreSummary + SetupStore,
 {
+    use crate::replay_txn::ExecutorProvider;
+    use std::time::Instant;
+
     data_store.setup(None)?;
+    let mut total_metrics = TotalMetrics::new();
+    let mut executor_provider = ExecutorProvider::new(cache_executor);
+
+    let mp = MultiProgress::new();
+    let tx_spinner = mp.add(ProgressBar::new_spinner());
+    let progress_bar = mp.add(ProgressBar::new(digests.len() as u64));
+
+    tx_spinner.set_style(ProgressStyle::with_template("{spinner}: {msg}").unwrap());
+    tx_spinner.enable_steady_tick(Duration::from_millis(80));
+
     for tx_digest in digests {
         let tx_dir = output_root_dir.join(tx_digest);
-        let artifact_manager = ArtifactManager::new(&tx_dir, overwrite_existing)?;
+        let artifact_manager =
+            ArtifactManager::new_with_options(&tx_dir, overwrite_existing, skip_artifacts)?;
         let span = info_span!("replay", tx_digest = %tx_digest);
-        let result = replay_transaction(&artifact_manager, tx_digest, data_store, trace)
-            .instrument(span)
-            .await;
+
+        tx_spinner.set_message(format!("Executing transaction {}", tx_digest));
+
+        let tx_start = Instant::now();
+        let result = replay_transaction(
+            &artifact_manager,
+            tx_digest,
+            data_store,
+            node.network_name(),
+            trace,
+            &mut executor_provider,
+        )
+        .instrument(span)
+        .await;
+        let tx_total_ms = tx_start.elapsed().as_millis();
+
+        let success = result.is_ok();
+        let exec_ms = result.as_ref().ok().copied().unwrap_or(0);
+
+        total_metrics.add_transaction(success, tx_total_ms, exec_ms);
+
+        // Print per-transaction result
+        let status = if success { "OK" } else { "FAILED" };
+
+        let time_info = if track_time {
+            format!(
+                " ({}): exec_ms={}, total_ms={}",
+                status, exec_ms, tx_total_ms
+            )
+        } else {
+            "".to_owned()
+        };
+
+        tx_spinner.println(format!("Executed transaction {}{}", tx_digest, time_info));
+
         match result {
             Err(e) if terminate_early => {
                 error!(tx_digest = %tx_digest, error = ?e, "Replay error; terminating early");
@@ -468,11 +587,12 @@ where
             Err(e) => {
                 error!(tx_digest = %tx_digest, error = ?e, "Replay failed");
             }
-            Ok(_) => {
-                info!(tx_digest = %tx_digest, "Replay succeeded");
-            }
+            Ok(_) => {}
         }
+        progress_bar.inc(1);
     }
+
+    tx_spinner.finish_and_clear();
 
     if verbose {
         let mut out = std::io::stdout().lock();
@@ -481,6 +601,18 @@ where
             warn!("Failed to write data store summary: {:?}", e);
         }
     }
+
+    if digests.len() > 1 {
+        println!(
+            "Replay run: tx_count={} success={} failure={} - exec_ms={}, total_ms={}",
+            total_metrics.tx_count,
+            total_metrics.success_count,
+            total_metrics.failure_count,
+            total_metrics.exec_ms,
+            total_metrics.total_ms
+        );
+    }
+
     Ok(())
 }
 
@@ -489,7 +621,7 @@ pub fn print_effects_or_fork<W: Write>(
     output_root: &Path,
     show_effects: bool,
     w: &mut W,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let output_dir = output_root.join(digest);
     let manager = ArtifactManager::new(&output_dir, false)?;
     if manager.member(Artifact::ForkedTransactionEffects).exists() {
@@ -519,7 +651,7 @@ pub fn print_effects_or_fork<W: Write>(
             w,
             "{}",
             SuiTransactionBlockEffects::try_from(tx_effects.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to convert effects: {e}"))?
+                .map_err(|e| anyhow!("Failed to convert effects: {e}"))?
         )?;
         manager
             .member(Artifact::TransactionGasReport)

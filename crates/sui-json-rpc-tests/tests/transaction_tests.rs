@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(deprecated)]
+
 #[cfg(not(msim))]
 use std::str::FromStr;
 
@@ -15,15 +17,15 @@ use sui_json_rpc_types::{
     SuiTransactionBlockResponseOptions, TransactionBlockBytes,
 };
 use sui_macros::sim_test;
+use sui_types::SUI_FRAMEWORK_ADDRESS;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::SuiAddress;
 use sui_types::gas_coin::GAS;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::transaction::Command;
 use sui_types::transaction::SenderSignedData;
 use sui_types::transaction::TransactionData;
-use sui_types::SUI_FRAMEWORK_ADDRESS;
+use sui_types::transaction_driver_types::ExecuteTransactionRequestType;
 use test_cluster::TestClusterBuilder;
 
 use sui_json_rpc_api::{IndexerApiClient, TransactionBuilderClient, WriteApiClient};
@@ -168,11 +170,9 @@ async fn test_get_raw_transaction() -> Result<(), anyhow::Error> {
 async fn test_get_fullnode_transaction() -> Result<(), anyhow::Error> {
     let cluster = TestClusterBuilder::new().build().await;
 
-    let context = &cluster.wallet;
-
     let mut tx_responses: Vec<SuiTransactionBlockResponse> = Vec::new();
 
-    let client = context.get_client().await.unwrap();
+    let client = cluster.sui_client().clone();
 
     for address in cluster.get_addresses() {
         let objects = client
@@ -346,8 +346,7 @@ async fn test_get_fullnode_transaction() -> Result<(), anyhow::Error> {
 #[sim_test]
 async fn test_query_transaction_blocks() -> Result<(), anyhow::Error> {
     let mut cluster = TestClusterBuilder::new().build().await;
-    let context = &cluster.wallet;
-    let client = context.get_client().await.unwrap();
+    let client = cluster.sui_client().clone();
 
     let address = cluster.get_address_0();
     let objects = client
@@ -450,9 +449,57 @@ async fn test_query_transaction_blocks() -> Result<(), anyhow::Error> {
 }
 
 #[sim_test]
+async fn test_query_transaction_blocks_to_address() -> Result<(), anyhow::Error> {
+    let cluster = TestClusterBuilder::new().build().await;
+    let http_client = cluster.rpc_client();
+
+    let accumulators_enabled = cluster.fullnode_handle.sui_node.with(|node| {
+        node.state()
+            .epoch_store_for_testing()
+            .protocol_config()
+            .enable_accumulators()
+    });
+    if !accumulators_enabled {
+        return Ok(());
+    }
+
+    let recipient = SuiAddress::random_for_testing_only();
+
+    // Send SUI to the recipient so the address appears in the index.
+    let tx = sui_test_transaction_builder::make_transfer_sui_address_balance_transaction(
+        &cluster.wallet,
+        Some(recipient),
+        1000,
+    )
+    .await;
+    let (tx_bytes, signatures) = tx.to_tx_bytes_and_signatures();
+
+    let response = http_client
+        .execute_transaction_block(
+            tx_bytes,
+            signatures,
+            Some(SuiTransactionBlockResponseOptions::new()),
+            Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+        )
+        .await?;
+
+    // Query transactions where the recipient received funds.
+    let query =
+        SuiTransactionBlockResponseQuery::new_with_filter(TransactionFilter::ToAddress(recipient));
+    let result = http_client
+        .query_transaction_blocks(query, None, Some(10), Some(false))
+        .await?;
+
+    assert_eq!(1, result.data.len());
+    assert_eq!(response.digest, result.data[0].digest);
+
+    Ok(())
+}
+
+#[sim_test]
 async fn test_display_transaction_block_with_empty_balance_changes() {
     let cluster = TestClusterBuilder::new()
-        .with_epoch_duration_ms(5_000)
+        .with_epoch_duration_ms(10_000)
         .build()
         .await;
     cluster.wait_for_epoch(Some(1)).await;

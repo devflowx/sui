@@ -21,7 +21,11 @@ Sui object identifiers
 -  [Function `sui_accumulator_root_address`](#sui_object_sui_accumulator_root_address)
 -  [Function `sui_coin_registry_object_id`](#sui_object_sui_coin_registry_object_id)
 -  [Function `sui_coin_registry_address`](#sui_object_sui_coin_registry_address)
+-  [Function `sui_display_registry_object_id`](#sui_object_sui_display_registry_object_id)
+-  [Function `sui_display_registry_address`](#sui_object_sui_display_registry_address)
 -  [Function `bridge`](#sui_object_bridge)
+-  [Function `address_alias_state`](#sui_object_address_alias_state)
+-  [Function `forwarding_address_registry`](#sui_object_forwarding_address_registry)
 -  [Function `uid_as_inner`](#sui_object_uid_as_inner)
 -  [Function `uid_to_inner`](#sui_object_uid_to_inner)
 -  [Function `uid_to_bytes`](#sui_object_uid_to_bytes)
@@ -35,7 +39,7 @@ Sui object identifiers
 -  [Function `borrow_uid`](#sui_object_borrow_uid)
 -  [Function `new_uid_from_hash`](#sui_object_new_uid_from_hash)
 -  [Function `delete_impl`](#sui_object_delete_impl)
--  [Function `record_new_uid`](#sui_object_record_new_uid)
+-  [Function `record_new_uid_from_hash`](#sui_object_record_new_uid_from_hash)
 
 
 <pre><code><b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
@@ -195,6 +199,36 @@ The hardcoded ID for the Coin Registry Object.
 
 
 <pre><code><b>const</b> <a href="../sui/object.md#sui_object_SUI_COIN_REGISTRY_OBJECT_ID">SUI_COIN_REGISTRY_OBJECT_ID</a>: <b>address</b> = 0xc;
+</code></pre>
+
+
+
+<a name="sui_object_SUI_DISPLAY_REGISTRY_OBJECT_ID"></a>
+
+The hardcoded ID for the Display Registry Object.
+
+
+<pre><code><b>const</b> <a href="../sui/object.md#sui_object_SUI_DISPLAY_REGISTRY_OBJECT_ID">SUI_DISPLAY_REGISTRY_OBJECT_ID</a>: <b>address</b> = 0xd;
+</code></pre>
+
+
+
+<a name="sui_object_SUI_ADDRESS_ALIAS_STATE_ID"></a>
+
+The hardcoded ID for the AddressAliasState Object.
+
+
+<pre><code><b>const</b> <a href="../sui/object.md#sui_object_SUI_ADDRESS_ALIAS_STATE_ID">SUI_ADDRESS_ALIAS_STATE_ID</a>: <b>address</b> = 0xa;
+</code></pre>
+
+
+
+<a name="sui_object_SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID"></a>
+
+The hardcoded ID for the singleton ForwardingAddressRegistry object.
+
+
+<pre><code><b>const</b> <a href="../sui/object.md#sui_object_SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID">SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID</a>: <b>address</b> = 0xfa;
 </code></pre>
 
 
@@ -552,6 +586,58 @@ This should only be called once from <code><a href="../sui/coin_registry.md#sui_
 
 </details>
 
+<a name="sui_object_sui_display_registry_object_id"></a>
+
+## Function `sui_display_registry_object_id`
+
+Create the <code><a href="../sui/object.md#sui_object_UID">UID</a></code> for the singleton <code>DisplayRegistry</code> object.
+This should only be called once from <code><a href="../sui/display_registry.md#sui_display_registry">display_registry</a></code>.
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_sui_display_registry_object_id">sui_display_registry_object_id</a>(): <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_sui_display_registry_object_id">sui_display_registry_object_id</a>(): <a href="../sui/object.md#sui_object_UID">UID</a> {
+    <a href="../sui/object.md#sui_object_UID">UID</a> {
+        <a href="../sui/object.md#sui_object_id">id</a>: <a href="../sui/object.md#sui_object_ID">ID</a> { bytes: <a href="../sui/object.md#sui_object_SUI_DISPLAY_REGISTRY_OBJECT_ID">SUI_DISPLAY_REGISTRY_OBJECT_ID</a> },
+    }
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="sui_object_sui_display_registry_address"></a>
+
+## Function `sui_display_registry_address`
+
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_sui_display_registry_address">sui_display_registry_address</a>(): <b>address</b>
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_sui_display_registry_address">sui_display_registry_address</a>(): <b>address</b> {
+    <a href="../sui/object.md#sui_object_SUI_DISPLAY_REGISTRY_OBJECT_ID">SUI_DISPLAY_REGISTRY_OBJECT_ID</a>
+}
+</code></pre>
+
+
+
+</details>
+
 <a name="sui_object_bridge"></a>
 
 ## Function `bridge`
@@ -572,6 +658,62 @@ This should only be called once from <code><a href="../sui/object.md#sui_object_
 <pre><code><b>fun</b> <a href="../sui/object.md#sui_object_bridge">bridge</a>(): <a href="../sui/object.md#sui_object_UID">UID</a> {
     <a href="../sui/object.md#sui_object_UID">UID</a> {
         <a href="../sui/object.md#sui_object_id">id</a>: <a href="../sui/object.md#sui_object_ID">ID</a> { bytes: <a href="../sui/object.md#sui_object_SUI_BRIDGE_ID">SUI_BRIDGE_ID</a> },
+    }
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="sui_object_address_alias_state"></a>
+
+## Function `address_alias_state`
+
+Create the <code><a href="../sui/object.md#sui_object_UID">UID</a></code> for the singleton <code>AddressAliasState</code> object.
+This should only be called once from <code><a href="../sui/address_alias.md#sui_address_alias">address_alias</a></code>.
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_address_alias_state">address_alias_state</a>(): <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_address_alias_state">address_alias_state</a>(): <a href="../sui/object.md#sui_object_UID">UID</a> {
+    <a href="../sui/object.md#sui_object_UID">UID</a> {
+        <a href="../sui/object.md#sui_object_id">id</a>: <a href="../sui/object.md#sui_object_ID">ID</a> { bytes: <a href="../sui/object.md#sui_object_SUI_ADDRESS_ALIAS_STATE_ID">SUI_ADDRESS_ALIAS_STATE_ID</a> },
+    }
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="sui_object_forwarding_address_registry"></a>
+
+## Function `forwarding_address_registry`
+
+Create the <code><a href="../sui/object.md#sui_object_UID">UID</a></code> for the singleton <code>ForwardingAddressRegistry</code> object.
+This should only be called once from <code><a href="../sui/forwarding_address.md#sui_forwarding_address">forwarding_address</a></code>.
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_forwarding_address_registry">forwarding_address_registry</a>(): <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_forwarding_address_registry">forwarding_address_registry</a>(): <a href="../sui/object.md#sui_object_UID">UID</a> {
+    <a href="../sui/object.md#sui_object_UID">UID</a> {
+        <a href="../sui/object.md#sui_object_id">id</a>: <a href="../sui/object.md#sui_object_ID">ID</a> { bytes: <a href="../sui/object.md#sui_object_SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID">SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID</a> },
     }
 }
 </code></pre>
@@ -872,7 +1014,7 @@ restrictable in the object's module.
 Generate a new UID specifically used for creating a UID from a hash
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_new_uid_from_hash">new_uid_from_hash</a>(bytes: <b>address</b>): <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_new_uid_from_hash">new_uid_from_hash</a>(parent: <b>address</b>, bytes: <b>address</b>): <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>
 </code></pre>
 
 
@@ -881,8 +1023,8 @@ Generate a new UID specifically used for creating a UID from a hash
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_new_uid_from_hash">new_uid_from_hash</a>(bytes: <b>address</b>): <a href="../sui/object.md#sui_object_UID">UID</a> {
-    <a href="../sui/object.md#sui_object_record_new_uid">record_new_uid</a>(bytes);
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/object.md#sui_object_new_uid_from_hash">new_uid_from_hash</a>(parent: <b>address</b>, bytes: <b>address</b>): <a href="../sui/object.md#sui_object_UID">UID</a> {
+    <a href="../sui/object.md#sui_object_record_new_uid_from_hash">record_new_uid_from_hash</a>(parent, bytes);
     <a href="../sui/object.md#sui_object_UID">UID</a> { <a href="../sui/object.md#sui_object_id">id</a>: <a href="../sui/object.md#sui_object_ID">ID</a> { bytes } }
 }
 </code></pre>
@@ -913,13 +1055,13 @@ Generate a new UID specifically used for creating a UID from a hash
 
 </details>
 
-<a name="sui_object_record_new_uid"></a>
+<a name="sui_object_record_new_uid_from_hash"></a>
 
-## Function `record_new_uid`
+## Function `record_new_uid_from_hash`
 
 
 
-<pre><code><b>fun</b> <a href="../sui/object.md#sui_object_record_new_uid">record_new_uid</a>(<a href="../sui/object.md#sui_object_id">id</a>: <b>address</b>)
+<pre><code><b>fun</b> <a href="../sui/object.md#sui_object_record_new_uid_from_hash">record_new_uid_from_hash</a>(parent: <b>address</b>, bytes: <b>address</b>)
 </code></pre>
 
 
@@ -928,7 +1070,7 @@ Generate a new UID specifically used for creating a UID from a hash
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>fun</b> <a href="../sui/object.md#sui_object_record_new_uid">record_new_uid</a>(<a href="../sui/object.md#sui_object_id">id</a>: <b>address</b>);
+<pre><code><b>native</b> <b>fun</b> <a href="../sui/object.md#sui_object_record_new_uid_from_hash">record_new_uid_from_hash</a>(parent: <b>address</b>, bytes: <b>address</b>);
 </code></pre>
 
 

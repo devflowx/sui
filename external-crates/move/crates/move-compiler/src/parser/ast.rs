@@ -216,6 +216,15 @@ pub enum Attribute_ {
     Allow {
         allow_set: BTreeSet<(Option<Name>, Name)>,
     },
+    Deny {
+        deny_set: BTreeSet<(Option<Name>, Name)>,
+    },
+    Expect {
+        expect_set: BTreeSet<(Option<Name>, Name)>,
+    },
+    Warn {
+        warn_set: BTreeSet<(Option<Name>, Name)>,
+    },
     LintAllow {
         allow_set: BTreeSet<Name>,
     },
@@ -274,6 +283,8 @@ pub struct ModuleDefinition {
     pub loc: Loc,
     pub address: Option<LeadingNameAccess>,
     pub name: ModuleName,
+    /// Location of the module name, including any address qualifier
+    pub name_loc: Loc,
     pub is_spec_module: bool,
     pub is_extension: bool,
     pub definition_mode: ModuleDefinitionMode,
@@ -425,6 +436,7 @@ pub struct Constant {
     pub doc: DocComment,
     pub attributes: Vec<Attributes>,
     pub loc: Loc,
+    pub visibility: Visibility,
     pub signature: Type,
     pub name: ConstantName,
     pub value: Exp,
@@ -585,14 +597,8 @@ pub enum BinOp_ {
     Shl,
     // >>
     Shr,
-    // ..
-    Range, // spec only
 
     // Bool ops
-    // ==>
-    Implies, // spec only
-    // <==>
-    Iff,
     // &&
     And,
     // ||
@@ -843,6 +849,16 @@ impl fmt::Debug for LeadingNameAccess_ {
 // Impl
 //**************************************************************************************************
 
+impl ModuleDefinition {
+    pub fn modes(&self) -> UniqueSet<Name> {
+        let mut result = UniqueSet::new();
+        for attr in self.attributes.iter().map(|attr| attr.value.modes()) {
+            result = result.union(&attr);
+        }
+        result
+    }
+}
+
 impl ParsedAttribute_ {
     pub fn loc_str(&self) -> Spanned<&str> {
         match self {
@@ -881,6 +897,9 @@ impl Attribute_ {
             Attribute_::Mode { .. } => AK::Mode.name(),
             Attribute_::Syntax { .. } => AK::Syntax.name(),
             Attribute_::Allow { .. } => AK::Allow.name(),
+            Attribute_::Deny { .. } => AK::Deny.name(),
+            Attribute_::Expect { .. } => AK::Expect.name(),
+            Attribute_::Warn { .. } => AK::Warn.name(),
             Attribute_::LintAllow { .. } => AK::LintAllow.name(),
             Attribute_::Test => AK::Test.name(),
             Attribute_::ExpectedFailure { .. } => AK::ExpectedFailure.name(),
@@ -1287,10 +1306,6 @@ impl BinOp_ {
     pub const GT: &'static str = ">";
     pub const LE: &'static str = "<=";
     pub const GE: &'static str = ">=";
-    pub const IMPLIES: &'static str = "==>";
-    pub const IFF: &'static str = "<==>";
-    pub const RANGE: &'static str = "..";
-
     pub fn symbol(&self) -> &'static str {
         use BinOp_ as B;
         match self {
@@ -1312,9 +1327,6 @@ impl BinOp_ {
             B::Gt => B::GT,
             B::Le => B::LE,
             B::Ge => B::GE,
-            B::Implies => B::IMPLIES,
-            B::Iff => B::IFF,
-            B::Range => B::RANGE,
         }
     }
 
@@ -1332,16 +1344,8 @@ impl BinOp_ {
             | B::Lt
             | B::Gt
             | B::Le
-            | B::Ge
-            | B::Range
-            | B::Implies
-            | B::Iff => true,
+            | B::Ge => true,
         }
-    }
-
-    pub fn is_spec_only(&self) -> bool {
-        use BinOp_ as B;
-        matches!(self, B::Range | B::Implies | B::Iff)
     }
 }
 
@@ -1651,6 +1655,22 @@ impl AstDebug for ParsedAttribute_ {
 impl AstDebug for Attribute_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         use Attribute_ as A;
+
+        fn filter_set(w: &mut AstWriter, keyword: &str, set: &BTreeSet<(Option<Name>, Name)>) {
+            w.write(format!("{keyword}("));
+            w.comma(set, |w, (prefix, name)| {
+                if let Some(pref) = prefix {
+                    w.write(pref.value.as_str());
+                    w.write("(");
+                    w.write(name.value.as_str());
+                    w.write(")");
+                } else {
+                    w.write(name.value.as_str());
+                }
+            });
+            w.write(")");
+        }
+
         match self {
             A::BytecodeInstruction => {
                 w.write("bytecode_instruction");
@@ -1696,25 +1716,10 @@ impl AstDebug for Attribute_ {
                 w.write(kind.value.as_str());
                 w.write(")");
             }
-            A::Allow { allow_set } => {
-                w.write("allow(");
-                let mut first = true;
-                for (prefix, name) in allow_set {
-                    if !first {
-                        w.write(",");
-                    }
-                    first = false;
-                    if let Some(pref) = prefix {
-                        w.write(pref.value.as_str());
-                        w.write("(");
-                        w.write(name.value.as_str());
-                        w.write(")");
-                    } else {
-                        w.write(name.value.as_str());
-                    }
-                }
-                w.write(")");
-            }
+            A::Allow { allow_set } => filter_set(w, "allow", allow_set),
+            A::Deny { deny_set } => filter_set(w, "deny", deny_set),
+            A::Expect { expect_set } => filter_set(w, "expect", expect_set),
+            A::Warn { warn_set } => filter_set(w, "warn", warn_set),
             A::LintAllow { allow_set } => {
                 w.write("lint_allow(");
                 w.comma(allow_set, |w, name| {
@@ -1783,9 +1788,10 @@ impl AstDebug for ModuleDefinition {
         let ModuleDefinition {
             doc,
             attributes,
-            loc: _loc,
+            loc: _,
             address,
             name,
+            name_loc: _,
             is_spec_module,
             is_extension,
             members,
@@ -2093,12 +2099,14 @@ impl AstDebug for Constant {
             doc,
             attributes,
             loc: _loc,
+            visibility,
             name,
             signature,
             value,
         } = self;
         doc.ast_debug(w);
         attributes.ast_debug(w);
+        visibility.ast_debug(w);
         w.write(format!("const {}:", name));
         signature.ast_debug(w);
         w.write(" = ");

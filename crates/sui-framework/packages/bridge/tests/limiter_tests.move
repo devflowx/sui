@@ -14,13 +14,12 @@ use bridge::limiter::{
     total_amount,
     transfer_records,
     update_route_limit,
-    usd_value_multiplier
+    usd_value_multiplier,
 };
 use bridge::treasury::{Self, BTC, ETH, USDC, USDT};
-use std::unit_test::assert_eq;
+use std::unit_test::{assert_eq, destroy};
 use sui::clock;
 use sui::test_scenario;
-use sui::test_utils::destroy;
 
 #[test]
 fun test_24_hours_windows() {
@@ -68,7 +67,7 @@ fun test_24_hours_windows() {
             ),
             0,
         );
-        i = i + 1;
+        i = i + 1u64;
     };
     let record = limiter.transfer_records().get(&route);
     let mut expected_value = 24000 * 5 * usd_value_multiplier();

@@ -5,38 +5,38 @@ info:
   edition: legacy
   lint: false
 ---
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
   ┌─ tests/move_check/typing/mutate_invalid.move:6:10
   │
-6 │         *&mut 0 = false;
-  │          ^^^^^^   ----- Given: 'bool'
-  │          │         
+6 │         *&mut 0u64 = false;
+  │          ^^^^^^^^^   ----- Given: 'bool'
+  │          │    │       
+  │          │    Expected: 'u64'
   │          Invalid mutation. New value is not valid for the reference
-  │          Expected: integer
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
   ┌─ tests/move_check/typing/mutate_invalid.move:7:10
   │
 2 │     struct S has drop { f: u64 }
   │                            --- Expected: 'u64'
   ·
-7 │         *&mut S{f:0}.f = &1;
-  │          ^^^^^^^^^^^^^   -- Given: '&{integer}'
+7 │         *&mut S{f:0}.f = &1u64;
+  │          ^^^^^^^^^^^^^   ----- Given: '&u64'
   │          │                
   │          Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:8:10
    │
- 8 │         *foo(&mut 0) = (1, 0);
-   │          ^^^^^^^^^^^   ------ Given: '({integer}, {integer})'
+ 8 │         *foo(&mut 0) = (1u64, 0u64);
+   │          ^^^^^^^^^^^   ------------ Given: '(u64, u64)'
    │          │              
    │          Invalid mutation. New value is not valid for the reference
    ·
 23 │     fun foo(x: &mut u64): &mut u64 {
    │                                --- Expected: 'u64'
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
   ┌─ tests/move_check/typing/mutate_invalid.move:9:9
   │
 2 │     struct S has drop { f: u64 }
@@ -47,18 +47,18 @@ error[E04007]: incompatible types
   │         │                     
   │         Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:10:10
    │
  2 │     struct S has drop { f: u64 }
    │                            --- Expected: 'u64'
    ·
-10 │         *&mut bar(&mut S{f:0}).f = &0;
-   │          ^^^^^^^^^^^^^^^^^^^^^^^   -- Given: '&{integer}'
+10 │         *&mut bar(&mut S{f:0}).f = &0u64;
+   │          ^^^^^^^^^^^^^^^^^^^^^^^   ----- Given: '&u64'
    │          │                          
    │          Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:11:9
    │
  2 │     struct S has drop { f: u64 }
@@ -69,7 +69,7 @@ error[E04007]: incompatible types
    │         │          
    │         Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:12:10
    │
  2 │     struct S has drop { f: u64 }
@@ -80,7 +80,7 @@ error[E04007]: incompatible types
    │          │               
    │          Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:17:10
    │
 16 │         let r = &mut S{ f: 0 };
@@ -90,18 +90,18 @@ error[E04007]: incompatible types
    │          │    
    │          Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:19:9
    │
  2 │     struct S has drop { f: u64 }
    │                            --- Expected: 'u64'
    ·
-19 │         r.f = &0;
-   │         ^^^   -- Given: '&{integer}'
+19 │         r.f = &0u64;
+   │         ^^^   ----- Given: '&u64'
    │         │      
    │         Invalid mutation. New value is not valid for the reference
 
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_check/typing/mutate_invalid.move:20:10
    │
  2 │     struct S has drop { f: u64 }

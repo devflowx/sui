@@ -4,16 +4,15 @@
 use crate::base_types::AuthorityName;
 use crate::committee::{Committee, EpochId};
 use crate::crypto::{
-    AuthorityKeyPair, AuthorityQuorumSignInfo, AuthoritySignInfo, AuthoritySignInfoTrait,
-    AuthoritySignature, AuthorityStrongQuorumSignInfo, EmptySignInfo, Signer,
+    AuthorityKeyPair, AuthorityQuorumSignInfo, AuthoritySignInfo, AuthoritySignature,
+    AuthorityStrongQuorumSignInfo, EmptySignInfo, Signer,
 };
 use crate::error::SuiResult;
 use crate::executable_transaction::CertificateProof;
 use crate::messages_checkpoint::CheckpointSequenceNumber;
-use crate::transaction::SenderSignedData;
 use fastcrypto::traits::KeyPair;
 use once_cell::sync::OnceCell;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_name::{DeserializeNameAdapter, SerializeNameAdapter};
 use shared_crypto::intent::{Intent, IntentScope};
 use std::fmt::{Debug, Display, Formatter};
@@ -172,16 +171,6 @@ where
     }
 }
 
-impl Envelope<SenderSignedData, AuthoritySignInfo> {
-    pub fn verify_committee_sigs_only(&self, committee: &Committee) -> SuiResult {
-        self.auth_signature.verify_secure(
-            self.data(),
-            Intent::sui_app(IntentScope::SenderSignedTransaction),
-            committee,
-        )
-    }
-}
-
 impl<T, const S: bool> Envelope<T, AuthorityQuorumSignInfo<S>>
 where
     T: Message + Serialize,
@@ -276,7 +265,7 @@ where
     T: Message + Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0 .0)
+        write!(f, "{:?}", self.0.0)
     }
 }
 
@@ -294,11 +283,11 @@ impl<T: Message, S> VerifiedEnvelope<T, S> {
     }
 
     pub fn into_inner(self) -> Envelope<T, S> {
-        self.0 .0
+        self.0.0
     }
 
     pub fn inner(&self) -> &Envelope<T, S> {
-        &self.0 .0
+        &self.0.0
     }
 
     pub fn into_message(self) -> T {
@@ -336,7 +325,7 @@ impl<T: Message, S> From<TrustedEnvelope<T, S>> for VerifiedEnvelope<T, S> {
 impl<T: Message, S> Deref for VerifiedEnvelope<T, S> {
     type Target = Envelope<T, S>;
     fn deref(&self) -> &Self::Target {
-        &self.0 .0
+        &self.0.0
     }
 }
 
@@ -355,7 +344,7 @@ impl<T: Message, S> DerefMut for Envelope<T, S> {
 
 impl<T: Message, S> From<VerifiedEnvelope<T, S>> for Envelope<T, S> {
     fn from(v: VerifiedEnvelope<T, S>) -> Self {
-        v.0 .0
+        v.0.0
     }
 }
 
@@ -364,7 +353,7 @@ where
     Envelope<T, S>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.0 .0 == other.0 .0
+        self.0.0 == other.0.0
     }
 }
 
@@ -376,7 +365,7 @@ where
     Envelope<T, S>: Display,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0 .0)
+        write!(f, "{}", self.0.0)
     }
 }
 
@@ -432,23 +421,6 @@ impl<T: Message> VerifiedEnvelope<T, CertificateProof> {
             digest,
             data,
             auth_signature: CertificateProof::new_system(epoch),
-        })
-    }
-
-    pub fn new_from_quorum_execution(
-        transaction: VerifiedEnvelope<T, EmptySignInfo>,
-        epoch: EpochId,
-    ) -> Self {
-        let inner = transaction.into_inner();
-        let Envelope {
-            digest,
-            data,
-            auth_signature: _,
-        } = inner;
-        VerifiedEnvelope::new_unchecked(Envelope {
-            digest,
-            data,
-            auth_signature: CertificateProof::QuorumExecuted(epoch),
         })
     }
 

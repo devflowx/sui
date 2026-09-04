@@ -4,18 +4,21 @@
 use crate::chain_from_chain_id;
 use crate::{
     data_fetcher::{
-        extract_epoch_and_version, DataFetcher, Fetchers, NodeStateDumpFetcher, RemoteFetcher,
+        DataFetcher, Fetchers, NodeStateDumpFetcher, RemoteFetcher, extract_epoch_and_version,
     },
     displays::{
-        transaction_displays::{transform_command_results_to_annotated, FullPTB},
         Pretty,
+        transaction_displays::{FullPTB, transform_command_results_to_annotated},
     },
     types::*,
 };
 use futures::executor::block_on;
 use move_binary_format::CompiledModule;
 use move_bytecode_utils::module_cache::GetModule;
-use move_core_types::{language_storage::ModuleId, resolver::ModuleResolver};
+use move_core_types::resolver::SerializedPackage;
+use move_core_types::{
+    account_address::AccountAddress, language_storage::ModuleId, resolver::ModuleResolver,
+};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
@@ -34,16 +37,18 @@ use sui_json_rpc_types::{
 };
 use sui_protocol_config::{Chain, ProtocolConfig};
 use sui_sdk::{SuiClient, SuiClientBuilder};
+use sui_types::SUI_DENY_LIST_OBJECT_ID;
+use sui_types::error::SuiErrorKind;
 use sui_types::execution_params::{
-    get_early_execution_error, BalanceWithdrawStatus, ExecutionOrEarlyError,
+    ExecutionOrEarlyError, FundsWithdrawStatus, get_early_execution_error,
 };
 use sui_types::in_memory_storage::InMemoryStorage;
 use sui_types::message_envelope::Message;
-use sui_types::storage::{get_module, PackageObject};
+use sui_types::storage::{PackageObject, get_module, get_package};
 use sui_types::transaction::GasData;
 use sui_types::transaction::TransactionKind::ProgrammableTransaction;
-use sui_types::SUI_DENY_LIST_OBJECT_ID;
 use sui_types::{
+    DEEPBOOK_PACKAGE_ID,
     base_types::{ObjectID, ObjectRef, SequenceNumber, VersionNumber},
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
@@ -51,15 +56,14 @@ use sui_types::{
     executable_transaction::VerifiedExecutableTransaction,
     gas::SuiGasStatus,
     inner_temporary_store::InnerTemporaryStore,
-    metrics::LimitsMetrics,
+    metrics::ExecutionMetrics,
     object::{Object, Owner},
     storage::get_module_by_id,
-    storage::{BackingPackageStore, ChildObjectResolver, ObjectStore, ParentSync},
+    storage::{BackingPackageStore, ObjectStore, ParentSync, RuntimeObjectResolver},
     transaction::{
         CheckedInputObjects, InputObjectKind, InputObjects, ObjectReadResult, ObjectReadResultKind,
         SenderSignedData, Transaction, TransactionDataAPI, TransactionKind, VerifiedTransaction,
     },
-    DEEPBOOK_PACKAGE_ID,
 };
 use tracing::{error, info, trace, warn};
 
@@ -213,15 +217,15 @@ impl Storage {
                 self.package_cache
                     .lock()
                     .expect("Unable to lock")
-                    .iter()
-                    .map(|(_, obj)| obj.clone()),
+                    .values()
+                    .cloned(),
             )
             .chain(
                 self.object_version_cache
                     .lock()
                     .expect("Unable to lock")
-                    .iter()
-                    .map(|(_, obj)| obj.clone()),
+                    .values()
+                    .cloned(),
             )
             .collect::<Vec<_>>()
     }
@@ -242,7 +246,7 @@ pub struct LocalExec {
     // Debug events
     pub exec_store_events: Arc<Mutex<Vec<ExecutionStoreEvent>>>,
     // Debug events
-    pub metrics: Arc<LimitsMetrics>,
+    pub metrics: Arc<ExecutionMetrics>,
     // Used for fetching data from the network or remote store
     pub fetcher: Fetchers,
 
@@ -380,7 +384,7 @@ impl LocalExec {
     ) -> Result<Self, ReplayEngineError> {
         // Use a throwaway metrics registry for local execution.
         let registry = prometheus::Registry::new();
-        let metrics = Arc::new(LimitsMetrics::new(&registry));
+        let metrics = Arc::new(ExecutionMetrics::new(&registry));
 
         let fetcher = remote_fetcher.unwrap_or(RemoteFetcher::new(client.clone()));
 
@@ -408,7 +412,7 @@ impl LocalExec {
     ) -> Result<Self, ReplayEngineError> {
         // Use a throwaway metrics registry for local execution.
         let registry = prometheus::Registry::new();
-        let metrics = Arc::new(LimitsMetrics::new(&registry));
+        let metrics = Arc::new(ExecutionMetrics::new(&registry));
 
         let state = NodeStateDump::read_from_file(&PathBuf::from(path))?;
         let current_protocol_version = state.protocol_version;
@@ -498,7 +502,7 @@ impl LocalExec {
             .multi_download_latest(&non_system_package_objs)
             .await?
             .into_iter()
-            .chain(syst_packages_objs.into_iter());
+            .chain(syst_packages_objs);
 
         for obj in objs.clone() {
             let o_ref = obj.compute_object_reference();
@@ -573,7 +577,7 @@ impl LocalExec {
     ) -> Result<Option<Object>, ReplayEngineError> {
         let resp = block_on({
             //info!("Downloading latest object {object_id}");
-            self.multi_download_latest(&[*object_id])
+            self.multi_download_latest(std::slice::from_ref(object_id))
         })
         .map(|mut q| {
             q.pop()
@@ -583,7 +587,9 @@ impl LocalExec {
         match resp {
             Ok(v) => Ok(Some(v)),
             Err(ReplayEngineError::ObjectNotExist { id }) => {
-                error!("Could not find object {id} on RPC server. It might have been pruned, deleted, or never existed.");
+                error!(
+                    "Could not find object {id} on RPC server. It might have been pruned, deleted, or never existed."
+                );
                 Ok(None)
             }
             Err(ReplayEngineError::ObjectDeleted {
@@ -636,7 +642,9 @@ impl LocalExec {
                 Ok(Some(object))
             }
             Err(ReplayEngineError::ObjectNotExist { id }) => {
-                error!("Could not find child object {id} on RPC server. It might have been pruned, deleted, or never existed.");
+                error!(
+                    "Could not find child object {id} on RPC server. It might have been pruned, deleted, or never existed."
+                );
                 Ok(None)
             }
             Err(ReplayEngineError::ObjectDeleted {
@@ -650,7 +658,9 @@ impl LocalExec {
             // This is a child object which was not found in the store (e.g., due to exists
             // check before creating the dynamic field).
             Err(ReplayEngineError::ObjectVersionNotFound { id, version }) => {
-                info!("Object {id} {version} not found on RPC server -- this may have been pruned or never existed.");
+                info!(
+                    "Object {id} {version} not found on RPC server -- this may have been pruned or never existed."
+                );
                 Ok(None)
             }
             Err(err) => Err(ReplayEngineError::SuiRpcError {
@@ -754,7 +764,7 @@ impl LocalExec {
         let expensive_checks = true;
         let transaction_kind = override_transaction_kind.unwrap_or(tx_info.kind.clone());
         let gas_status = if tx_info.kind.is_system_tx() {
-            SuiGasStatus::new_unmetered()
+            SuiGasStatus::new_unmetered(protocol_config)
         } else {
             SuiGasStatus::new(
                 tx_info.gas_budget,
@@ -776,14 +786,14 @@ impl LocalExec {
             &checked_input_objects,
             &HashSet::new(),
             // TODO(address-balances): Support balance withdraw status for replay
-            &BalanceWithdrawStatus::NoWithdraw,
+            &FundsWithdrawStatus::MaybeSufficient,
         );
         let execution_params = match early_execution_error {
-            Some(error) => ExecutionOrEarlyError::Err(error),
-            None => ExecutionOrEarlyError::Ok(()),
+            None => ExecutionOrEarlyError::ok(None),
+            Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
         let (inner_store, gas_status, effects, _timings, result) = executor
-            .execute_transaction_to_effects(
+            .execute_transaction_to_effects_and_execution_error(
                 &self,
                 protocol_config,
                 metrics.clone(),
@@ -792,9 +802,12 @@ impl LocalExec {
                 &tx_info.executed_epoch,
                 tx_info.epoch_start_timestamp,
                 checked_input_objects,
+                // TODO: Support implicit system object reads for replay.
+                sui_types::base_types::SystemObjectVersions::empty(),
                 gas_data,
                 gas_status,
                 transaction_kind.clone(),
+                None, // compat_args
                 tx_info.sender,
                 *tx_digest,
                 &mut None,
@@ -834,7 +847,7 @@ impl LocalExec {
         tx_info: &OnChainTransactionInfo,
         transaction_kind: &TransactionKind,
         protocol_config: &ProtocolConfig,
-        metrics: Arc<LimitsMetrics>,
+        metrics: Arc<ExecutionMetrics>,
         expensive_checks: bool,
         input_objects: InputObjects,
     ) -> anyhow::Result<()> {
@@ -853,11 +866,11 @@ impl LocalExec {
             &checked_input_objects,
             &HashSet::new(),
             // TODO(address-balances): Support balance withdraw status for replay
-            &BalanceWithdrawStatus::NoWithdraw,
+            &FundsWithdrawStatus::MaybeSufficient,
         );
         let execution_params = match early_execution_error {
-            Some(error) => ExecutionOrEarlyError::Err(error),
-            None => ExecutionOrEarlyError::Ok(()),
+            None => ExecutionOrEarlyError::ok(None),
+            Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
         if let ProgrammableTransaction(pt) = transaction_kind {
             trace!(
@@ -866,6 +879,7 @@ impl LocalExec {
                 Pretty(&FullPTB {
                     ptb: pt.clone(),
                     results: transform_command_results_to_annotated(
+                        protocol_config,
                         executor,
                         &self.clone(),
                         executor.dev_inspect_transaction(
@@ -877,6 +891,7 @@ impl LocalExec {
                             &tx_info.executed_epoch,
                             tx_info.epoch_start_timestamp,
                             CheckedInputObjects::new_for_replay(input_objects),
+                            sui_types::base_types::SystemObjectVersions::empty(),
                             gas_data,
                             SuiGasStatus::new(
                                 tx_info.gas_budget,
@@ -885,6 +900,7 @@ impl LocalExec {
                                 protocol_config,
                             )?,
                             transaction_kind.clone(),
+                            None, // compat_args
                             tx_info.sender,
                             tx_info.sender_signed_data.digest(),
                             skip_checks,
@@ -906,10 +922,10 @@ impl LocalExec {
     ) -> Result<ExecutionSandboxState, ReplayEngineError> {
         if self.is_remote_replay() {
             assert!(
-            !self.protocol_version_system_package_table.is_empty()
-                || !self.protocol_version_epoch_table.is_empty(),
-            "Required tables not populated. Must call `init_for_execution` before executing transactions"
-        );
+                !self.protocol_version_system_package_table.is_empty()
+                    || !self.protocol_version_epoch_table.is_empty(),
+                "Required tables not populated. Must call `init_for_execution` before executing transactions"
+            );
         }
 
         let tx_info = if self.is_remote_replay() {
@@ -951,7 +967,7 @@ impl LocalExec {
         // traits and make them shared so that we don't have to fix one by one when we have major execution
         // layer changes.
         let input_objects = store.read_input_objects_for_transaction(&transaction);
-        let executable = VerifiedExecutableTransaction::new_from_quorum_execution(
+        let executable = VerifiedExecutableTransaction::new_from_consensus(
             VerifiedTransaction::new_unchecked(transaction),
             executed_epoch,
         );
@@ -969,28 +985,31 @@ impl LocalExec {
             &input_objects,
             &HashSet::new(),
             // TODO(address-balances): Support balance withdraw status for replay
-            &BalanceWithdrawStatus::NoWithdraw,
+            &FundsWithdrawStatus::MaybeSufficient,
         );
         let execution_params = match early_execution_error {
-            Some(error) => ExecutionOrEarlyError::Err(error),
-            None => ExecutionOrEarlyError::Ok(()),
+            None => ExecutionOrEarlyError::ok(None),
+            Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
-        let (_, _, effects, _timings, exec_res) = executor.execute_transaction_to_effects(
-            &store,
-            &protocol_config,
-            Arc::new(LimitsMetrics::new(&Registry::new())),
-            true,
-            execution_params,
-            &executed_epoch,
-            epoch_start_timestamp,
-            input_objects,
-            gas_data,
-            gas_status,
-            kind,
-            signer,
-            *executable.digest(),
-            &mut None,
-        );
+        let (_, _, effects, _timings, exec_res) = executor
+            .execute_transaction_to_effects_and_execution_error(
+                &store,
+                &protocol_config,
+                Arc::new(ExecutionMetrics::new(&Registry::new())),
+                true,
+                execution_params,
+                &executed_epoch,
+                epoch_start_timestamp,
+                input_objects,
+                sui_types::base_types::SystemObjectVersions::empty(),
+                gas_data,
+                gas_status,
+                kind,
+                None, // compat_args
+                signer,
+                *executable.digest(),
+                &mut None,
+            );
 
         let effects =
             SuiTransactionBlockEffects::try_from(effects).map_err(ReplayEngineError::from)?;
@@ -1361,14 +1380,20 @@ impl LocalExec {
                     // This happens when the RPC server prunes older object
                     // Replays in the current protocol version will work but old ones might not
                     // as we cannot fetch the package
-                    warn!("Object {} does not exist on RPC server. This might be due to pruning. Historical replays might not work", id);
+                    warn!(
+                        "Object {} does not exist on RPC server. This might be due to pruning. Historical replays might not work",
+                        id
+                    );
                     break;
                 }
                 Err(ReplayEngineError::ObjectVersionNotFound { id, version }) => {
                     // This happens when the RPC server prunes older object
                     // Replays in the current protocol version will work but old ones might not
                     // as we cannot fetch the package
-                    warn!("Object {} at version {} does not exist on RPC server. This might be due to pruning. Historical replays might not work", id, version);
+                    warn!(
+                        "Object {} at version {} does not exist on RPC server. This might be due to pruning. Historical replays might not work",
+                        id, version
+                    );
                     break;
                 }
                 Err(ReplayEngineError::ObjectVersionTooHigh {
@@ -1376,7 +1401,10 @@ impl LocalExec {
                     asked_version,
                     latest_version,
                 }) => {
-                    warn!("Object {} at version {} does not exist on RPC server. Latest version is {}. This might be due to pruning. Historical replays might not work", id, asked_version,latest_version );
+                    warn!(
+                        "Object {} at version {} does not exist on RPC server. Latest version is {}. This might be due to pruning. Historical replays might not work",
+                        id, asked_version, latest_version
+                    );
                     break;
                 }
                 Err(ReplayEngineError::ObjectDeleted {
@@ -1387,7 +1415,10 @@ impl LocalExec {
                     // This happens when the RPC server prunes older object
                     // Replays in the current protocol version will work but old ones might not
                     // as we cannot fetch the package
-                    warn!("Object {} at version {} digest {} deleted from RPC server. This might be due to pruning. Historical replays might not work", id, version, digest);
+                    warn!(
+                        "Object {} at version {} digest {} deleted from RPC server. This might be due to pruning. Historical replays might not work",
+                        id, version, digest
+                    );
                     break;
                 }
                 Err(e) => return Err(e),
@@ -1495,7 +1526,9 @@ impl LocalExec {
         match parse_effect_error_for_denied_coins(status) {
             Some(coin_type) => {
                 let Some(mut config_id_and_version) = self.config_and_versions.clone() else {
-                    panic!("Need to specify the config object ID and version for '{coin_type}' in order to replay this transaction");
+                    panic!(
+                        "Need to specify the config object ID and version for '{coin_type}' in order to replay this transaction"
+                    );
                 };
                 // NB: the version of the deny list object doesn't matter
                 if !config_id_and_version
@@ -1727,7 +1760,7 @@ impl LocalExec {
                 InputObjectKind::SharedMoveObject {
                     id,
                     initial_shared_version: _,
-                    mutable: _,
+                    mutability: _,
                 } if !deleted_shared_info_map.contains_key(id) => {
                     // We already downloaded
                     if let Some(o) = self
@@ -1892,7 +1925,7 @@ impl BackingPackageStore for LocalExec {
             // If package not present fetch it from the network
             self_
                 .get_or_download_object(package_id, true /* we expect a Move package*/)
-                .map_err(|e| SuiError::Storage(e.to_string()))
+                .map_err(|e| SuiErrorKind::Storage(e.to_string()).into())
         }
 
         let res = inner(self, package_id);
@@ -1907,7 +1940,7 @@ impl BackingPackageStore for LocalExec {
     }
 }
 
-impl ChildObjectResolver for LocalExec {
+impl RuntimeObjectResolver for LocalExec {
     /// This uses `get_object`, which does not download from the network
     /// Hence all objects must be in store already
     fn read_child_object(
@@ -1929,18 +1962,20 @@ impl ChildObjectResolver for LocalExec {
                 };
             let child_version = child_object.version();
             if child_object.version() > child_version_upper_bound {
-                return Err(SuiError::Unknown(format!(
+                return Err(SuiErrorKind::Unknown(format!(
                     "Invariant Violation. Replay loaded child_object {child} at version \
                     {child_version} but expected the version to be <= {child_version_upper_bound}"
-                )));
+                ))
+                .into());
             }
             let parent = *parent;
             if child_object.owner != Owner::ObjectOwner(parent.into()) {
-                return Err(SuiError::InvalidChildObjectAccess {
+                return Err(SuiErrorKind::InvalidChildObjectAccess {
                     object: *child,
                     given_parent: parent,
                     actual_owner: child_object.owner.clone(),
-                });
+                }
+                .into());
             }
             Ok(Some(child_object))
         }
@@ -1950,7 +1985,7 @@ impl ChildObjectResolver for LocalExec {
             .lock()
             .expect("Unable to lock events list")
             .push(
-                ExecutionStoreEvent::ChildObjectResolverStoreReadChildObject {
+                ExecutionStoreEvent::RuntimeObjectResolverStoreReadChildObject {
                     parent: *parent,
                     child: *child,
                     result: res.clone(),
@@ -1977,10 +2012,10 @@ impl ChildObjectResolver for LocalExec {
                 Some(o) => o,
             };
             if recv_object.version() != receive_object_at_version {
-                return Err(SuiError::Unknown(format!(
+                return Err(SuiErrorKind::Unknown(format!(
                     "Invariant Violation. Replay loaded child_object {receiving_object_id} at version \
                     {receive_object_at_version} but expected the version to be == {receive_object_at_version}"
-                )));
+                )).into());
             }
             if recv_object.owner != Owner::AddressOwner((*owner).into()) {
                 return Ok(None);
@@ -2052,6 +2087,24 @@ impl ModuleResolver for LocalExec {
             });
         res
     }
+
+    fn get_packages_static<const N: usize>(
+        &self,
+        ids: [AccountAddress; N],
+    ) -> Result<[Option<SerializedPackage>; N], Self::Error> {
+        let mut res = [const { None }; N];
+        for i in 0..N {
+            res[i] = get_package(self, &ids[i].into())?;
+        }
+        Ok(res)
+    }
+
+    fn get_packages<'a>(
+        &self,
+        ids: impl ExactSizeIterator<Item = &'a AccountAddress>,
+    ) -> Result<Vec<Option<SerializedPackage>>, Self::Error> {
+        ids.map(|id| get_package(self, &(*id).into())).collect()
+    }
 }
 
 impl ModuleResolver for &mut LocalExec {
@@ -2060,6 +2113,20 @@ impl ModuleResolver for &mut LocalExec {
     fn get_module(&self, module_id: &ModuleId) -> SuiResult<Option<Vec<u8>>> {
         // Recording event here will be double-counting since its already recorded in the get_module fn
         (**self).get_module(module_id)
+    }
+
+    fn get_packages<'a>(
+        &self,
+        ids: impl ExactSizeIterator<Item = &'a AccountAddress>,
+    ) -> Result<Vec<Option<SerializedPackage>>, Self::Error> {
+        (**self).get_packages(ids)
+    }
+
+    fn get_packages_static<const N: usize>(
+        &self,
+        ids: [AccountAddress; N],
+    ) -> Result<[Option<SerializedPackage>; N], Self::Error> {
+        (**self).get_packages_static(ids)
     }
 }
 
@@ -2194,7 +2261,7 @@ mod tests {
     fn test_regex_regulated_coin_errors() {
         let test_bank = vec![
             "CoinTypeGlobalPause { coin_type: \"39a572c071784c280ee8ee8c683477e059d1381abc4366f9a58ffac3f350a254::rcoin::RCOIN\" }",
-            "AddressDeniedForCoin { address: B, coin_type: \"39a572c071784c280ee8ee8c683477e059d1381abc4366f9a58ffac3f350a254::rcoin::RCOIN\" }"
+            "AddressDeniedForCoin { address: B, coin_type: \"39a572c071784c280ee8ee8c683477e059d1381abc4366f9a58ffac3f350a254::rcoin::RCOIN\" }",
         ];
         let expected_string =
             "39a572c071784c280ee8ee8c683477e059d1381abc4366f9a58ffac3f350a254::rcoin::RCOIN";

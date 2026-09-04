@@ -18,7 +18,7 @@ module test::m {
 
     public entry fun mint_child(s: &mut S, ctx: &mut TxContext) {
         let id = object::new(ctx);
-        sui::dynamic_object_field::add(&mut s.id, 0, Child { id });
+        sui::dynamic_object_field::add(&mut s.id, 0u64, Child { id });
     }
 }
 
@@ -26,8 +26,8 @@ module test::m {
 
 //# run test::m::mint_child --args object(2,0)
 
-//# view-object 3,0
+//# view-object 3,1
 
-//# transfer-object 3,0 --sender A --recipient B
+//# transfer-object 3,1 --sender A --recipient B
 
-//# view-object 3,0
+//# view-object 3,1

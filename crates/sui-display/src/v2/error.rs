@@ -1,34 +1,98 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::mem;
-use std::{collections::BTreeSet, fmt};
+use std::sync::Arc;
 
-use super::lexer::{Lexeme, OwnedLexeme, Token};
-use super::peek::Peekable2Ext;
+use move_core_types::annotated_visitor as AV;
+use move_core_types::language_storage::TypeTag;
+use sui_types::object::option_visitor as OV;
+use sui_types::object::rpc_visitor as RV;
 
+use crate::v2::lexer::Lexeme;
+use crate::v2::lexer::OwnedLexeme;
+use crate::v2::lexer::Token;
+use crate::v2::peek::Peekable2Ext;
+
+/// Errors related to the display format as a whole.
+///
+/// NB. Limit errors (`Too*`) are duplicated here and in `FormatError` because they occur while
+/// working on a format, and need to be propagated up to the Display overall.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("Duplicate name {0:?}")]
+    NameDuplicate(String),
+
+    #[error("Name pattern {0:?} produced no output")]
+    NameEmpty(String),
+
+    #[error("Name pattern {0:?} did not evaluate to a string")]
+    NameInvalid(String),
+
+    #[error("Error evaluating name pattern {0:?}: {1}")]
+    NameEvaluation(String, FormatError),
+
+    #[error("Display contains too many elements")]
+    TooBig,
+
+    #[error("Display tries to load too many objects")]
+    TooManyLoads,
+
+    #[error("Display produces too much output")]
+    TooMuchOutput,
+}
+
+/// Errors related to a single format string.
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum FormatError {
+    #[error("BCS error: {0}")]
+    Bcs(#[from] bcs::Error),
+
     #[error("Hex {0} contains invalid character")]
     InvalidHexCharacter(OwnedLexeme),
 
     #[error("Invalid {0}")]
     InvalidIdentifier(OwnedLexeme),
 
-    #[error("Invalid {what}: {err}")]
-    InvalidNumber { what: &'static str, err: String },
+    #[error("Invalid {what} at byte offset {offset}: {err}")]
+    InvalidNumber {
+        what: &'static str,
+        offset: usize,
+        err: String,
+    },
 
     #[error("Odd number of characters in hex {0}")]
     OddHexLiteral(OwnedLexeme),
 
-    #[error("Display format is nested too deeply")]
+    #[error("Storage error: {0}")]
+    Store(Arc<anyhow::Error>),
+
+    #[error("Display contains too many elements")]
+    TooBig,
+
+    #[error("Format is nested too deeply")]
     TooDeep,
 
-    #[error("Display format contains too many elements")]
-    TooBig,
+    #[error("Display tries to load too many objects")]
+    TooManyLoads,
+
+    #[error("Display produces too much output")]
+    TooMuchOutput,
+
+    #[error("Invalid transform: {0}")]
+    TransformInvalid(&'static str),
+
+    /// The above error augmented with the offset of the originating expression.
+    #[error("Invalid transform for expression at byte offset {offset}: {reason}")]
+    TransformInvalid_ { offset: usize, reason: &'static str },
 
     #[error("Unexpected end-of-string, expected {expect}")]
     UnexpectedEos { expect: ExpectedSet },
+
+    #[error("Unexpected {0}, expected end-of-string")]
+    UnexpectedRemaining(OwnedLexeme),
 
     #[error("Unexpected {actual}, expected {expect}")]
     UnexpectedToken {
@@ -36,20 +100,37 @@ pub enum Error {
         expect: ExpectedSet,
     },
 
-    #[error("vector at offset {offset} requires 1 type parameter, found {arity}")]
+    #[error("Vector at byte offset {offset} requires 1 type parameter, found {arity}")]
     VectorArity { offset: usize, arity: usize },
+
+    #[error("Internal error: vector without element type")]
+    VectorNoType,
+
+    #[error(
+        "Vector at byte offset {offset}, could have element type {} or {}",
+        .this.to_canonical_display(true),
+        .that.to_canonical_display(true),
+    )]
+    VectorTypeMismatch {
+        offset: usize,
+        this: TypeTag,
+        that: TypeTag,
+    },
+
+    #[error("Deserialization error: {0}")]
+    Visitor(#[from] AV::Error),
 }
 
 /// The set of patterns that the parser tried to match against the next token, in a given
 /// invocation of `match_token!` or `match_token_opt!`. This is used to provide a clearer error
 /// message.
 #[derive(Debug, Clone)]
-pub(crate) struct ExpectedSet {
+pub struct ExpectedSet {
     /// Other sets of patterns that were attempted on the same location.
-    pub prev: Vec<ExpectedSet>,
+    prev: Vec<ExpectedSet>,
 
     /// The set of patterns that were tried in this invocation.
-    pub tried: &'static [Expected],
+    tried: &'static [Expected],
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -69,18 +150,59 @@ pub(crate) enum Match<T> {
 }
 
 impl Error {
+    /// Whether this error is because of something outside the user's control.
+    pub fn is_internal_error(&self) -> bool {
+        matches!(self, Self::NameEvaluation(_, e) if e.is_internal_error())
+    }
+
+    /// Whether this error is because a resource limit was exceeded.
+    pub fn is_resource_limit_error(&self) -> bool {
+        matches!(self, Self::NameEvaluation(_, e) if e.is_resource_limit_error())
+            || matches!(
+                self,
+                Self::TooBig | Self::TooManyLoads | Self::TooMuchOutput
+            )
+    }
+}
+
+impl FormatError {
+    /// Whether this error is because of something outside the user's control.
+    pub fn is_internal_error(&self) -> bool {
+        matches!(self, Self::Bcs(_) | Self::Store(_) | Self::Visitor(_))
+    }
+
+    /// Whether this error is because a resource limit was exceeded.
+    pub fn is_resource_limit_error(&self) -> bool {
+        matches!(
+            self,
+            Self::TooBig | Self::TooDeep | Self::TooManyLoads | Self::TooMuchOutput
+        )
+    }
+
+    /// Indicate that the error occurred while processing an expression at `offset`.
+    pub(crate) fn for_expr_at_offset(self, offset: usize) -> Self {
+        match self {
+            FormatError::TransformInvalid(reason) => {
+                FormatError::TransformInvalid_ { offset, reason }
+            }
+            error => error,
+        }
+    }
+
     // Indicate that `tried` was also tried at `offset`, in case the error is related to other
     // tokens that were tried at the same location.
     pub(crate) fn also_tried(self, offset: Option<usize>, tried: ExpectedSet) -> Self {
         match (offset, self) {
-            (Some(offset), Error::UnexpectedToken { actual, expect }) if offset == actual.2 => {
-                Error::UnexpectedToken {
+            (Some(offset), FormatError::UnexpectedToken { actual, expect })
+                if offset == actual.2 =>
+            {
+                FormatError::UnexpectedToken {
                     actual,
                     expect: expect.union(tried),
                 }
             }
 
-            (None, Error::UnexpectedEos { expect }) => Error::UnexpectedEos {
+            (None, FormatError::UnexpectedEos { expect }) => FormatError::UnexpectedEos {
                 expect: expect.union(tried),
             },
 
@@ -115,14 +237,14 @@ impl ExpectedSet {
         self
     }
 
-    pub(crate) fn into_error(self, actual: Option<&Lexeme<'_>>) -> Error {
+    pub(crate) fn into_error(self, actual: Option<&Lexeme<'_>>) -> FormatError {
         if let Some(actual) = actual {
-            Error::UnexpectedToken {
+            FormatError::UnexpectedToken {
                 actual: actual.detach(),
                 expect: self,
             }
         } else {
-            Error::UnexpectedEos { expect: self }
+            FormatError::UnexpectedEos { expect: self }
         }
     }
 }
@@ -173,5 +295,39 @@ impl fmt::Display for ExpectedSet {
         }
 
         Ok(())
+    }
+}
+
+impl From<RV::Error> for FormatError {
+    fn from(error: RV::Error) -> Self {
+        match error {
+            RV::Error::Visitor(err) => err.into(),
+            RV::Error::Option(err) => err.into(),
+            RV::Error::Meter(err) => err.into(),
+            RV::Error::UnexpectedType => {
+                FormatError::Bcs(bcs::Error::Custom("unexpected type".to_string()))
+            }
+        }
+    }
+}
+
+impl From<RV::MeterError> for FormatError {
+    fn from(error: RV::MeterError) -> Self {
+        match error {
+            RV::MeterError::TooBig => FormatError::TooBig,
+            RV::MeterError::TooDeep => FormatError::TooDeep,
+        }
+    }
+}
+
+impl From<OV::Error> for FormatError {
+    fn from(OV::Error: OV::Error) -> Self {
+        FormatError::Bcs(bcs::Error::ExpectedOption)
+    }
+}
+
+impl From<std::fmt::Error> for FormatError {
+    fn from(_: std::fmt::Error) -> Self {
+        FormatError::TooMuchOutput
     }
 }

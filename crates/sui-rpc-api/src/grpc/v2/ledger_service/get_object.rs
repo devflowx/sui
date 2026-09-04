@@ -1,14 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::ObjectNotFoundError;
 use crate::ErrorReason;
 use crate::RpcError;
 use crate::RpcService;
+use crate::error::ObjectNotFoundError;
 use prost_types::FieldMask;
 use sui_rpc::field::FieldMaskTree;
 use sui_rpc::field::FieldMaskUtil;
-use sui_rpc::merge::Merge;
 use sui_rpc::proto::google::rpc::bad_request::FieldViolation;
 use sui_rpc::proto::sui::rpc::v2::BatchGetObjectsRequest;
 use sui_rpc::proto::sui::rpc::v2::BatchGetObjectsResponse;
@@ -17,8 +16,10 @@ use sui_rpc::proto::sui::rpc::v2::GetObjectResponse;
 use sui_rpc::proto::sui::rpc::v2::GetObjectResult;
 use sui_rpc::proto::sui::rpc::v2::Object;
 use sui_sdk_types::Address;
+use sui_types::full_checkpoint_content::ObjectSet;
 
-pub const READ_MASK_DEFAULT: &str = "object_id,version,digest";
+pub const MAX_BATCH_REQUESTS: usize = 1000;
+pub const READ_MASK_DEFAULT: &str = crate::read_mask_defaults::OBJECT;
 
 type ValidationResult = Result<(Vec<(Address, Option<u64>)>, FieldMaskTree), RpcError>;
 
@@ -84,6 +85,13 @@ pub fn batch_get_objects(
         ..
     }: BatchGetObjectsRequest,
 ) -> Result<BatchGetObjectsResponse, RpcError> {
+    if requests.len() > MAX_BATCH_REQUESTS {
+        return Err(RpcError::new(
+            tonic::Code::InvalidArgument,
+            format!("number of batch requests exceed limit of {MAX_BATCH_REQUESTS}"),
+        ));
+    }
+
     let requests = requests
         .into_iter()
         .map(|req| (req.object_id, req.version))
@@ -121,13 +129,5 @@ fn get_object_impl(
             .ok_or_else(|| ObjectNotFoundError::new(object_id))?
     };
 
-    let mut message = Object::default();
-
-    if read_mask.contains(Object::JSON_FIELD.name) {
-        message.json = crate::grpc::v2::render_object_to_json(service, &object).map(Box::new);
-    }
-
-    message.merge(&object, read_mask);
-
-    Ok(message)
+    Ok(service.render_object_to_proto(&object, read_mask, &ObjectSet::default()))
 }

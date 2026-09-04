@@ -5,18 +5,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
+use anyhow::anyhow;
 use prometheus::Registry;
-use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::{
-    consistent_service_client::ConsistentServiceClient, owner::OwnerKind, AvailableRangeRequest,
-    AvailableRangeResponse, Balance, BatchGetBalancesRequest, End, ListObjectsByTypeRequest,
-    ListOwnedObjectsRequest, Object, Owner, CHECKPOINT_METADATA,
-};
-use sui_types::{
-    base_types::{ObjectDigest, ObjectID, ObjectRef, SequenceNumber},
-    TypeTag,
-};
-use tokio_util::sync::CancellationToken;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::consistent_service_client::ConsistentServiceClient;
+use sui_types::base_types::ObjectDigest;
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SequenceNumber;
 use tonic::transport::Channel;
 use tracing::instrument;
 use url::Url;
@@ -24,13 +20,6 @@ use url::Url;
 pub use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha as proto;
 
 use crate::metrics::ConsistentReaderMetrics;
-
-/// Like `anyhow::bail!`, but returns this module's `Error` type, not `anyhow::Error`.
-macro_rules! bail {
-    ($e:expr) => {
-        return Err(Error::Internal(anyhow!($e)));
-    };
-}
 
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct ConsistentReaderArgs {
@@ -49,7 +38,6 @@ pub struct ConsistentReader {
     client: Option<Client>,
     timeout: Option<Duration>,
     metrics: Arc<ConsistentReaderMetrics>,
-    cancel: CancellationToken,
 }
 
 /// Response from a paginated query.
@@ -92,7 +80,6 @@ impl ConsistentReader {
         prefix: Option<&str>,
         args: ConsistentReaderArgs,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> Result<Self, Error> {
         let client = if let Some(url) = &args.consistent_store_url {
             let mut endpoint = Channel::from_shared(url.to_string())
@@ -102,10 +89,7 @@ impl ConsistentReader {
                 endpoint = endpoint.timeout(timeout);
             }
 
-            let channel = endpoint
-                .connect()
-                .await
-                .context("Failed to connect to gRPC endpoint")?;
+            let channel = endpoint.connect_lazy();
 
             Some(ConsistentServiceClient::new(channel))
         } else {
@@ -119,18 +103,20 @@ impl ConsistentReader {
             client,
             timeout,
             metrics,
-            cancel,
         })
     }
 
     /// Get the consistent store's watermarks, as of the given `checkpoint`.
     #[instrument(skip(self), level = "debug")]
-    pub async fn available_range(&self, checkpoint: u64) -> Result<AvailableRangeResponse, Error> {
+    pub async fn available_range(
+        &self,
+        checkpoint: u64,
+    ) -> Result<proto::AvailableRangeResponse, Error> {
         self.request(
             "available_range",
             Some(checkpoint),
             |mut client, request| async move { client.available_range(request).await },
-            AvailableRangeRequest {},
+            proto::AvailableRangeRequest {},
         )
         .await
     }
@@ -140,19 +126,18 @@ impl ConsistentReader {
     pub async fn batch_get_balances(
         &self,
         checkpoint: u64,
-        address: String,
-        coin_types: Vec<String>,
-    ) -> Result<Vec<(TypeTag, u64)>, Error> {
+        requests: Vec<(String, String)>,
+    ) -> Result<Vec<proto::Balance>, Error> {
         let response = self
             .request(
                 "batch_get_balances",
                 Some(checkpoint),
                 |mut client, request| async move { client.batch_get_balances(request).await },
-                BatchGetBalancesRequest {
-                    requests: coin_types
+                proto::BatchGetBalancesRequest {
+                    requests: requests
                         .into_iter()
-                        .map(|coin_type| proto::GetBalanceRequest {
-                            owner: Some(address.clone()),
+                        .map(|(owner, coin_type)| proto::GetBalanceRequest {
+                            owner: Some(owner),
                             coin_type: Some(coin_type),
                         })
                         .collect(),
@@ -162,8 +147,7 @@ impl ConsistentReader {
 
         let mut results = vec![];
         for balance in response.balances {
-            let edge: Edge<(TypeTag, u64)> = balance.try_into()?;
-            results.push(edge.value);
+            results.push(balance);
         }
 
         Ok(results)
@@ -173,41 +157,37 @@ impl ConsistentReader {
     #[instrument(skip(self), level = "debug")]
     pub async fn get_balance(
         &self,
-        checkpoint: u64,
+        checkpoint: Option<u64>,
         address: String,
         coin_type: String,
-    ) -> Result<(TypeTag, u64), Error> {
-        let response = self
-            .request(
-                "get_balance",
-                Some(checkpoint),
-                |mut client, request| async move { client.get_balance(request).await },
-                proto::GetBalanceRequest {
-                    owner: Some(address),
-                    coin_type: Some(coin_type),
-                },
-            )
-            .await?;
-
-        let edge: Edge<(TypeTag, u64)> = response.try_into()?;
-        Ok(edge.value)
+    ) -> Result<proto::Balance, Error> {
+        self.request(
+            "get_balance",
+            checkpoint,
+            |mut client, request| async move { client.get_balance(request).await },
+            proto::GetBalanceRequest {
+                owner: Some(address),
+                coin_type: Some(coin_type),
+            },
+        )
+        .await
     }
 
     /// Paginate coin balances for `address`, at checkpoint `checkpoint`.
     #[instrument(skip(self), level = "debug")]
     pub async fn list_balances(
         &self,
-        checkpoint: u64,
+        checkpoint: Option<u64>,
         address: String,
         page_size: Option<u32>,
         after_token: Option<Vec<u8>>,
         before_token: Option<Vec<u8>>,
         is_from_front: bool,
-    ) -> Result<Page<(TypeTag, u64)>, Error> {
+    ) -> Result<Page<proto::Balance>, Error> {
         let response = self
             .request(
                 "list_balances",
-                Some(checkpoint),
+                checkpoint,
                 |mut client, request| async move { client.list_balances(request).await },
                 proto::ListBalancesRequest {
                     owner: Some(address),
@@ -215,9 +195,9 @@ impl ConsistentReader {
                     after_token: after_token.map(Into::into),
                     before_token: before_token.map(Into::into),
                     end: if is_from_front {
-                        Some(End::Front.into())
+                        Some(proto::End::Front.into())
                     } else {
-                        Some(End::Back.into())
+                        Some(proto::End::Back.into())
                     },
                 },
             )
@@ -229,8 +209,11 @@ impl ConsistentReader {
         let results = response
             .balances
             .into_iter()
-            .map(TryFrom::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|b| Edge {
+                token: b.page_token.clone().unwrap_or_default().into(),
+                value: b,
+            })
+            .collect();
 
         Ok(Page {
             results,
@@ -243,7 +226,7 @@ impl ConsistentReader {
     #[instrument(skip(self), level = "debug")]
     pub async fn list_objects_by_type(
         &self,
-        checkpoint: u64,
+        checkpoint: Option<u64>,
         object_type: String,
         page_size: Option<u32>,
         after_token: Option<Vec<u8>>,
@@ -253,17 +236,17 @@ impl ConsistentReader {
         let response = self
             .request(
                 "list_objects_by_type",
-                Some(checkpoint),
+                checkpoint,
                 |mut client, request| async move { client.list_objects_by_type(request).await },
-                ListObjectsByTypeRequest {
+                proto::ListObjectsByTypeRequest {
                     object_type: Some(object_type),
                     page_size,
                     after_token: after_token.map(Into::into),
                     before_token: before_token.map(Into::into),
                     end: if is_from_front {
-                        Some(End::Front.into())
+                        Some(proto::End::Front.into())
                     } else {
-                        Some(End::Back.into())
+                        Some(proto::End::Back.into())
                     },
                 },
             )
@@ -286,12 +269,13 @@ impl ConsistentReader {
     }
 
     /// Paginate live objects at `checkpoint`, with owner described by `kind` and `address`, and an
-    /// optional `object_type` filter.
+    /// optional, `object_type`. If `object_type` is prefaced with `!`, objects of the type prefix
+    /// will be excluded from the page of results.
     #[instrument(skip(self), level = "debug")]
     pub async fn list_owned_objects(
         &self,
-        checkpoint: u64,
-        kind: OwnerKind,
+        checkpoint: Option<u64>,
+        kind: proto::owner::OwnerKind,
         address: Option<String>,
         object_type: Option<String>,
         page_size: Option<u32>,
@@ -302,10 +286,10 @@ impl ConsistentReader {
         let response = self
             .request(
                 "list_owned_objects",
-                Some(checkpoint),
+                checkpoint,
                 |mut client, request| async move { client.list_owned_objects(request).await },
-                ListOwnedObjectsRequest {
-                    owner: Some(Owner {
+                proto::ListOwnedObjectsRequest {
+                    owner: Some(proto::Owner {
                         kind: Some(kind.into()),
                         address,
                     }),
@@ -314,9 +298,9 @@ impl ConsistentReader {
                     after_token: after_token.map(Into::into),
                     before_token: before_token.map(Into::into),
                     end: if is_from_front {
-                        Some(End::Front.into())
+                        Some(proto::End::Front.into())
                     } else {
-                        Some(End::Back.into())
+                        Some(proto::End::Back.into())
                     },
                 },
             )
@@ -372,7 +356,7 @@ impl ConsistentReader {
 
         if let Some(checkpoint) = checkpoint {
             request.metadata_mut().insert(
-                CHECKPOINT_METADATA,
+                proto::CHECKPOINT_HEIGHT_METADATA,
                 checkpoint
                     .to_string()
                     .parse()
@@ -380,15 +364,10 @@ impl ConsistentReader {
             );
         }
 
-        let response = tokio::select! {
-            _ = self.cancel.cancelled() => {
-                bail!("Request cancelled");
-            }
-
-            r = response(client, request) => {
-                r.map(|r| r.into_inner()).map_err(Into::into)
-            }
-        };
+        let response = response(client, request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(Into::into);
 
         if response.is_ok() {
             self.metrics
@@ -406,31 +385,10 @@ impl ConsistentReader {
     }
 }
 
-impl TryFrom<Balance> for Edge<(TypeTag, u64)> {
+impl TryFrom<proto::Object> for Edge<ObjectRef> {
     type Error = Error;
 
-    fn try_from(proto: Balance) -> Result<Self, Error> {
-        let coin_type: TypeTag = proto
-            .coin_type
-            .context("coin type missing")?
-            .parse()
-            .context("invalid coin type")?;
-
-        let balance: u64 = proto.balance.unwrap_or(0);
-
-        let token: Vec<u8> = proto.page_token.unwrap_or_default().into();
-
-        Ok(Edge {
-            token,
-            value: (coin_type, balance),
-        })
-    }
-}
-
-impl TryFrom<Object> for Edge<ObjectRef> {
-    type Error = Error;
-
-    fn try_from(proto: Object) -> Result<Self, Error> {
+    fn try_from(proto: proto::Object) -> Result<Self, Error> {
         let object_id: ObjectID = proto
             .object_id
             .context("object ID missing")?

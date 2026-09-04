@@ -32,18 +32,17 @@ use bridge::message::{
     update_asset_price_payload_token_id,
     update_bridge_limit_payload_limit,
     update_bridge_limit_payload_receiving_chain,
-    update_bridge_limit_payload_sending_chain
+    update_bridge_limit_payload_sending_chain,
 };
 use bridge::treasury::{Self, BTC, ETH, USDC};
 use std::ascii;
-use std::unit_test::assert_eq;
+use std::unit_test::{assert_eq, destroy};
 use sui::address;
 use sui::balance;
 use sui::bcs;
 use sui::coin::{Self, Coin};
 use sui::hex;
 use sui::test_scenario;
-use sui::test_utils::destroy;
 
 const INVALID_CHAIN: u8 = 42;
 

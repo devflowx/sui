@@ -8,21 +8,27 @@ pub enum Error {
     #[error("Checkpoint {0} not found")]
     NotFound(u64),
 
-    #[error("Failed to deserialize checkpoint {0}: {1}")]
-    DeserializationError(u64, #[source] anyhow::Error),
+    #[error("Failed to decode checkpoint {0}: {1}")]
+    DecodeError(u64, #[source] anyhow::Error),
 
     #[error("Failed to fetch checkpoint {0}: {1}")]
     FetchError(u64, #[source] anyhow::Error),
 
+    #[error("Failed to fetch chain id for checkpoint {0}: {1}")]
+    ChainIdError(u64, #[source] anyhow::Error),
+
+    #[error("Failed to fetch latest checkpoint: {0}")]
+    LatestCheckpointError(#[source] anyhow::Error),
+
     #[error(transparent)]
-    ReqwestError(#[from] reqwest::Error),
+    ObjectStoreError(#[from] object_store::Error),
 
     #[error("No subscribers for ingestion service")]
     NoSubscribers,
 
-    #[error("Shutdown signal received, stopping ingestion service")]
-    Cancelled,
-
     #[error(transparent)]
     RpcClientError(#[from] tonic::Status),
+
+    #[error("Streaming error: {0}")]
+    StreamingError(#[source] anyhow::Error),
 }

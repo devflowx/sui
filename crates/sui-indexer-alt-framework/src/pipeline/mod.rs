@@ -3,27 +3,22 @@
 
 use std::time::Duration;
 
-pub use processor::Processor;
-use serde::{Deserialize, Serialize};
-
+pub use crate::config::ConcurrencyConfig;
 use crate::store::CommitterWatermark;
+pub use processor::Processor;
+use rand::Rng;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub mod concurrent;
 mod logging;
 mod processor;
 pub mod sequential;
 
-/// Extra buffer added to channels between tasks in a pipeline. There does not need to be a huge
-/// capacity here because tasks already buffer rows to insert internally.
-const PIPELINE_BUFFER: usize = 5;
-
 /// Issue a warning every time the number of pending watermarks exceeds this number. This can
 /// happen if the pipeline was started with its initial checkpoint overridden to be strictly
 /// greater than its current watermark -- in that case, the pipeline will never be able to update
 /// its watermarks.
-///
-/// This may be a legitimate thing to do when backfilling a table, but in that case
-/// `--skip-watermarks` should be used.
 const WARN_PENDING_WATERMARKS: usize = 10000;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -36,6 +31,31 @@ pub struct CommitterConfig {
 
     /// Watermark task will check for pending watermarks this often, in milliseconds.
     pub watermark_interval_ms: u64,
+
+    /// Maximum random jitter to add to the watermark interval, in milliseconds.
+    pub watermark_interval_jitter_ms: u64,
+}
+
+/// Per-pipeline ingestion settings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct IngestionConfig {
+    /// Capacity of this pipeline's bounded subscriber channel. If `None`, the built-in default
+    /// is used (see [`IngestionConfig::subscriber_channel_size`]).
+    pub subscriber_channel_size: Option<usize>,
+}
+
+impl IngestionConfig {
+    /// Resolves `subscriber_channel_size` to its final value, substituting the built-in default
+    /// if unset.
+    ///
+    /// The default is small on purpose: the adaptive controller does the real backpressure work,
+    /// and larger values just pin more decoded checkpoints in memory without throughput benefit.
+    /// Scales with CPU count for fetch parallelism headroom, with a floor of 4 so the
+    /// controller's dead band (0.6..0.85) has integer room to maneuver on small machines.
+    pub fn subscriber_channel_size(&self) -> usize {
+        self.subscriber_channel_size
+            .unwrap_or_else(|| (num_cpus::get() / 2).max(4))
+    }
 }
 
 /// Processed values associated with a single checkpoint. This is an internal type used to
@@ -58,17 +78,6 @@ struct WatermarkPart {
     total_rows: usize,
 }
 
-/// Internal type used by workers to propagate errors or shutdown signals up to their
-/// supervisor.
-#[derive(thiserror::Error, Debug)]
-enum Break {
-    #[error("Shutdown received")]
-    Cancel,
-
-    #[error(transparent)]
-    Err(#[from] anyhow::Error),
-}
-
 impl CommitterConfig {
     pub fn collect_interval(&self) -> Duration {
         Duration::from_millis(self.collect_interval_ms)
@@ -76,6 +85,17 @@ impl CommitterConfig {
 
     pub fn watermark_interval(&self) -> Duration {
         Duration::from_millis(self.watermark_interval_ms)
+    }
+
+    /// Returns the next watermark update instant with a random jitter added. The jitter is a
+    /// random value between 0 and `watermark_interval_jitter_ms`.
+    pub fn watermark_interval_with_jitter(&self) -> tokio::time::Instant {
+        let jitter = if self.watermark_interval_jitter_ms == 0 {
+            0
+        } else {
+            rand::thread_rng().gen_range(0..=self.watermark_interval_jitter_ms)
+        };
+        tokio::time::Instant::now() + Duration::from_millis(self.watermark_interval_ms + jitter)
     }
 }
 
@@ -125,13 +145,19 @@ impl WatermarkPart {
 
     /// Add the rows from `other` to this part.
     fn add(&mut self, other: WatermarkPart) {
-        debug_assert_eq!(self.checkpoint(), other.checkpoint());
+        assert_eq!(self.checkpoint(), other.checkpoint());
         self.batch_rows += other.batch_rows;
+        assert!(
+            self.batch_rows <= self.total_rows,
+            "batch_rows ({}) exceeded total_rows ({})",
+            self.batch_rows,
+            self.total_rows,
+        );
     }
 
     /// Record that `rows` have been taken from this part.
     fn take(&mut self, rows: usize) -> WatermarkPart {
-        debug_assert!(
+        assert!(
             self.batch_rows >= rows,
             "Can't take more rows than are available"
         );
@@ -151,6 +177,7 @@ impl Default for CommitterConfig {
             write_concurrency: 5,
             collect_interval_ms: 500,
             watermark_interval_ms: 500,
+            watermark_interval_jitter_ms: 0,
         }
     }
 }
@@ -158,16 +185,18 @@ impl Default for CommitterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::Arc;
-    use sui_types::full_checkpoint_content::CheckpointData;
+    use sui_types::full_checkpoint_content::Checkpoint;
 
     // Test implementation of Processor
     struct TestProcessor;
+    #[async_trait]
     impl Processor for TestProcessor {
         const NAME: &'static str = "test";
         type Value = i32;
 
-        fn process(&self, _checkpoint: &Arc<CheckpointData>) -> anyhow::Result<Vec<Self::Value>> {
+        async fn process(&self, _checkpoint: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
             Ok(vec![1, 2, 3])
         }
     }

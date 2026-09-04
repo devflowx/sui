@@ -5,10 +5,10 @@
 #![forbid(unsafe_code)]
 
 use crate::tasks::{
-    InitCommand, PrintBytecodeCommand, PublishCommand, RunCommand, SyntaxChoice, TaskCommand,
-    TaskInput, taskify,
+    InitCommand, PrintBytecodeCommand, PublishAndCallsCommand, PublishCommand, PublishRunCommand,
+    RunCommand, SyntaxChoice, TaskCommand, TaskInput, taskify,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use clap::Parser;
 use move_binary_format::file_format::CompiledModule;
@@ -22,7 +22,7 @@ use move_command_line_common::{
 use move_compiler::{
     PreCompiledProgramInfo,
     compiled_unit::AnnotatedCompiledUnit,
-    diagnostics::{Diagnostics, warning_filters::WarningFiltersBuilder},
+    diagnostics::{Diagnostics, filter::unused_for_test_filter_scope},
     editions::{Edition, Flavor},
     shared::{NumericalAddress, PackageConfig, files::MappedFiles},
 };
@@ -37,9 +37,8 @@ use move_core_types::{
     language_storage::{ModuleId, TypeTag},
 };
 use move_disassembler::disassembler::{Disassembler, DisassemblerOptions};
-use move_ir_types::location::Spanned;
 use move_symbol_pool::Symbol;
-use move_vm_runtime::session::SerializedReturnValues;
+use move_vm_runtime::dev_utils::vm_arguments::ValueFrame;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::{Debug, Write as FmtWrite},
@@ -59,6 +58,8 @@ pub struct CompiledState {
     edition: Edition,
     flavor: Flavor,
     modules: BTreeMap<ModuleId, CompiledModule>,
+    source_maps: BTreeMap<ModuleId, SourceMap>,
+    syntax_choices: BTreeMap<ModuleId, SyntaxChoice>,
     temp_files: BTreeMap<String, NamedTempFile>,
 }
 
@@ -132,6 +133,22 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
         gas_budget: Option<u64>,
         extra: Self::ExtraPublishArgs,
     ) -> Result<(Option<String>, Vec<MaybeNamedCompiledModule>)>;
+    async fn publish_modules_with_calls(
+        &mut self,
+        modules: Vec<MaybeNamedCompiledModule>,
+        calls: Vec<(
+            ModuleId,
+            Identifier,
+            Vec<<<Self as MoveTestAdapter<'a>>::ExtraValueArgs as ParsableValue>::ConcreteValue>,
+        )>,
+        signers: Vec<ParsedAddress>,
+        gas_budget: Option<u64>,
+        extra_args: Self::ExtraPublishArgs,
+    ) -> Result<(
+        Option<String>,
+        Vec<MaybeNamedCompiledModule>,
+        Vec<ValueFrame>,
+    )>;
     async fn call_function(
         &mut self,
         module: &ModuleId,
@@ -141,7 +158,7 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
         args: Vec<<<Self as MoveTestAdapter<'a>>::ExtraValueArgs as ParsableValue>::ConcreteValue>,
         gas_budget: Option<u64>,
         extra: Self::ExtraRunArgs,
-    ) -> Result<(Option<String>, SerializedReturnValues)>;
+    ) -> Result<(Option<String>, ValueFrame)>;
 
     async fn handle_subcommand(
         &mut self,
@@ -189,14 +206,17 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
             stop_line,
             data,
             task_text,
+            unattached_comments_before: _,
+            unattached_comments_after: _,
         } = task;
         match command {
             TaskCommand::Init { .. } => {
                 panic!("The 'init' command is optional. But if used, it must be the first command")
             }
             TaskCommand::PrintBytecode(PrintBytecodeCommand { syntax }) => {
+                // TODO this should really work over published modules, not source
                 let syntax = syntax.unwrap_or_else(|| self.default_syntax());
-                let (warnings_opt, output, _data, modules) = compile_any(
+                let (warnings_opt, _data, (output, modules)) = compile_any(
                     self,
                     "publish",
                     syntax,
@@ -210,27 +230,27 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
                 )
                 .await?;
                 let output = merge_output(output, warnings_opt);
-                let output = modules.into_iter().fold(output, |output, m| {
+                let output = modules.into_iter().try_fold(output, |output, m| {
                     let MaybeNamedCompiledModule {
                         module, source_map, ..
                     } = m;
-                    let source_mapping = match source_map {
-                        Some(m) => SourceMapping::new(m, &module),
-                        None => SourceMapping::new_without_source_map(
-                            &module,
-                            Spanned::unsafe_no_loc(()).loc,
-                        )
-                        .expect("Unable to build dummy source mapping"),
+                    let Some(source_map) = source_map else {
+                        bail!("No source map available for {}", module.self_id())
                     };
+                    let source_mapping = SourceMapping::new(source_map, &module);
                     let disassembler =
                         Disassembler::new(source_mapping, DisassemblerOptions::new());
-                    merge_output(output, Some(disassembler.disassemble().unwrap()))
-                });
+                    Ok(merge_output(
+                        output,
+                        Some(disassembler.disassemble().unwrap()),
+                    ))
+                })?;
                 Ok(output)
             }
+
             TaskCommand::Publish(PublishCommand { gas_budget, syntax }, extra_args) => {
                 let syntax = syntax.unwrap_or_else(|| self.default_syntax());
-                let (warnings_opt, output, data, modules) = compile_any(
+                let (warnings_opt, data, (output, modules)) = compile_any(
                     self,
                     "publish",
                     syntax,
@@ -246,6 +266,61 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
                 store_modules(self, syntax, data, modules);
                 Ok(merge_output(warnings_opt, output))
             }
+
+            TaskCommand::PublishAndCall(
+                PublishAndCallsCommand {
+                    gas_budget,
+                    syntax,
+                    signers,
+                    calls,
+                },
+                extra_args,
+            ) => {
+                let syntax = syntax.unwrap_or_else(|| self.default_syntax());
+                let calls = PublishRunCommand::<Self::ExtraValueArgs>::from_calls(calls)?;
+                let calls = calls
+                    .into_iter()
+                    .map(|run_command| {
+                        let PublishRunCommand {
+                            // type_args: _,
+                            args,
+                            name,
+                        } = run_command;
+                        println!("name: {name:#?}");
+                        let (raw_addr, module_name, function) = name;
+                        let addr = self.compiled_state().resolve_address(&raw_addr);
+                        let module_id = ModuleId::new(addr, module_name);
+                        let function = function.as_ident_str().to_owned();
+                        let args = self.compiled_state().resolve_args(args)?;
+                        let result: anyhow::Result<_> = Ok((module_id, function, args));
+                        result
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let (warnings_opt, data, (output, modules, return_values)) = compile_any(
+                    self,
+                    "publish",
+                    syntax,
+                    name,
+                    number,
+                    start_line,
+                    command_lines_stop,
+                    stop_line,
+                    data,
+                    |adapter, modules| {
+                        adapter.publish_modules_with_calls(
+                            modules, calls, signers, gas_budget, extra_args,
+                        )
+                    },
+                )
+                .await?;
+                store_modules(self, syntax, data, modules);
+                let mut output = merge_output(warnings_opt, output);
+                for values in return_values {
+                    output = merge_output(output, display_return_values(values));
+                    output = merge_output(output, Some("\n".to_string()));
+                }
+                Ok(output)
+            }
             TaskCommand::Run(
                 RunCommand {
                     signers,
@@ -259,7 +334,7 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
             ) => {
                 let syntax = syntax.unwrap_or_else(|| self.default_syntax());
                 let empty_publish_args = <Self::ExtraPublishArgs as Default>::default();
-                let (warnings_opt, output, data, modules) = compile_any(
+                let (warnings_opt, data, (output, modules)) = compile_any(
                     self,
                     "publish",
                     syntax,
@@ -342,6 +417,8 @@ pub trait MoveTestAdapter<'a>: Sized + Send {
                     stop_line,
                     data,
                     task_text,
+                    unattached_comments_before: vec![],
+                    unattached_comments_after: vec![],
                 })
                 .await
             }
@@ -371,18 +448,39 @@ fn single_entry_function(
     Ok((module.self_id(), name))
 }
 
-fn display_return_values(return_values: SerializedReturnValues) -> Option<String> {
-    let SerializedReturnValues {
-        mutable_reference_outputs,
-        return_values,
-    } = return_values;
+fn display_return_values(
+    ValueFrame {
+        mut heap,
+        heap_mut_refs,
+        heap_imm_refs: _,
+        values: return_values,
+    }: ValueFrame,
+) -> Option<String> {
     let mut output = vec![];
-    if !mutable_reference_outputs.is_empty() {
-        let values = mutable_reference_outputs
+    // Values first so we can drop them before grabbing values from the base heap.
+    let printed = if !return_values.is_empty() {
+        Some(
+            return_values
+                .iter()
+                .map(|v| {
+                    let mut buf = String::new();
+                    move_vm_runtime::execution::values::debug::print_value(&mut buf, v).unwrap();
+                    buf
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    } else {
+        None
+    };
+
+    drop(return_values);
+
+    if !heap_mut_refs.is_empty() {
+        let values = heap_mut_refs
             .iter()
-            .map(|(idx, bytes, layout)| {
-                let value =
-                    move_vm_types::values::Value::simple_deserialize(bytes, layout).unwrap();
+            .map(|(idx, heap_id)| {
+                let value = heap.take_loc(*heap_id).unwrap();
                 (idx, value)
             })
             .collect::<Vec<_>>();
@@ -390,31 +488,18 @@ fn display_return_values(return_values: SerializedReturnValues) -> Option<String
             .iter()
             .map(|(idx, v)| {
                 let mut buf = String::new();
-                move_vm_types::values::debug::print_value(&mut buf, v).unwrap();
+                move_vm_runtime::execution::values::debug::print_value(&mut buf, v).unwrap();
                 format!("local#{}: {}", idx, buf)
             })
             .collect::<Vec<_>>()
             .join(", ");
         output.push(format!("mutable inputs after call: {}", printed))
     };
-    if !return_values.is_empty() {
-        let values = return_values
-            .iter()
-            .map(|(bytes, layout)| {
-                move_vm_types::values::Value::simple_deserialize(bytes, layout).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let printed = values
-            .iter()
-            .map(|v| {
-                let mut buf = String::new();
-                move_vm_types::values::debug::print_value(&mut buf, v).unwrap();
-                buf
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+
+    if let Some(printed) = printed {
         output.push(format!("return values: {}", printed))
-    };
+    }
+
     if output.is_empty() {
         None
     } else {
@@ -446,6 +531,8 @@ impl CompiledState {
             pre_compiled_program_info_opt: pre_compiled_deps.clone(),
             pre_compiled_ids,
             modules: BTreeMap::new(),
+            source_maps: BTreeMap::new(),
+            syntax_choices: BTreeMap::new(),
             compiled_module_named_address_mapping: BTreeMap::new(),
             named_address_mapping,
             edition: compiler_edition.unwrap_or(Edition::LEGACY),
@@ -475,6 +562,14 @@ impl CompiledState {
         self.temp_files.keys()
     }
 
+    pub fn source_map(&self, id: &ModuleId) -> Option<&SourceMap> {
+        self.source_maps.get(id)
+    }
+
+    pub fn syntax_choice(&self, id: &ModuleId) -> Option<&SyntaxChoice> {
+        self.syntax_choices.get(id)
+    }
+
     pub fn add_with_source_file(
         &mut self,
         modules: Vec<MaybeNamedCompiledModule>,
@@ -486,6 +581,7 @@ impl CompiledState {
             let MaybeNamedCompiledModule {
                 named_address: named_addr_opt,
                 module,
+                source_map,
                 ..
             } = m;
             let id = module.self_id();
@@ -494,11 +590,18 @@ impl CompiledState {
                 self.compiled_module_named_address_mapping
                     .insert(id.clone(), named_addr);
             }
-            self.modules.insert(id, module);
+            self.modules.insert(id.clone(), module);
+            if let Some(source_map) = source_map {
+                self.source_maps.insert(id, source_map);
+            }
         }
     }
 
-    pub fn add_and_generate_interface_file(&mut self, module: CompiledModule) {
+    pub fn add_and_generate_interface_file(
+        &mut self,
+        module: CompiledModule,
+        source_map: Option<SourceMap>,
+    ) {
         let id = module.self_id();
         self.check_not_precompiled(&id);
         let interface_file = NamedTempFile::new().unwrap();
@@ -515,7 +618,10 @@ impl CompiledState {
             .unwrap();
         let prev = self.temp_files.insert(path, interface_file);
         assert!(prev.is_none());
-        self.modules.insert(id, module);
+        self.modules.insert(id.clone(), module);
+        if let Some(source_map) = source_map {
+            self.source_maps.insert(id, source_map);
+        }
     }
 
     fn add_precompiled(&mut self, named_addr_opt: Option<Symbol>, module: CompiledModule) {
@@ -549,7 +655,7 @@ pub struct MaybeNamedCompiledModule {
     pub source_map: Option<SourceMap>,
 }
 
-pub async fn compile_any<'state, 'adapter: 'result, 'result, F, A, R>(
+pub async fn compile_any<'state, 'adapter: 'result, 'result, F, A, FR, Output>(
     test_adapter: &'adapter mut A,
     command: &str,
     syntax: SyntaxChoice,
@@ -560,16 +666,11 @@ pub async fn compile_any<'state, 'adapter: 'result, 'result, F, A, R>(
     _stop_line: usize,
     data: Option<NamedTempFile>,
     handler: F,
-) -> Result<(
-    Option<String>,
-    Option<String>,
-    NamedTempFile,
-    Vec<MaybeNamedCompiledModule>,
-)>
+) -> Result<(Option<String>, NamedTempFile, Output)>
 where
     A: MoveTestAdapter<'state> + 'adapter,
-    F: FnOnce(&'adapter mut A, Vec<MaybeNamedCompiledModule>) -> R,
-    R: Future<Output = Result<(Option<String>, Vec<MaybeNamedCompiledModule>)>> + 'result,
+    F: FnOnce(&'adapter mut A, Vec<MaybeNamedCompiledModule>) -> FR,
+    FR: Future<Output = Result<Output>> + 'result,
 {
     let data = match data {
         Some(f) => f,
@@ -599,19 +700,19 @@ where
             (modules, warnings_opt)
         }
         SyntaxChoice::IR => {
-            let module = compile_ir_module(state, data.path())?;
+            let (module, source_map) = compile_ir_module(state, data.path())?;
             (
                 vec![MaybeNamedCompiledModule {
                     named_address: None,
                     module,
-                    source_map: None,
+                    source_map: Some(source_map),
                 }],
                 None,
             )
         }
     };
-    let (output, modules) = handler(test_adapter, modules).await?;
-    Ok((warnings_opt, output, data, modules))
+    let handler_result = handler(test_adapter, modules).await?;
+    Ok((warnings_opt, data, handler_result))
 }
 
 pub fn store_modules<'a, A: MoveTestAdapter<'a>>(
@@ -622,16 +723,22 @@ pub fn store_modules<'a, A: MoveTestAdapter<'a>>(
 ) {
     match syntax {
         SyntaxChoice::Source => {
+            let state = test_adapter.compiled_state();
+            for m in &modules {
+                state
+                    .syntax_choices
+                    .insert(m.module.self_id(), SyntaxChoice::Source);
+            }
             let path = data.path().to_str().unwrap().to_owned();
-            test_adapter
-                .compiled_state()
-                .add_with_source_file(modules, (path, data))
+            state.add_with_source_file(modules, (path, data))
         }
         SyntaxChoice::IR => {
-            let module = modules.pop().unwrap().module;
-            test_adapter
-                .compiled_state()
-                .add_and_generate_interface_file(module);
+            let module = modules.pop().unwrap();
+            let state = test_adapter.compiled_state();
+            state
+                .syntax_choices
+                .insert(module.module.self_id(), SyntaxChoice::IR);
+            state.add_and_generate_interface_file(module.module, module.source_map);
         }
     }
 }
@@ -658,7 +765,7 @@ pub fn compile_source_units(
     // txn testing framework test code includes private unused functions and unused struct types on
     // purpose and generating warnings for all of them does not make much sense (and there would be
     // a lot of them!) so let's suppress them function warnings, so let's suppress these
-    let warning_filter = WarningFiltersBuilder::unused_warnings_filter_for_test();
+    let warning_filter = unused_for_test_filter_scope();
     let (mut files, compiler_res) = move_compiler::Compiler::from_files(
         None,
         vec![file_name.as_ref().to_str().unwrap().to_owned()],
@@ -690,7 +797,7 @@ pub fn compile_source_units(
 pub fn compile_ir_module(
     state: &CompiledState,
     file_name: impl AsRef<Path>,
-) -> Result<CompiledModule> {
+) -> Result<(CompiledModule, SourceMap)> {
     use move_ir_compiler::Compiler as IRCompiler;
     let code = std::fs::read_to_string(file_name).unwrap();
     let named_addresses = state
@@ -701,15 +808,32 @@ pub fn compile_ir_module(
     // TODO this mapping does not work well with upgrades since they have the same original ID
     IRCompiler::new(state.dep_modules().collect())
         .with_named_addresses(named_addresses)
-        .into_compiled_module(&code)
+        .into_compiled_module_with_source_map(&code)
 }
 
-/// Creates an adapter for the given tasks, using the first task command to initialize the adapter
-/// if it is a `TaskCommand::Init`. Returns the adapter and the output string.
-pub async fn create_adapter<'a, Adapter>(
+/// Taskifies the test input and creates an adapter, using the first task command to initialize the
+/// adapter if it is a `TaskCommand::Init`. Returns the adapter, output string, and remaining tasks.
+pub async fn create_adapter_and_taskify<'a, Adapter>(
     path: &Path,
     pre_compiled_program: Option<Arc<PreCompiledProgramInfo>>,
-) -> Result<(String, Adapter), Box<dyn std::error::Error>>
+) -> Result<
+    (
+        String,
+        Adapter,
+        VecDeque<
+            TaskInput<
+                TaskCommand<
+                    Adapter::ExtraInitArgs,
+                    Adapter::ExtraPublishArgs,
+                    Adapter::ExtraValueArgs,
+                    Adapter::ExtraRunArgs,
+                    Adapter::Subcommand,
+                >,
+            >,
+        >,
+    ),
+    Box<dyn std::error::Error>,
+>
 where
     Adapter: MoveTestAdapter<'a>,
     Adapter::ExtraInitArgs: Debug,
@@ -747,7 +871,17 @@ where
     )
     .unwrap();
 
-    let first_task = tasks.pop_front().unwrap();
+    let mut first_task = tasks.pop_front().unwrap();
+    let init_unattached_comments = std::mem::take(&mut first_task.unattached_comments_before);
+    write_unattached_comments(&mut output, &init_unattached_comments);
+    let init_comments = normalize_snapshot_comment_whitespace(
+        &first_task
+            .task_text
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("//#"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     let init_opt = match &first_task.command {
         TaskCommand::Init(_, _) => Some(first_task.map(|known| match known {
             TaskCommand::Init(command, extra_args) => (command, extra_args),
@@ -762,18 +896,30 @@ where
         Adapter::init(default_syntax, pre_compiled_program, init_opt, path).await;
 
     if let Some(result) = result_opt {
-        if let Err(e) = writeln!(output, "\ninit:\n{}", result) {
-            return Err(Box::new(e));
+        if !init_comments.is_empty() {
+            write!(output, "\n{init_comments}").map_err(Box::new)?;
         }
+        writeln!(output, "\ninit:\n{}", result).map_err(Box::new)?;
     }
-    Ok((output, adapter))
+    Ok((output, adapter, tasks))
 }
 
-/// Consumes the adapter to run tasks from path.
+/// Consumes the adapter and task queue to run the test.
 pub async fn run_tasks_with_adapter<'a, Adapter>(
     path: &Path,
     mut adapter: Adapter,
     mut output: String,
+    tasks: VecDeque<
+        TaskInput<
+            TaskCommand<
+                Adapter::ExtraInitArgs,
+                Adapter::ExtraPublishArgs,
+                Adapter::ExtraValueArgs,
+                Adapter::ExtraRunArgs,
+                Adapter::Subcommand,
+            >,
+        >,
+    >,
     insta_options: Option<InstaOptions>,
 ) -> Result<()>
 where
@@ -784,25 +930,6 @@ where
     Adapter::ExtraRunArgs: Debug,
     Adapter::Subcommand: Debug,
 {
-    let mut tasks = taskify::<
-        TaskCommand<
-            Adapter::ExtraInitArgs,
-            Adapter::ExtraPublishArgs,
-            Adapter::ExtraValueArgs,
-            Adapter::ExtraRunArgs,
-            Adapter::Subcommand,
-        >,
-    >(path)?
-    .into_iter()
-    .collect::<VecDeque<_>>();
-    assert!(!tasks.is_empty());
-
-    // Pop off init command if present, this has already been handled before this function was
-    // called to initialize the adapter
-    if let Some(TaskCommand::Init(_, _)) = tasks.front().map(|t| &t.command) {
-        tasks.pop_front();
-    }
-
     for task in tasks {
         handle_known_task(&mut output, &mut adapter, task).await;
     }
@@ -838,15 +965,46 @@ where
     Adapter::ExtraRunArgs: Debug,
     Adapter::Subcommand: Debug,
 {
-    let (output, adapter) = create_adapter::<Adapter>(path, pre_compiled_program).await?;
-    run_tasks_with_adapter(path, adapter, output, insta_options).await?;
+    let (output, adapter, tasks) =
+        create_adapter_and_taskify::<Adapter>(path, pre_compiled_program).await?;
+    run_tasks_with_adapter(path, adapter, output, tasks, insta_options).await?;
     Ok(())
+}
+
+fn normalize_snapshot_comment_whitespace(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                line.trim_end()
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Writes standalone comment blocks with one blank line before the first block and between blocks.
+fn write_unattached_comments(output: &mut String, comments: &[Vec<String>]) {
+    if comments.is_empty() {
+        return;
+    }
+
+    writeln!(output).unwrap();
+    for (index, block) in comments.iter().enumerate() {
+        if index > 0 {
+            writeln!(output).unwrap();
+        }
+        for line in block {
+            writeln!(output, "{}", normalize_snapshot_comment_whitespace(line)).unwrap();
+        }
+    }
 }
 
 async fn handle_known_task<'a, Adapter: MoveTestAdapter<'a>>(
     output: &mut String,
     adapter: &mut Adapter,
-    task: TaskInput<
+    mut task: TaskInput<
         TaskCommand<
             Adapter::ExtraInitArgs,
             Adapter::ExtraPublishArgs,
@@ -856,15 +1014,22 @@ async fn handle_known_task<'a, Adapter: MoveTestAdapter<'a>>(
         >,
     >,
 ) {
+    write_unattached_comments(output, &task.unattached_comments_before);
+    let trailing_comments = std::mem::take(&mut task.unattached_comments_after);
     let task_number = task.number;
     let start_line = task.start_line;
     let stop_line = task.stop_line;
-    let task_text = adapter
-        .render_command_input(&task)
-        .unwrap_or_else(|| task.task_text.clone());
+    let task_text = normalize_snapshot_comment_whitespace(
+        &adapter
+            .render_command_input(&task)
+            .unwrap_or_else(|| task.task_text.clone()),
+    );
     let result = adapter.handle_command(task).await;
     let result_string = match result {
-        Ok(None) => return,
+        Ok(None) => {
+            write_unattached_comments(output, &trailing_comments);
+            return;
+        }
         Ok(Some(s)) => s,
         Err(e) => format!("Error: {}", adapter.process_error(e).await),
     };
@@ -881,4 +1046,5 @@ async fn handle_known_task<'a, Adapter: MoveTestAdapter<'a>>(
         "\ntask {task_number}, {line_number}:\n{task_text}\n{result_string}"
     )
     .unwrap();
+    write_unattached_comments(output, &trailing_comments);
 }

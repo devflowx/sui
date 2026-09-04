@@ -10,9 +10,12 @@
 //!   greater than positive integers.
 //! - Structs are compared by lexicographically, as a tuple of their fields.
 //! - Collections are first ordered by size, then by their elements in lexicographic order.
-use bincode::{error::DecodeError, Decode, Encode};
 
-pub(crate) fn encode<T: Encode>(x: &T) -> Vec<u8> {
+use bincode::Decode;
+use bincode::Encode;
+use bincode::error::DecodeError;
+
+pub(crate) fn encode<T: Encode + ?Sized>(x: &T) -> Vec<u8> {
     let config = bincode::config::standard()
         .with_big_endian()
         .with_fixed_int_encoding();
@@ -36,6 +39,21 @@ pub(crate) fn next(bs: &mut [u8]) -> bool {
     for b in bs.iter_mut().rev() {
         *b = b.wrapping_add(1);
         if *b != 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Modify the key `bs` in place to the lexicographically previous key.
+///
+/// Returns a boolean indicating whether the decrement succeeded without underflow or not. On an
+/// underflow, the key is reset to 0xFF.
+pub(crate) fn prev(bs: &mut [u8]) -> bool {
+    for b in bs.iter_mut().rev() {
+        *b = b.wrapping_sub(1);
+        if *b != 0xFF {
             return true;
         }
     }

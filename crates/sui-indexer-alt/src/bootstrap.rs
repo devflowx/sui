@@ -3,23 +3,26 @@
 
 use std::time::Duration;
 
-use crate::Indexer;
-use anyhow::{bail, Context, Result};
-use diesel::{OptionalExtension, QueryDsl, SelectableHelper};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use diesel::OptionalExtension;
+use diesel::QueryDsl;
+use diesel::SelectableHelper;
 use diesel_async::RunQueryDsl;
 use sui_indexer_alt_framework::postgres::Db;
-use sui_indexer_alt_framework::types::{
-    full_checkpoint_content::CheckpointData,
-    sui_system_state::{get_sui_system_state, SuiSystemStateTrait},
-    transaction::{TransactionDataAPI, TransactionKind},
-};
-use sui_indexer_alt_schema::{
-    checkpoints::StoredGenesis,
-    epochs::StoredEpochStart,
-    schema::{kv_epoch_starts, kv_genesis},
-};
-use tokio_util::sync::CancellationToken;
+use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
+use sui_indexer_alt_framework::types::sui_system_state::SuiSystemStateTrait;
+use sui_indexer_alt_framework::types::sui_system_state::get_sui_system_state;
+use sui_indexer_alt_framework::types::transaction::TransactionKind;
+use sui_indexer_alt_schema::checkpoints::StoredGenesis;
+use sui_indexer_alt_schema::epochs::StoredEpochStart;
+use sui_indexer_alt_schema::schema::kv_epoch_starts;
+use sui_indexer_alt_schema::schema::kv_genesis;
+use sui_types::transaction::TransactionDataAPI;
 use tracing::info;
+
+use crate::Indexer;
 
 pub struct BootstrapGenesis {
     pub stored_genesis: StoredGenesis,
@@ -30,13 +33,9 @@ pub struct BootstrapGenesis {
 /// the information stored there. If the database has been bootstrapped before, this function will
 /// simply read the previously bootstrapped information. Otherwise, it will wait until the first
 /// checkpoint is available and extract the necessary information from there.
-///
-/// Can be cancelled via the `cancel` token, or through an interrupt signal (which will also cancel
-/// the token).
 pub async fn bootstrap(
     indexer: &Indexer<Db>,
     retry_interval: Duration,
-    cancel: CancellationToken,
     bootstrap_genesis: Option<BootstrapGenesis>,
 ) -> Result<StoredGenesis> {
     info!("Bootstrapping indexer with genesis information");
@@ -72,35 +71,35 @@ pub async fn bootstrap(
         // - Get the Genesis system transaction from the genesis checkpoint.
         // - Get the system state object that was written out by the system transaction.
         None => {
-            let genesis_checkpoint = tokio::select! {
-                cp = indexer.ingestion_client().wait_for(0, retry_interval) =>
-                    cp.context("Failed to fetch genesis checkpoint")?,
-                _ = cancel.cancelled() => {
-                    bail!("Cancelled before genesis checkpoint was available");
-                }
-            };
+            let genesis_checkpoint_envelope = indexer
+                .ingestion_client()
+                .wait_for(0, retry_interval)
+                .await
+                .context("Failed to fetch genesis checkpoint")?;
 
-            let CheckpointData {
-                checkpoint_summary,
+            let Checkpoint {
                 transactions,
+                object_set,
                 ..
-            } = genesis_checkpoint.as_ref();
+            } = genesis_checkpoint_envelope.checkpoint.as_ref();
 
-            let Some(genesis_transaction) = transactions.iter().find(|tx| {
-                matches!(
-                    tx.transaction.intent_message().value.kind(),
-                    TransactionKind::Genesis(_)
-                )
-            }) else {
+            let Some(genesis_transaction) = transactions
+                .iter()
+                .find(|tx| matches!(tx.transaction.kind(), TransactionKind::Genesis(_)))
+            else {
                 bail!("Could not find Genesis transaction");
             };
 
-            let sui_system_state =
-                get_sui_system_state(&genesis_transaction.output_objects.as_slice())
-                    .context("Failed to get Genesis SystemState")?;
+            let output_objects: Vec<_> = genesis_transaction
+                .output_objects(object_set)
+                .cloned()
+                .collect();
+
+            let sui_system_state = get_sui_system_state(&output_objects.as_slice())
+                .context("Failed to get Genesis SystemState")?;
 
             let stored_genesis = StoredGenesis {
-                genesis_digest: checkpoint_summary.digest().inner().to_vec(),
+                genesis_digest: genesis_checkpoint_envelope.chain_id.as_bytes().to_vec(),
                 initial_protocol_version: sui_system_state.protocol_version() as i64,
             };
             let stored_epoch_start = StoredEpochStart {

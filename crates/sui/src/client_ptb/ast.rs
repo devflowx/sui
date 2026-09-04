@@ -5,13 +5,13 @@ use std::{collections::BTreeMap, fmt};
 
 use move_core_types::parsing::{
     address::{NumericalAddress, ParsedAddress},
-    types::{ParsedFqName, ParsedModuleId, ParsedStructType, ParsedType},
+    types::{ParsedDatatype, ParsedFqName, ParsedModuleId, ParsedType},
 };
 use move_core_types::runtime_value::MoveValue;
 use sui_types::{
+    Identifier, TypeTag,
     base_types::{ObjectID, RESOLVED_ASCII_STR, RESOLVED_STD_OPTION, RESOLVED_UTF8_STR},
     id::RESOLVED_SUI_ID,
-    Identifier, TypeTag,
 };
 
 use crate::{err, error, sp};
@@ -483,15 +483,15 @@ impl fmt::Display for TyDisplay<'_> {
             Bool => write!(f, "bool"),
             Signer => write!(f, "signer"),
             Vector(ty) => write!(f, "vector<{}>", TyDisplay(ty)),
-            Struct(ParsedStructType {
+            Datatype(ParsedDatatype {
                 fq_name:
                     ParsedFqName {
                         module: ParsedModuleId { address, name },
-                        name: struct_name,
+                        name: datatype_name,
                     },
                 type_args,
             }) => {
-                write!(f, "{address}::{name}::{struct_name}")?;
+                write!(f, "{address}::{name}::{datatype_name}")?;
                 if type_args.is_empty() {
                     Ok(())
                 } else {

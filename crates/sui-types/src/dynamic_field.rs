@@ -3,13 +3,13 @@
 
 use crate::base_types::{MoveObjectType, ObjectDigest, SuiAddress};
 use crate::crypto::DefaultHash;
-use crate::error::{SuiError, SuiResult};
+use crate::error::{SuiError, SuiErrorKind, SuiResult};
 use crate::id::UID;
 use crate::object::{MoveObject, Object};
-use crate::storage::{ChildObjectResolver, ObjectStore};
+use crate::storage::{ObjectStore, RuntimeObjectResolver};
 use crate::sui_serde::Readable;
 use crate::sui_serde::SuiTypeTag;
-use crate::{MoveTypeTagTrait, ObjectID, SequenceNumber, SUI_FRAMEWORK_ADDRESS};
+use crate::{MoveTypeTagTrait, ObjectID, SUI_FRAMEWORK_ADDRESS, SequenceNumber};
 use fastcrypto::encoding::Base64;
 use fastcrypto::hash::HashFunction;
 use move_core_types::annotated_value::{MoveStruct, MoveValue};
@@ -17,12 +17,12 @@ use move_core_types::ident_str;
 use move_core_types::identifier::IdentStr;
 use move_core_types::language_storage::{StructTag, TypeTag};
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
-use serde_with::serde_as;
 use serde_with::DisplayFromStr;
+use serde_with::serde_as;
 use shared_crypto::intent::HashingIntentScope;
 use std::fmt;
 use std::fmt::{Display, Formatter};
@@ -61,7 +61,7 @@ where
 }
 
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicFieldInfo {
     pub name: DynamicFieldName,
@@ -75,7 +75,7 @@ pub struct DynamicFieldInfo {
 }
 
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicFieldName {
     #[schemars(with = "String")]
@@ -149,22 +149,24 @@ impl DynamicFieldInfo {
             (DynamicFieldType::DynamicObject, Some(TypeTag::Struct(s))) => Ok(s
                 .type_params
                 .first()
-                .ok_or_else(|| SuiError::ObjectDeserializationError {
+                .ok_or_else(|| SuiErrorKind::ObjectDeserializationError {
                     error: format!("Error extracting dynamic object name from object: {tag}"),
                 })?
                 .clone()),
-            _ => Err(SuiError::ObjectDeserializationError {
+            _ => Err(SuiErrorKind::ObjectDeserializationError {
                 error: format!("Error extracting dynamic object name from object: {tag}"),
-            }),
+            }
+            .into()),
         }
     }
 
     pub fn try_extract_field_value(tag: &StructTag) -> SuiResult<TypeTag> {
         match tag.type_params.last() {
             Some(value_type) => Ok(value_type.clone()),
-            None => Err(SuiError::ObjectDeserializationError {
+            None => Err(SuiErrorKind::ObjectDeserializationError {
                 error: format!("Error extracting dynamic object value from object: {tag}"),
-            }),
+            }
+            .into()),
         }
     }
 
@@ -172,13 +174,13 @@ impl DynamicFieldInfo {
         move_struct: &MoveStruct,
     ) -> SuiResult<(MoveValue, DynamicFieldType, ObjectID)> {
         let name = extract_field_from_move_struct(move_struct, "name").ok_or_else(|| {
-            SuiError::ObjectDeserializationError {
+            SuiErrorKind::ObjectDeserializationError {
                 error: "Cannot extract [name] field from sui::dynamic_field::Field".to_string(),
             }
         })?;
 
         let value = extract_field_from_move_struct(move_struct, "value").ok_or_else(|| {
-            SuiError::ObjectDeserializationError {
+            SuiErrorKind::ObjectDeserializationError {
                 error: "Cannot extract [value] field from sui::dynamic_field::Field".to_string(),
             }
         })?;
@@ -190,23 +192,24 @@ impl DynamicFieldInfo {
                 }
                 _ => None,
             }
-            .ok_or_else(|| SuiError::ObjectDeserializationError {
+            .ok_or_else(|| SuiErrorKind::ObjectDeserializationError {
                 error: "Cannot extract [name] field from sui::dynamic_object_field::Wrapper."
                     .to_string(),
             })?;
             // ID extracted from the wrapper object
-            let object_id =
-                extract_id_value(value).ok_or_else(|| SuiError::ObjectDeserializationError {
+            let object_id = extract_id_value(value).ok_or_else(|| {
+                SuiErrorKind::ObjectDeserializationError {
                     error: format!(
                         "Cannot extract dynamic object's object id from \
                         sui::dynamic_field::Field, {value:?}"
                     ),
-                })?;
+                }
+            })?;
             (name.clone(), DynamicFieldType::DynamicObject, object_id)
         } else {
             // ID of the Field object
             let object_id = extract_object_id(move_struct).ok_or_else(|| {
-                SuiError::ObjectDeserializationError {
+                SuiErrorKind::ObjectDeserializationError {
                     error: format!(
                         "Cannot extract dynamic object's object id from \
                         sui::dynamic_field::Field, {move_struct:?}",
@@ -272,12 +275,11 @@ where
     T: Into<SuiAddress>,
 {
     let parent: SuiAddress = parent.into();
-    let k_tag_bytes = bcs::to_bytes(key_type_tag)?;
     tracing::trace!(
-        "Deriving dynamic field ID for parent={:?}, key={:?}, key_type_tag={:?}",
+        "Deriving dynamic field ID for parent={:?}, key={:?}, key_type_tag={}",
         parent,
         key_bytes,
-        key_type_tag,
+        key_type_tag.to_canonical_display(true),
     );
 
     // hash(parent || len(key) || key || key_type_tag)
@@ -286,7 +288,7 @@ where
     hasher.update(parent);
     hasher.update(key_bytes.len().to_le_bytes());
     hasher.update(key_bytes);
-    hasher.update(k_tag_bytes);
+    bcs::serialize_into(&mut hasher, key_type_tag)?;
     let hash = hasher.finalize();
 
     // truncate into an ObjectID and return
@@ -307,8 +309,11 @@ where
         value,
     };
 
-    bcs::to_bytes(&field).map_err(|err| SuiError::ObjectSerializationError {
-        error: err.to_string(),
+    bcs::to_bytes(&field).map_err(|err| {
+        SuiErrorKind::ObjectSerializationError {
+            error: err.to_string(),
+        }
+        .into()
     })
 }
 
@@ -327,7 +332,7 @@ where
     Ok(DynamicFieldKey(parent_id, key.clone(), K::get_type_tag())
         .into_unbounded_id()?
         .expect_object(key, object_store)?
-        .as_object())
+        .into_object())
 }
 
 /// Similar to `get_dynamic_field_object_from_store`, but returns the value in the field instead of
@@ -377,7 +382,7 @@ where
     /// Get the computed ID of the dynamic field.
     pub fn object_id(&self) -> Result<ObjectID, SuiError> {
         derive_dynamic_field_id(self.0, &self.2, &bcs::to_bytes(&self.1).unwrap())
-            .map_err(|e| SuiError::DynamicFieldReadError(e.to_string()))
+            .map_err(|e| SuiErrorKind::DynamicFieldReadError(e.to_string()).into())
     }
 
     /// Convert the key into a UnboundedDynamicFieldID, which can be used to load the latest
@@ -450,7 +455,7 @@ where
         let move_object_type = MoveObjectType::from(*struct_tag);
 
         let field_bytes =
-            bcs::to_bytes(&field).map_err(|e| SuiError::ObjectSerializationError {
+            bcs::to_bytes(&field).map_err(|e| SuiErrorKind::ObjectSerializationError {
                 error: e.to_string(),
             })?;
         Ok(unsafe {
@@ -507,10 +512,13 @@ where
         let parent = self.0;
         let id = self.1;
         self.load_object(object_store).ok_or_else(|| {
-            SuiError::DynamicFieldReadError(format!(
-                "Dynamic field with key={:?} and ID={:?} not found on parent {:?}",
-                key, id, parent
-            ))
+            {
+                SuiErrorKind::DynamicFieldReadError(format!(
+                    "Dynamic field with key={:?} and ID={:?} not found on parent {:?}",
+                    key, id, parent
+                ))
+            }
+            .into()
         })
     }
 
@@ -562,16 +570,20 @@ where
     /// If the field does not exist, return None.
     pub fn load_object(
         self,
-        child_object_resolver: &dyn ChildObjectResolver,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
     ) -> Result<Option<DynamicFieldObject<K>>, SuiError> {
-        child_object_resolver
+        runtime_object_resolver
             .read_child_object(&self.0, &self.1, self.2)
             .map(|r| r.map(DynamicFieldObject::<K>::new))
     }
 
     /// Check if the field object exists in the store.
-    pub fn exists(self, child_object_resolver: &dyn ChildObjectResolver) -> Result<bool, SuiError> {
-        self.load_object(child_object_resolver).map(|r| r.is_some())
+    pub fn exists(
+        self,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
+    ) -> Result<bool, SuiError> {
+        self.load_object(runtime_object_resolver)
+            .map(|r| r.is_some())
     }
 }
 
@@ -585,8 +597,12 @@ impl<K> DynamicFieldObject<K> {
     }
 
     /// Get the underlying Object.
-    pub fn as_object(self) -> Object {
+    pub fn into_object(self) -> Object {
         self.0
+    }
+
+    pub fn as_object(&self) -> &Object {
+        &self.0
     }
 }
 
@@ -609,12 +625,12 @@ where
     {
         let object = self.0;
         let move_object = object.data.try_as_move().ok_or_else(|| {
-            SuiError::DynamicFieldReadError(format!(
+            SuiErrorKind::DynamicFieldReadError(format!(
                 "Dynamic field {:?} is not a Move object",
                 object.id()
             ))
         })?;
         bcs::from_bytes::<Field<K, V>>(move_object.contents())
-            .map_err(|err| SuiError::DynamicFieldReadError(err.to_string()))
+            .map_err(|err| SuiErrorKind::DynamicFieldReadError(err.to_string()).into())
     }
 }

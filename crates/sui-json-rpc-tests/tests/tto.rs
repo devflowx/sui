@@ -10,17 +10,18 @@ use sui_json_rpc_types::{
     TransactionBlockBytes,
 };
 use sui_move_build::BuildConfig;
+use sui_types::Identifier;
 use sui_types::base_types::SuiAddress;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::transaction::{CallArg, ObjectArg, TransactionData, TransactionKind};
-use sui_types::Identifier;
+use sui_types::transaction_driver_types::ExecuteTransactionRequestType;
 use test_cluster::TestClusterBuilder;
 
 #[tokio::test]
 async fn test_indexing_with_tto() {
     let cluster = TestClusterBuilder::new().build().await;
 
+    #[allow(deprecated)]
     let http_client = cluster.rpc_client();
     let address = cluster.get_address_0();
 
@@ -49,7 +50,10 @@ async fn test_indexing_with_tto() {
 
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["tests", "data", "tto"]);
-    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let compiled_package = BuildConfig::new_for_testing()
+        .build_async(&path)
+        .await
+        .unwrap();
     let compiled_modules_bytes =
         compiled_package.get_package_base64(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();

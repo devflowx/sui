@@ -47,7 +47,6 @@ list.
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -773,7 +772,7 @@ meaningless to add them to the deny list.
 
 <pre><code><b>fun</b> <a href="../sui/deny_list.md#sui_deny_list_per_type_exists">per_type_exists</a>(<a href="../sui/deny_list.md#sui_deny_list">deny_list</a>: &<a href="../sui/deny_list.md#sui_deny_list_DenyList">DenyList</a>, per_type_index: u64, per_type_key: vector&lt;u8&gt;): bool {
     <b>let</b> key = <a href="../sui/deny_list.md#sui_deny_list_ConfigKey">ConfigKey</a> { per_type_index, per_type_key };
-    ofield::exists_(&<a href="../sui/deny_list.md#sui_deny_list">deny_list</a>.id, key)
+    ofield::exists(&<a href="../sui/deny_list.md#sui_deny_list">deny_list</a>.id, key)
 }
 </code></pre>
 

@@ -1,11 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::base_types::SuiAddress;
 use crate::ObjectID;
+use crate::base_types::SuiAddress;
+use crate::error::{BoxError, ExecutionError, ExecutionErrorMetadata, ExecutionErrorTrait};
 use move_binary_format::file_format::{CodeOffset, TypeParameterIndex};
 use move_core_types::language_storage::ModuleId;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use sui_macros::EnumVariantOrder;
 use thiserror::Error;
@@ -18,12 +20,59 @@ mod execution_status_tests;
 pub enum ExecutionStatus {
     Success,
     /// Gas used in the failed case, and the error.
-    Failure {
-        /// The error
-        error: ExecutionFailureStatus,
-        /// Which command the error occurred
-        command: Option<CommandIndex>,
-    },
+    Failure(ExecutionFailure),
+}
+
+#[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionFailure {
+    pub error: ExecutionErrorKind,
+    pub command: Option<CommandIndex>,
+}
+
+impl ExecutionFailure {
+    pub fn new(error: ExecutionErrorKind, command: Option<CommandIndex>) -> Self {
+        ExecutionFailure { error, command }
+    }
+}
+
+impl From<ExecutionError> for ExecutionFailure {
+    fn from(value: ExecutionError) -> Self {
+        Self {
+            error: value.kind().clone(),
+            command: value.command(),
+        }
+    }
+}
+
+impl Error for ExecutionFailure {}
+
+impl Display for ExecutionFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Execution Failure: {}", self.error)
+    }
+}
+
+impl ExecutionErrorTrait for ExecutionFailure {
+    fn new(
+        failure: ExecutionFailure,
+        _source: Option<BoxError>,
+        _metadata: ExecutionErrorMetadata,
+    ) -> Self {
+        failure
+    }
+
+    fn with_command_index(self, command: CommandIndex) -> Self {
+        Self {
+            command: Some(command),
+            ..self
+        }
+    }
+    fn kind(&self) -> &ExecutionErrorKind {
+        &self.error
+    }
+    fn command(&self) -> Option<CommandIndex> {
+        self.command
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
@@ -38,8 +87,10 @@ impl fmt::Display for CongestedObjects {
     }
 }
 
+pub type ExecutionFailureStatus = ExecutionErrorKind;
+
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize, Error, EnumVariantOrder)]
-pub enum ExecutionFailureStatus {
+pub enum ExecutionErrorKind {
     //
     // General transaction errors
     //
@@ -199,7 +250,9 @@ pub enum ExecutionFailureStatus {
     #[error("The shared object operation is not allowed.")]
     SharedObjectOperationNotAllowed,
 
-    #[error("Certificate cannot be executed due to a dependency on a deleted shared object or an object that was transferred out of consensus")]
+    #[error(
+        "Certificate cannot be executed due to a dependency on a deleted shared object or an object that was transferred out of consensus"
+    )]
     InputObjectDeleted,
 
     #[error("Certificate is cancelled due to congestion on shared objects: {congested_objects}")]
@@ -240,8 +293,11 @@ pub enum ExecutionFailureStatus {
     #[error("A valid linkage was unable to be determined for the transaction")]
     InvalidLinkage,
 
-    #[error("Insufficient balance for transaction withdrawal")]
-    InsufficientBalanceForWithdraw,
+    #[error("Insufficient funds for funds accumulator withdrawal")]
+    InsufficientFundsForWithdraw,
+
+    #[error("Non-exclusive write input object {id} has been modified")]
+    NonExclusiveWriteInputObjectModified { id: ObjectID },
     // NOTE: if you want to add a new enum,
     // please add it at the end for Rust SDK backward compatibility.
 }
@@ -339,6 +395,12 @@ pub enum CommandArgumentError {
         command."
     )]
     InvalidReferenceArgument,
+    #[error(
+        "Invalid usage of TxContext in the function signature. TxContext can only be used by \
+        reference, `&TxContext` or `&mut TxContext`. If used mutably, it must be the only \
+        TxContext parameter, and TxContext can never be returned from a Move call."
+    )]
+    InvalidTxContext,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize, Hash, Error)]
@@ -368,7 +430,7 @@ pub enum TypeArgumentError {
     ConstraintNotSatisfied,
 }
 
-impl ExecutionFailureStatus {
+impl ExecutionErrorKind {
     pub fn command_argument_error(kind: CommandArgumentError, arg_idx: u16) -> Self {
         Self::CommandArgumentError { arg_idx, kind }
     }
@@ -406,47 +468,42 @@ impl Display for MoveLocation {
 }
 
 impl ExecutionStatus {
-    pub fn new_failure(
-        error: ExecutionFailureStatus,
-        command: Option<CommandIndex>,
-    ) -> ExecutionStatus {
-        ExecutionStatus::Failure { error, command }
+    pub fn new_failure(failure: ExecutionFailure) -> ExecutionStatus {
+        ExecutionStatus::Failure(failure)
     }
 
     pub fn is_ok(&self) -> bool {
-        matches!(self, ExecutionStatus::Success { .. })
+        matches!(self, ExecutionStatus::Success)
     }
 
     pub fn is_err(&self) -> bool {
-        matches!(self, ExecutionStatus::Failure { .. })
+        matches!(self, ExecutionStatus::Failure(_))
     }
 
     pub fn unwrap(&self) {
         match self {
             ExecutionStatus::Success => {}
-            ExecutionStatus::Failure { .. } => {
+            ExecutionStatus::Failure(_) => {
                 panic!("Unable to unwrap() on {:?}", self);
             }
         }
     }
 
-    pub fn unwrap_err(self) -> (ExecutionFailureStatus, Option<CommandIndex>) {
+    pub fn unwrap_err(self) -> (ExecutionErrorKind, Option<CommandIndex>) {
         match self {
-            ExecutionStatus::Success { .. } => {
+            ExecutionStatus::Success => {
                 panic!("Unable to unwrap() on {:?}", self);
             }
-            ExecutionStatus::Failure { error, command } => (error, command),
+            ExecutionStatus::Failure(ExecutionFailure { error, command }) => (error, command),
         }
     }
 
     pub fn get_congested_objects(&self) -> Option<&CongestedObjects> {
-        if let ExecutionStatus::Failure {
+        if let ExecutionStatus::Failure(ExecutionFailure {
             error:
-                ExecutionFailureStatus::ExecutionCancelledDueToSharedObjectCongestion {
-                    congested_objects,
-                },
+                ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { congested_objects },
             ..
-        } = self
+        }) = self
         {
             Some(congested_objects)
         } else {
@@ -457,10 +514,10 @@ impl ExecutionStatus {
     pub fn is_cancelled(&self) -> bool {
         matches!(
             self,
-            ExecutionStatus::Failure {
-                error: ExecutionFailureStatus::ExecutionCancelledDueToSharedObjectCongestion { .. },
+            ExecutionStatus::Failure(ExecutionFailure {
+                error: ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { .. },
                 ..
-            }
+            })
         )
     }
 }

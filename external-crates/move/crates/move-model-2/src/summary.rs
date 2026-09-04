@@ -843,9 +843,11 @@ impl Fields {
 
 impl Type {
     fn multiple_from_ast(context: &Context, ty @ sp!(_, ty_): &N::Type) -> Vec<Self> {
-        match ty_ {
-            N::Type_::Unit => vec![],
-            N::Type_::Apply(_, sp!(_, N::TypeName_::Multiple(_)), tys) => {
+        use N::TypeInner as TI;
+
+        match ty_.inner() {
+            TI::Unit => vec![],
+            TI::Apply(_, sp!(_, N::TypeName_::Multiple(_)), tys) => {
                 tys.iter().map(|ty| Type::from_ast(context, ty)).collect()
             }
             _ => {
@@ -855,13 +857,15 @@ impl Type {
     }
 
     fn from_ast(context: &Context, sp!(_, ty_): &N::Type) -> Self {
-        match ty_ {
-            N::Type_::Unit => Self::Tuple(vec![]),
-            N::Type_::Ref(mut_, inner) => {
+        use N::TypeInner as TI;
+
+        match ty_.inner() {
+            TI::Unit => Self::Tuple(vec![]),
+            TI::Ref(mut_, inner) => {
                 Type::Reference(*mut_, Box::new(Self::from_ast(context, inner)))
             }
-            N::Type_::Param(tp) => Type::NamedTypeParameter(tp.user_specified_name.value),
-            N::Type_::Apply(_, sp!(_, tn_), tys) => match tn_ {
+            TI::Param(tp) => Type::NamedTypeParameter(tp.user_specified_name.value),
+            TI::Apply(_, sp!(_, tn_), tys) => match tn_ {
                 N::TypeName_::ModuleType(m, n) => {
                     let normalized_id = m.value.module_id();
                     let name = n.0.value;
@@ -900,16 +904,14 @@ impl Type {
                     }
                 },
             },
-            N::Type_::Fun(params, ret_) => Type::Fun(
+            TI::Fun(params, ret_) => Type::Fun(
                 params
                     .iter()
                     .map(|ty| Self::from_ast(context, ty))
                     .collect(),
                 Box::new(Self::from_ast(context, ret_)),
             ),
-            N::Type_::Var(_) | N::Type_::Anything | N::Type_::Void | N::Type_::UnresolvedError => {
-                Self::Any
-            }
+            TI::Var(_) | TI::Anything | TI::Void | TI::UnresolvedError => Self::Any,
         }
     }
 }
@@ -1022,6 +1024,42 @@ fn attribute(k: &KA::KnownAttribute) -> Attribute {
                     }
                 }
                 Attribute::Parameterized(KA::DiagnosticAttribute::ALLOW.into(), inner)
+            }
+            KA::DiagnosticAttribute::Deny { deny_set } => {
+                let mut inner = Vec::new();
+                for (prefix_opt, name) in deny_set {
+                    if let Some(pref) = prefix_opt {
+                        let grp = vec![Attribute::Name(name.value)];
+                        inner.push(Attribute::Parameterized(pref.value, grp));
+                    } else {
+                        inner.push(Attribute::Name(name.value));
+                    }
+                }
+                Attribute::Parameterized(KA::DiagnosticAttribute::DENY.into(), inner)
+            }
+            KA::DiagnosticAttribute::Expect { expect_set } => {
+                let mut inner = Vec::new();
+                for (prefix_opt, name) in expect_set {
+                    if let Some(pref) = prefix_opt {
+                        let grp = vec![Attribute::Name(name.value)];
+                        inner.push(Attribute::Parameterized(pref.value, grp));
+                    } else {
+                        inner.push(Attribute::Name(name.value));
+                    }
+                }
+                Attribute::Parameterized(KA::DiagnosticAttribute::EXPECT.into(), inner)
+            }
+            KA::DiagnosticAttribute::Warn { warn_set } => {
+                let mut inner = Vec::new();
+                for (prefix_opt, name) in warn_set {
+                    if let Some(pref) = prefix_opt {
+                        let grp = vec![Attribute::Name(name.value)];
+                        inner.push(Attribute::Parameterized(pref.value, grp));
+                    } else {
+                        inner.push(Attribute::Name(name.value));
+                    }
+                }
+                Attribute::Parameterized(KA::DiagnosticAttribute::WARN.into(), inner)
             }
             KA::DiagnosticAttribute::LintAllow { allow_set } => {
                 let inner = allow_set

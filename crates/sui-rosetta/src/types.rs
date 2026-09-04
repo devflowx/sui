@@ -4,8 +4,8 @@
 use std::fmt::Debug;
 use std::str::FromStr;
 
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::response::{IntoResponse, Response};
 use fastcrypto::encoding::Hex;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serializer};
@@ -14,22 +14,24 @@ use serde_json::Value;
 use strum_macros::EnumIter;
 use strum_macros::EnumString;
 
-use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockKind};
+use sui_rpc::proto::sui::rpc::v2::ExecutionStatus;
+use sui_rpc::proto::sui::rpc::v2::TransactionKind;
+use sui_rpc::proto::sui::rpc::v2::transaction_kind::Kind;
+use sui_sdk_types::Address;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest};
 use sui_types::crypto::PublicKey as SuiPublicKey;
 use sui_types::crypto::SignatureScheme;
 use sui_types::messages_checkpoint::CheckpointDigest;
 
+use crate::SUI;
 use crate::errors::{Error, ErrorType};
 use crate::operations::Operations;
-use crate::SUI;
 pub use internal_operation::InternalOperation;
 
 pub mod internal_operation;
+pub mod transaction_envelope;
 
-#[cfg(test)]
-#[path = "unit_tests/types_tests.rs"]
-mod types_tests;
+pub use transaction_envelope::{AuxData, RosettaTransaction};
 
 pub type BlockHeight = u64;
 
@@ -86,6 +88,7 @@ pub enum SubAccountType {
     Stake,
     PendingStake,
     EstimatedReward,
+    FungibleStakedSuiValue,
 }
 
 impl From<SuiAddress> for AccountIdentifier {
@@ -187,14 +190,22 @@ pub struct Amount {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct AmountMetadata {
     pub sub_balances: Vec<SubBalance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_epoch_start_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_epoch_duration_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct SubBalance {
-    pub stake_id: ObjectID,
-    pub validator: SuiAddress,
+    pub stake_id: Address,
+    pub validator: Address,
     #[serde(with = "str_format")]
     pub value: i128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_epoch: Option<u64>,
 }
 
 impl Amount {
@@ -211,8 +222,31 @@ impl Amount {
         Self {
             value,
             currency: Currency::default(),
-            metadata: Some(AmountMetadata { sub_balances }),
+            metadata: Some(AmountMetadata {
+                sub_balances,
+                latest_epoch: None,
+                latest_epoch_start_timestamp_ms: None,
+                latest_epoch_duration_ms: None,
+            }),
         }
+    }
+
+    pub fn with_epoch_timing(
+        mut self,
+        epoch: u64,
+        epoch_start_timestamp_ms: u64,
+        epoch_duration_ms: u64,
+    ) -> Self {
+        let metadata = self.metadata.get_or_insert_with(|| AmountMetadata {
+            sub_balances: vec![],
+            latest_epoch: None,
+            latest_epoch_start_timestamp_ms: None,
+            latest_epoch_duration_ms: None,
+        });
+        metadata.latest_epoch = Some(epoch);
+        metadata.latest_epoch_start_timestamp_ms = Some(epoch_start_timestamp_ms);
+        metadata.latest_epoch_duration_ms = Some(epoch_duration_ms);
+        self
     }
 }
 
@@ -258,24 +292,6 @@ impl IntoResponse for AccountCoinsResponse {
 pub struct Coin {
     pub coin_identifier: CoinIdentifier,
     pub amount: Amount,
-}
-
-impl From<sui_sdk::rpc_types::Coin> for Coin {
-    fn from(coin: sui_sdk::rpc_types::Coin) -> Self {
-        Self {
-            coin_identifier: CoinIdentifier {
-                identifier: CoinID {
-                    id: coin.coin_object_id,
-                    version: coin.version,
-                },
-            },
-            amount: Amount {
-                value: coin.balance as i128,
-                currency: SUI.clone(),
-                metadata: None,
-            },
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -458,6 +474,8 @@ pub enum OperationType {
     PayCoin,
     Stake,
     WithdrawStake,
+    ConsolidateAllStakedSuiToFungible,
+    MergeAndRedeemFungibleStakedSui,
     // All other Sui transaction types, readonly
     EpochChange,
     Genesis,
@@ -467,34 +485,67 @@ pub enum OperationType {
     RandomnessStateUpdate,
     EndOfEpochTransaction,
     ProgrammableSystemTransaction,
+    Unknown,
 }
 
-impl From<&SuiTransactionBlockKind> for OperationType {
-    fn from(tx: &SuiTransactionBlockKind) -> Self {
-        match tx {
-            SuiTransactionBlockKind::ChangeEpoch(_) => OperationType::EpochChange,
-            SuiTransactionBlockKind::Genesis(_) => OperationType::Genesis,
-            SuiTransactionBlockKind::ConsensusCommitPrologue(_)
-            | SuiTransactionBlockKind::ConsensusCommitPrologueV2(_)
-            | SuiTransactionBlockKind::ConsensusCommitPrologueV3(_)
-            | SuiTransactionBlockKind::ConsensusCommitPrologueV4(_) => {
-                OperationType::ConsensusCommitPrologue
-            }
-            SuiTransactionBlockKind::ProgrammableTransaction(_) => {
-                OperationType::ProgrammableTransaction
-            }
-            SuiTransactionBlockKind::AuthenticatorStateUpdate(_) => {
-                OperationType::AuthenticatorStateUpdate
-            }
-            SuiTransactionBlockKind::RandomnessStateUpdate(_) => {
-                OperationType::RandomnessStateUpdate
-            }
-            SuiTransactionBlockKind::EndOfEpochTransaction(_) => {
-                OperationType::EndOfEpochTransaction
-            }
-            SuiTransactionBlockKind::ProgrammableSystemTransaction(_) => {
-                OperationType::ProgrammableSystemTransaction
-            }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RedeemMode {
+    AtLeast,
+    AtMost,
+    All,
+}
+
+/// Internal plan describing how `MergeAndRedeemFungibleStakedSui` should execute.
+///
+/// Computed at metadata time (after pool state is read and the actual on-chain
+/// redeem formula is mirrored locally) and threaded through to PTB construction
+/// so the builder can attach mode-specific runtime guards. Only `AtLeast` adds
+/// a `balance::split` chain abort guard; `AtMost` relies on the staking pool
+/// invariant `actual <= floor(token * sui_balance / pool_token_balance)`.
+///
+/// `token_amount = None` on `AtLeast` / `AtMost` means "redeem the full merged
+/// FSS without splitting" — used when the binary search picked exactly the
+/// total token count. Splitting in that case is legal but leaves a zero-value
+/// FSS object in the wallet (`split_fungible_staked_sui` decrements value but
+/// doesn't delete the object), which is wasted dust. Skipping the split keeps
+/// the wallet clean.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RedeemPlan {
+    /// Redeem all FSS for the validator's pool.
+    All,
+    /// Redeem at least `min_sui` MIST. PTB enforces `balance.value >= min_sui`
+    /// at execution time via `balance::split(min_sui)` and `balance::join`.
+    /// `token_amount = None` means redeem the full merged FSS (no
+    /// `split_fungible_staked_sui`); `Some(n)` splits off a `n`-token sub-FSS
+    /// and redeems only that.
+    AtLeast {
+        token_amount: Option<u64>,
+        min_sui: u64,
+    },
+    /// Redeem at most `max_sui` MIST. Token count is chosen so the chain
+    /// invariant `actual <= floor(token * SB / PTB) <= max_sui` holds.
+    /// `token_amount = None` means the cap covers everything the user holds;
+    /// the PTB redeems the full merged FSS without splitting.
+    AtMost {
+        token_amount: Option<u64>,
+        max_sui: u64,
+    },
+}
+
+impl From<&TransactionKind> for OperationType {
+    fn from(tx: &TransactionKind) -> Self {
+        match tx.kind.and_then(|k| Kind::try_from(k).ok()) {
+            Some(Kind::ProgrammableTransaction) => OperationType::ProgrammableTransaction,
+            Some(Kind::ChangeEpoch) => OperationType::EpochChange,
+            Some(Kind::Genesis) => OperationType::Genesis,
+            Some(Kind::ConsensusCommitPrologueV1)
+            | Some(Kind::ConsensusCommitPrologueV2)
+            | Some(Kind::ConsensusCommitPrologueV3)
+            | Some(Kind::ConsensusCommitPrologueV4) => OperationType::ConsensusCommitPrologue,
+            Some(Kind::AuthenticatorStateUpdate) => OperationType::AuthenticatorStateUpdate,
+            Some(Kind::RandomnessStateUpdate) => OperationType::RandomnessStateUpdate,
+            Some(Kind::EndOfEpoch) => OperationType::EndOfEpochTransaction,
+            Some(Kind::Unknown) | Some(_) | None => OperationType::Unknown,
         }
     }
 }
@@ -666,15 +717,63 @@ pub struct ConstructionMetadata {
     pub sender: SuiAddress,
     /// `Coin<SUI>` objects to be used as gas
     pub gas_coins: Vec<ObjectRef>,
-    /// `Coin<SUI>` objects to be merged to GasCoin
+    /// DEPRECATED: Kept for backwards compatibility during rolling deployments.
+    /// For PaySui/Stake: extra gas coins to merge into gas
+    /// For PayCoin/WithdrawStake: empty
+    /// New code should use `objects` field instead.
+    #[serde(default)]
     pub extra_gas_coins: Vec<ObjectRef>,
+    /// For PaySui/Stake: extra gas coins to merge into gas
+    /// For PayCoin: payment coins of the specified type
+    /// For WithdrawStake: stake objects to withdraw
     pub objects: Vec<ObjectRef>,
+    /// Party-owned (ConsensusAddress) version of objects
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub party_objects: Vec<(ObjectID, SequenceNumber)>,
     /// Always refers to SUI balance used
     #[serde(with = "str_format")]
     pub total_coin_value: i128,
     pub gas_price: u64,
     pub budget: u64,
     pub currency: Option<Currency>,
+    /// Amount to withdraw from address balance for payment
+    #[serde(default)]
+    pub address_balance_withdrawal: u64,
+    /// Current epoch, needed for ValidDuring expiration with address-balance gas
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    /// Genesis checkpoint digest (base58), identifies the chain for address-balance gas
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+    /// Uniqueness value for transactions that pay gas from an address balance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u32>,
+    /// Number of FungibleStakedSui objects in the `objects` array (the rest are StakedSui).
+    /// Used by ConsolidateAllStakedSuiToFungible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fss_object_count: Option<u64>,
+    /// Pool tokens to redeem. `None` = redeem all.
+    /// Used by `MergeAndRedeemFungibleStakedSui`.
+    ///
+    /// **Forward-compat field only**: kept so older clients reading newer
+    /// metadata responses still see the field they expect. New servers
+    /// consume `redeem_plan` exclusively when constructing the payload —
+    /// older metadata responses that lack `redeem_plan` cannot be signed by
+    /// new code (the payload step rejects them with a clear error so the
+    /// client can re-fetch metadata). This field is therefore one-way
+    /// compat (new server → old client), not two-way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeem_token_amount: Option<u64>,
+    /// Mode-aware redeem plan for `MergeAndRedeemFungibleStakedSui`.
+    /// Computed in `try_fetch_needed_objects` after mirroring the on-chain
+    /// payout formula and binary-searching for the right token count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeem_plan: Option<RedeemPlan>,
+    /// Quote-time epoch. When `Some(N)`, the resulting transaction is bound to
+    /// epoch N via `TransactionExpiration` so amount-sensitive plans cannot be
+    /// replayed in a later epoch with a different exchange rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_epoch: Option<u64>,
 }
 
 impl IntoResponse for ConstructionMetadataResponse {
@@ -793,11 +892,12 @@ pub enum OperationStatus {
     Failure,
 }
 
-impl From<SuiExecutionStatus> for OperationStatus {
-    fn from(es: SuiExecutionStatus) -> Self {
-        match es {
-            SuiExecutionStatus::Success => OperationStatus::Success,
-            SuiExecutionStatus::Failure { .. } => OperationStatus::Failure,
+impl From<&ExecutionStatus> for OperationStatus {
+    fn from(es: &ExecutionStatus) -> Self {
+        if es.success() {
+            OperationStatus::Success
+        } else {
+            OperationStatus::Failure
         }
     }
 }
@@ -916,4 +1016,213 @@ pub struct PrefundedAccount {
     pub account_identifier: AccountIdentifier,
     pub curve_type: CurveType,
     pub currency: Currency,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quick_js::Context;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_currency_defaults() {
+        let expected = Currency {
+            symbol: "SUI".to_string(),
+            decimals: 9,
+            metadata: CurrencyMetadata {
+                coin_type:
+                    "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
+                        .to_string(),
+            },
+        };
+
+        let currency: Currency = serde_json::from_value(json!(
+            {
+                "symbol": "SUI",
+                "decimals": 9,
+            }
+        ))
+        .unwrap();
+        assert_eq!(expected, currency);
+
+        let amount: Amount = serde_json::from_value(json!(
+            {
+                "value": "1000000000",
+            }
+        ))
+        .unwrap();
+        assert_eq!(expected, amount.currency);
+
+        let account_balance_request: AccountBalanceRequest = serde_json::from_value(json!(
+            {
+                "network_identifier": {
+                    "blockchain": "sui",
+                    "network": "mainnet"
+                },
+                "account_identifier": {
+                    "address": "0xadc3a0bb21840f732435f8b649e99df6b29cd27854dfa4b020e3bee07ea09b96"
+                }
+            }
+        ))
+        .unwrap();
+        assert_eq!(
+            expected,
+            account_balance_request.currencies.0.clone().pop().unwrap()
+        );
+
+        let account_balance_request: AccountBalanceRequest = serde_json::from_value(json!(
+            {
+                "network_identifier": {
+                    "blockchain": "sui",
+                    "network": "mainnet"
+                },
+                "account_identifier": {
+                    "address": "0xadc3a0bb21840f732435f8b649e99df6b29cd27854dfa4b020e3bee07ea09b96"
+                },
+                "currencies": []
+            }
+        ))
+        .unwrap();
+        assert_eq!(
+            expected,
+            account_balance_request.currencies.0.clone().pop().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_total_coin_value_js_conversion_for_large_balance() {
+        #[derive(Serialize, Deserialize, Debug)]
+        pub struct TestConstructionMetadata {
+            pub sender: SuiAddress,
+            pub coins: Vec<ObjectRef>,
+            pub objects: Vec<ObjectRef>,
+            pub total_coin_value: u64,
+            pub gas_price: u64,
+            pub budget: u64,
+            pub currency: Option<Currency>,
+        }
+
+        let test_metadata = TestConstructionMetadata {
+            sender: Default::default(),
+            coins: vec![],
+            objects: vec![],
+            total_coin_value: 65_000_004_233_578_496,
+            gas_price: 0,
+            budget: 0,
+            currency: None,
+        };
+        let test_metadata_json = serde_json::to_string(&test_metadata).unwrap();
+
+        let prod_metadata = ConstructionMetadata {
+            sender: Default::default(),
+            gas_coins: vec![],
+            extra_gas_coins: vec![],
+            objects: vec![],
+            party_objects: vec![],
+            total_coin_value: 65_000_004_233_578_496,
+            gas_price: 0,
+            budget: 0,
+            currency: None,
+            address_balance_withdrawal: 0,
+            epoch: None,
+            chain_id: None,
+            nonce: None,
+            fss_object_count: None,
+            redeem_token_amount: None,
+            redeem_plan: None,
+            bind_epoch: None,
+        };
+        let prod_metadata_json = serde_json::to_string(&prod_metadata).unwrap();
+
+        let context = Context::new().unwrap();
+
+        let test_total_coin_value = format!(
+            "JSON.parse({:?}).total_coin_value.toString()",
+            test_metadata_json
+        );
+        let js_test_total_coin_value = context.eval_as::<String>(&test_total_coin_value).unwrap();
+
+        let prod_total_coin_value = format!(
+            "JSON.parse({:?}).total_coin_value.toString()",
+            prod_metadata_json
+        );
+        let js_prod_total_coin_value = context.eval_as::<String>(&prod_total_coin_value).unwrap();
+
+        assert_eq!("65000004233578500", js_test_total_coin_value);
+        assert_eq!("65000004233578496", js_prod_total_coin_value);
+    }
+
+    #[test]
+    fn test_amount_metadata_epoch_fields_omitted_when_none() {
+        let amount = Amount::new_from_sub_balances(vec![SubBalance {
+            stake_id: Address::ZERO,
+            validator: Address::ZERO,
+            value: 100,
+            activation_epoch: None,
+        }]);
+        let json = serde_json::to_value(&amount).unwrap();
+        let metadata = json.get("metadata").unwrap();
+        assert!(metadata.get("latest_epoch").is_none());
+        assert!(metadata.get("latest_epoch_start_timestamp_ms").is_none());
+        assert!(metadata.get("latest_epoch_duration_ms").is_none());
+    }
+
+    #[test]
+    fn test_amount_metadata_epoch_fields_present_when_set() {
+        let amount = Amount::new_from_sub_balances(vec![SubBalance {
+            stake_id: Address::ZERO,
+            validator: Address::ZERO,
+            value: 100,
+            activation_epoch: None,
+        }])
+        .with_epoch_timing(542, 1710460800000, 86400000);
+
+        let json = serde_json::to_value(&amount).unwrap();
+        let metadata = json.get("metadata").unwrap();
+        assert_eq!(metadata.get("latest_epoch").unwrap(), 542);
+        assert_eq!(
+            metadata.get("latest_epoch_start_timestamp_ms").unwrap(),
+            1710460800000u64
+        );
+        assert_eq!(
+            metadata.get("latest_epoch_duration_ms").unwrap(),
+            86400000u64
+        );
+    }
+
+    #[test]
+    fn test_sub_balance_activation_epoch_omitted_when_none() {
+        let sb = SubBalance {
+            stake_id: Address::ZERO,
+            validator: Address::ZERO,
+            value: 100,
+            activation_epoch: None,
+        };
+        let json = serde_json::to_value(&sb).unwrap();
+        assert!(json.get("activation_epoch").is_none());
+    }
+
+    #[test]
+    fn test_sub_balance_activation_epoch_present_when_set() {
+        let sb = SubBalance {
+            stake_id: Address::ZERO,
+            validator: Address::ZERO,
+            value: 100,
+            activation_epoch: Some(543),
+        };
+        let json = serde_json::to_value(&sb).unwrap();
+        assert_eq!(json.get("activation_epoch").unwrap(), 543);
+    }
+
+    #[test]
+    fn test_fungible_staked_sui_value_sub_account_type_serde() {
+        let sub_account: SubAccount = serde_json::from_value(json!({
+            "address": "FungibleStakedSuiValue"
+        }))
+        .unwrap();
+        assert_eq!(
+            sub_account.account_type,
+            SubAccountType::FungibleStakedSuiValue
+        );
+    }
 }

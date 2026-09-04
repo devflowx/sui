@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    execution_mode::ExecutionMode,
     sp,
     static_programmable_transactions::{env::Env, typing::ast as T},
 };
 use indexmap::IndexSet;
+use mysten_common::ZipDebugEqIteratorExt;
 use std::rc::Rc;
 use sui_types::error::ExecutionError;
 
@@ -56,9 +58,11 @@ struct Location {
 
 #[derive(Debug)]
 struct Context {
+    allow_references_in_ptbs: bool,
     tx_context: Location,
     gas: Location,
     object_inputs: Vec<Location>,
+    withdrawal_inputs: Vec<Location>,
     pure_inputs: Vec<Location>,
     receiving_inputs: Vec<Location>,
     results: Vec<Vec<Location>>,
@@ -289,52 +293,104 @@ impl Location {
 }
 
 impl Context {
-    fn new(txn: &T::Transaction) -> Self {
+    fn new<Mode: ExecutionMode>(env: &Env<Mode>, txn: &T::Transaction) -> anyhow::Result<Self> {
         let T::Transaction {
+            gas_payment,
             bytes: _,
             objects,
+            withdrawals,
             pure,
             receiving,
+            withdrawal_compatibility_conversions: _,
+            original_command_len: _,
             commands: _,
+            unified_linkage: _,
         } = txn;
         let tx_context = Location::non_ref(T::Location::TxContext);
-        let gas = Location::non_ref(T::Location::GasCoin);
+        let mut gas = Location::non_ref(T::Location::GasCoin);
+        if gas_payment.is_none() {
+            gas.move_value()
+                .map_err(|_| anyhow::anyhow!("gas coin should be initialized"))?;
+        }
         let object_inputs = (0..objects.len())
-            .map(|i| Location::non_ref(T::Location::ObjectInput(i as u16)))
-            .collect();
+            .map(|i| {
+                Ok(Location::non_ref(T::Location::ObjectInput(checked_as!(
+                    i, u16
+                )?)))
+            })
+            .collect::<Result<_, ExecutionError>>()?;
+        let withdrawal_inputs = (0..withdrawals.len())
+            .map(|i| {
+                Ok(Location::non_ref(T::Location::WithdrawalInput(
+                    checked_as!(i, u16)?,
+                )))
+            })
+            .collect::<Result<_, ExecutionError>>()?;
         let pure_inputs = (0..pure.len())
-            .map(|i| Location::non_ref(T::Location::PureInput(i as u16)))
-            .collect();
+            .map(|i| {
+                Ok(Location::non_ref(T::Location::PureInput(checked_as!(
+                    i, u16
+                )?)))
+            })
+            .collect::<Result<_, ExecutionError>>()?;
         let receiving_inputs = (0..receiving.len())
-            .map(|i| Location::non_ref(T::Location::ReceivingInput(i as u16)))
-            .collect();
-        Self {
+            .map(|i| {
+                Ok(Location::non_ref(T::Location::ReceivingInput(checked_as!(
+                    i, u16
+                )?)))
+            })
+            .collect::<Result<_, ExecutionError>>()?;
+        Ok(Self {
+            allow_references_in_ptbs: env.protocol_config.allow_references_in_ptbs(),
             tx_context,
             gas,
             object_inputs,
+            withdrawal_inputs,
             pure_inputs,
             receiving_inputs,
             results: vec![],
             arg_roots: IndexSet::new(),
-        }
+        })
     }
 
-    fn current_command(&self) -> u16 {
-        self.results.len() as u16
+    fn current_command(&self) -> anyhow::Result<u16> {
+        Ok(checked_as!(self.results.len(), u16)?)
     }
 
-    fn add_result_values(&mut self, results: impl IntoIterator<Item = Option<Value>>) {
-        let command = self.current_command();
+    fn add_result_values(
+        &mut self,
+        results: impl IntoIterator<Item = Option<Value>>,
+    ) -> anyhow::Result<()> {
+        let command = self.current_command()?;
+        let allow_references_in_ptbs = self.allow_references_in_ptbs;
         self.results.push(
             results
                 .into_iter()
                 .enumerate()
-                .map(|(i, v)| Location {
-                    self_path: Rc::new(PathSet::initial(T::Location::Result(command, i as u16))),
-                    value: v,
+                .map(|(i, v)| {
+                    // Post-condition of the source strip in `call`: for path sets, `TxContext`
+                    // can never be returned. Gated because flag-off dev-inspect legitimately
+                    // produces ctx-rooted results.
+                    if allow_references_in_ptbs && let Some(Value::Ref { paths, .. }) = &v {
+                        anyhow::ensure!(
+                            paths
+                                .0
+                                .iter()
+                                .all(|p| p.root != RootLocation::Known(T::Location::TxContext)),
+                            "TxContext can never be returned"
+                        );
+                    }
+                    Ok(Location {
+                        self_path: Rc::new(PathSet::initial(T::Location::Result(
+                            command,
+                            checked_as!(i, u16)?,
+                        ))),
+                        value: v,
+                    })
                 })
-                .collect(),
+                .collect::<anyhow::Result<_>>()?,
         );
+        Ok(())
     }
 
     fn location(&self, loc: T::Location) -> anyhow::Result<&Location> {
@@ -345,6 +401,10 @@ impl Context {
                 .object_inputs
                 .get(i as usize)
                 .ok_or_else(|| anyhow::anyhow!("Object input index out of bounds {i}"))?,
+            T::Location::WithdrawalInput(i) => self
+                .withdrawal_inputs
+                .get(i as usize)
+                .ok_or_else(|| anyhow::anyhow!("Withdrawal input index out of bounds {i}"))?,
             T::Location::PureInput(i) => self
                 .pure_inputs
                 .get(i as usize)
@@ -369,6 +429,10 @@ impl Context {
                 .object_inputs
                 .get_mut(i as usize)
                 .ok_or_else(|| anyhow::anyhow!("Object input index out of bounds {i}"))?,
+            T::Location::WithdrawalInput(i) => self
+                .withdrawal_inputs
+                .get_mut(i as usize)
+                .ok_or_else(|| anyhow::anyhow!("Withdrawal input index out of bounds {i}"))?,
             T::Location::PureInput(i) => self
                 .pure_inputs
                 .get_mut(i as usize)
@@ -403,7 +467,7 @@ impl Context {
                     "Borrowed flag mismatch for copy usage: expected {borrowed}, got {is_borrowed} \
                     location {:?} for in command {}",
                     location.self_path,
-                    self.current_command()
+                    self.current_command()?
                 );
             }
         }
@@ -449,9 +513,11 @@ impl Context {
 
     fn all_references(&self) -> impl Iterator<Item = Rc<PathSet>> {
         let Self {
+            allow_references_in_ptbs: _,
             tx_context,
             gas,
             object_inputs,
+            withdrawal_inputs,
             pure_inputs,
             receiving_inputs,
             results,
@@ -460,6 +526,7 @@ impl Context {
         std::iter::once(tx_context)
             .chain(std::iter::once(gas))
             .chain(object_inputs)
+            .chain(withdrawal_inputs)
             .chain(pure_inputs)
             .chain(receiving_inputs)
             .chain(results.iter().flatten())
@@ -494,21 +561,37 @@ impl Context {
 /// not be expressive enough in the presence of control flow. Luckily, PTBs do not have control flow
 /// so we can use this approach as a safety net for the Regex based implementation until that
 /// code is sufficiently. tested and hardened.
+/// Strip TxContext input arguments so that they do not flow as inputs
 /// Checks the following
 /// - Values are not used after being moved
 /// - Reference safety is upheld (no dangling references)
-pub fn verify(_env: &Env, txn: &T::Transaction) -> Result<(), ExecutionError> {
-    verify_(txn).map_err(|e| make_invariant_violation!("{}. Transaction {:?}", e, txn))
+pub fn verify<Mode: ExecutionMode>(
+    env: &Env<Mode>,
+    txn: &T::Transaction,
+) -> Result<(), Mode::Error> {
+    Ok(verify_(env, txn).map_err(|e| make_invariant_violation!("{}. Transaction {:?}", e, txn))?)
 }
 
-fn verify_(txn: &T::Transaction) -> anyhow::Result<()> {
-    let mut context = Context::new(txn);
+fn verify_<Mode: ExecutionMode>(env: &Env<Mode>, txn: &T::Transaction) -> anyhow::Result<()> {
+    if env
+        .protocol_config
+        .max_ptb_live_references_as_option()
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut context = Context::new(env, txn)?;
     let T::Transaction {
+        gas_payment: _,
         bytes: _,
         objects: _,
+        withdrawals: _,
         pure: _,
         receiving: _,
+        withdrawal_compatibility_conversions: _,
+        original_command_len: _,
         commands,
+        unified_linkage: _,
     } = txn;
     for c in commands {
         command(&mut context, c)?;
@@ -530,9 +613,9 @@ fn command(context: &mut Context, c: &T::Command) -> anyhow::Result<()> {
     context.add_result_values(
         results
             .into_iter()
-            .zip(c.value.drop_values.iter().copied())
+            .zip_debug_eq(c.value.drop_values.iter().copied())
             .map(|(v, drop)| if drop { None } else { Some(v) }),
-    );
+    )?;
     context.arg_roots.clear();
     Ok(())
 }
@@ -646,7 +729,15 @@ fn call(
         imm_paths.is_disjoint(&mut_paths),
         "Mutable and immutable borrows cannot overlap"
     );
-    let command = context.current_command();
+    // With references enabled in PTBs, TxContext still cannot be the
+    // root of a returned reference. We ensure this by removing them from
+    // any possible input.
+    if context.allow_references_in_ptbs {
+        let is_ctx = |p: &Path| p.root == RootLocation::Known(T::Location::TxContext);
+        mut_paths.0.retain(|p| !is_ctx(p));
+        all_paths.0.retain(|p| !is_ctx(p));
+    }
+    let command = context.current_command()?;
     let mut_paths = if mut_paths.is_empty() {
         PathSet::unknown_root(command)
     } else {
@@ -663,7 +754,7 @@ fn call(
         .map(|(i, ty)| {
             let delta = Delta {
                 command,
-                result: i as u16,
+                result: checked_as!(i, u16)?,
             };
             match ty {
                 T::Type::Reference(/* is mut */ true, _) => {

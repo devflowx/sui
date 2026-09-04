@@ -6,8 +6,9 @@ use crate::{
         authority_per_epoch_store::CertLockGuard, shared_object_version_manager::AssignedVersions,
     },
     execution_cache::ObjectCacheRead,
+    transaction_simulation::SimulationInputLoader,
 };
-use itertools::izip;
+use mysten_common::{ZipDebugEqIteratorExt, izip_debug_eq};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use sui_types::{
@@ -104,7 +105,7 @@ impl TransactionInputLoader {
             .cache
             .multi_get_objects_with_more_accurate_error_return(&object_refs)?;
         assert_eq!(objects.len(), object_refs.len());
-        for (index, object) in fetch_indices.into_iter().zip(objects.into_iter()) {
+        for (index, object) in fetch_indices.into_iter().zip_debug_eq(objects.into_iter()) {
             input_results[index] = Some(ObjectReadResult {
                 input_object_kind: input_object_kinds[index],
                 object: ObjectReadResultKind::Object(object),
@@ -205,17 +206,20 @@ impl TransactionInputLoader {
 
         assert!(objects.len() == object_keys.len() && objects.len() == fetches.len());
 
-        for (object, key, (index, input)) in izip!(
+        for (object, key, (index, input)) in izip_debug_eq!(
             objects.into_iter(),
             object_keys.into_iter(),
             fetches.into_iter()
         ) {
             results[index] = Some(match (object, input) {
-                (Some(obj), InputObjectKind::SharedMoveObject { .. }) if obj.full_id() == input.full_object_id() => {
+                (Some(obj), InputObjectKind::SharedMoveObject { .. })
+                    if obj.full_id() == input.full_object_id() =>
+                {
                     ObjectReadResult {
-                    input_object_kind: *input,
-                    object: obj.into(),
-                }},
+                        input_object_kind: *input,
+                        object: obj.into(),
+                    }
+                }
                 (_, InputObjectKind::SharedMoveObject { .. }) => {
                     assert!(key.1.is_valid());
                     // If the full ID on a shared input doesn't match, check if the object
@@ -227,17 +231,24 @@ impl TransactionInputLoader {
                     ) {
                         ObjectReadResult {
                             input_object_kind: *input,
-                            object: ObjectReadResultKind::ObjectConsensusStreamEnded(version, dependency),
+                            object: ObjectReadResultKind::ObjectConsensusStreamEnded(
+                                version, dependency,
+                            ),
                         }
                     } else {
-                        panic!("All dependencies of tx {tx_key:?} should have been executed now, but Shared Object id: {:?}, version: {version} is absent in epoch {epoch_id}", input.full_object_id());
+                        panic!(
+                            "All dependencies of tx {tx_key:?} should have been executed now, but Shared Object id: {:?}, version: {version} is absent in epoch {epoch_id}",
+                            input.full_object_id()
+                        );
                     }
-                },
+                }
                 (Some(obj), input_object_kind) => ObjectReadResult {
                     input_object_kind: *input_object_kind,
                     object: obj.into(),
                 },
-                _ => panic!("All dependencies of tx {tx_key:?} should have been executed now, but obj {key:?} is absent"),
+                _ => panic!(
+                    "All dependencies of tx {tx_key:?} should have been executed now, but obj {key:?} is absent"
+                ),
             });
         }
 
@@ -246,6 +257,18 @@ impl TransactionInputLoader {
             .map(Option::unwrap)
             .collect::<Vec<_>>()
             .into())
+    }
+}
+
+impl SimulationInputLoader for TransactionInputLoader {
+    fn read_objects_for_simulation(
+        &self,
+        _transaction_digest: &TransactionDigest,
+        input_object_kinds: &[InputObjectKind],
+        receiving_object_refs: &[ObjectRef],
+        epoch_id: EpochId,
+    ) -> SuiResult<(InputObjects, ReceivingObjects)> {
+        self.read_objects_for_signing(None, input_object_kinds, receiving_object_refs, epoch_id)
     }
 }
 

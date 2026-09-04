@@ -1,11 +1,14 @@
 [package]
 name = "sui-verifier-latest"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Mysten Labs <eng@mystenlabs.com>"]
 description = "Move framework for Sui platform"
 license = "Apache-2.0"
 publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 move-binary-format.workspace = true
@@ -17,5 +20,6 @@ move-abstract-stack.workspace = true
 
 move-bytecode-verifier = { path = "../../../external-crates/move/crates/move-bytecode-verifier" }
 
+mysten-common.workspace = true
 sui-types.workspace = true
 sui-protocol-config.workspace = true

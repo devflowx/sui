@@ -95,13 +95,14 @@ title: Module `sui_system::validator`
 <pre><code><b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/u64.md#std_u64">std::u64</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -118,6 +119,7 @@ title: Module `sui_system::validator`
 <b>use</b> <a href="../sui/hex.md#sui_hex">sui::hex</a>;
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/sui.md#sui_sui">sui::sui</a>;
 <b>use</b> <a href="../sui/table.md#sui_table">sui::table</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
@@ -709,6 +711,16 @@ Validator trying to set gas price higher than threshold.
 
 
 
+<a name="sui_system_validator_EInvalidProtocolPubKeyLength"></a>
+
+Invalid protocol public key length.
+
+
+<pre><code><b>const</b> <a href="../sui_system/validator.md#sui_system_validator_EInvalidProtocolPubKeyLength">EInvalidProtocolPubKeyLength</a>: u64 = 16;
+</code></pre>
+
+
+
 <a name="sui_system_validator_MAX_COMMISSION_RATE"></a>
 
 
@@ -1171,7 +1183,7 @@ Need to present a <code>ValidatorOperationCap</code>.
     new_price: u64,
 ) {
     <b>assert</b>!(new_price &lt; <a href="../sui_system/validator.md#sui_system_validator_MAX_VALIDATOR_GAS_PRICE">MAX_VALIDATOR_GAS_PRICE</a>, <a href="../sui_system/validator.md#sui_system_validator_EGasPriceHigherThanThreshold">EGasPriceHigherThanThreshold</a>);
-    <b>let</b> validator_address = *verified_cap.verified_operation_cap_address();
+    <b>let</b> validator_address = verified_cap.verified_operation_cap_address();
     <b>assert</b>!(validator_address == self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_sui_address">sui_address</a>, <a href="../sui_system/validator.md#sui_system_validator_EInvalidCap">EInvalidCap</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_gas_price">next_epoch_gas_price</a> = new_price;
 }
@@ -1204,7 +1216,7 @@ Set new gas price for the candidate validator.
 ) {
     <b>assert</b>!(self.<a href="../sui_system/validator.md#sui_system_validator_is_preactive">is_preactive</a>(), <a href="../sui_system/validator.md#sui_system_validator_ENotValidatorCandidate">ENotValidatorCandidate</a>);
     <b>assert</b>!(new_price &lt; <a href="../sui_system/validator.md#sui_system_validator_MAX_VALIDATOR_GAS_PRICE">MAX_VALIDATOR_GAS_PRICE</a>, <a href="../sui_system/validator.md#sui_system_validator_EGasPriceHigherThanThreshold">EGasPriceHigherThanThreshold</a>);
-    <b>let</b> validator_address = *verified_cap.verified_operation_cap_address();
+    <b>let</b> validator_address = verified_cap.verified_operation_cap_address();
     <b>assert</b>!(validator_address == self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_sui_address">sui_address</a>, <a href="../sui_system/validator.md#sui_system_validator_EInvalidCap">EInvalidCap</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_gas_price">next_epoch_gas_price</a> = new_price;
     self.<a href="../sui_system/validator.md#sui_system_validator_gas_price">gas_price</a> = new_price;
@@ -1261,6 +1273,7 @@ Set new commission rate for the candidate validator.
     <b>assert</b>!(self.<a href="../sui_system/validator.md#sui_system_validator_is_preactive">is_preactive</a>(), <a href="../sui_system/validator.md#sui_system_validator_ENotValidatorCandidate">ENotValidatorCandidate</a>);
     <b>assert</b>!(new_commission_rate &lt;= <a href="../sui_system/validator.md#sui_system_validator_MAX_COMMISSION_RATE">MAX_COMMISSION_RATE</a>, <a href="../sui_system/validator.md#sui_system_validator_ECommissionRateTooHigh">ECommissionRateTooHigh</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_commission_rate">commission_rate</a> = new_commission_rate;
+    self.next_epoch_commission_rate = new_commission_rate;
 }
 </code></pre>
 
@@ -2211,6 +2224,8 @@ Set the voting power of this validator, called only from validator_set.
         || self.<a href="../sui_system/validator.md#sui_system_validator_name">name</a> == other.<a href="../sui_system/validator.md#sui_system_validator_name">name</a>
         || self.net_address == other.net_address
         || self.<a href="../sui_system/validator.md#sui_system_validator_p2p_address">p2p_address</a> == other.<a href="../sui_system/validator.md#sui_system_validator_p2p_address">p2p_address</a>
+        || self.<a href="../sui_system/validator.md#sui_system_validator_primary_address">primary_address</a> == other.<a href="../sui_system/validator.md#sui_system_validator_primary_address">primary_address</a>
+        || self.<a href="../sui_system/validator.md#sui_system_validator_worker_address">worker_address</a> == other.<a href="../sui_system/validator.md#sui_system_validator_worker_address">worker_address</a>
         || self.<a href="../sui_system/validator.md#sui_system_validator_protocol_pubkey_bytes">protocol_pubkey_bytes</a> == other.<a href="../sui_system/validator.md#sui_system_validator_protocol_pubkey_bytes">protocol_pubkey_bytes</a>
         || self.<a href="../sui_system/validator.md#sui_system_validator_network_pubkey_bytes">network_pubkey_bytes</a> == other.<a href="../sui_system/validator.md#sui_system_validator_network_pubkey_bytes">network_pubkey_bytes</a>
         || self.<a href="../sui_system/validator.md#sui_system_validator_network_pubkey_bytes">network_pubkey_bytes</a> == other.<a href="../sui_system/validator.md#sui_system_validator_worker_pubkey_bytes">worker_pubkey_bytes</a>
@@ -2219,6 +2234,8 @@ Set the voting power of this validator, called only from validator_set.
         // All next epoch parameters.
         || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.next_epoch_net_address, other.next_epoch_net_address)
         || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_p2p_address">next_epoch_p2p_address</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_p2p_address">next_epoch_p2p_address</a>)
+        || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_primary_address">next_epoch_primary_address</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_primary_address">next_epoch_primary_address</a>)
+        || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_worker_address">next_epoch_worker_address</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_worker_address">next_epoch_worker_address</a>)
         || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_protocol_pubkey_bytes">next_epoch_protocol_pubkey_bytes</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_protocol_pubkey_bytes">next_epoch_protocol_pubkey_bytes</a>)
         || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>)
         || <a href="../sui_system/validator.md#sui_system_validator_both_some_and_equal">both_some_and_equal</a>!(self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>, other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_worker_pubkey_bytes">next_epoch_worker_pubkey_bytes</a>)
@@ -2227,6 +2244,8 @@ Set the voting power of this validator, called only from validator_set.
         // My next epoch parameters with other current epoch parameters.
         || self.next_epoch_net_address.is_some_and!(|v| v == other.net_address)
         || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_p2p_address">next_epoch_p2p_address</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_p2p_address">p2p_address</a>)
+        || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_primary_address">next_epoch_primary_address</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_primary_address">primary_address</a>)
+        || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_worker_address">next_epoch_worker_address</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_worker_address">worker_address</a>)
         || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_protocol_pubkey_bytes">next_epoch_protocol_pubkey_bytes</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_protocol_pubkey_bytes">protocol_pubkey_bytes</a>)
         || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_network_pubkey_bytes">network_pubkey_bytes</a>)
         || self.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>.is_some_and!(|v| v == other.<a href="../sui_system/validator.md#sui_system_validator_worker_pubkey_bytes">worker_pubkey_bytes</a>)
@@ -2235,6 +2254,8 @@ Set the voting power of this validator, called only from validator_set.
         // Other next epoch parameters with my current epoch parameters.
         || other.next_epoch_net_address.is_some_and!(|v| v == self.net_address)
         || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_p2p_address">next_epoch_p2p_address</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_p2p_address">p2p_address</a>)
+        || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_primary_address">next_epoch_primary_address</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_primary_address">primary_address</a>)
+        || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_worker_address">next_epoch_worker_address</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_worker_address">worker_address</a>)
         || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_protocol_pubkey_bytes">next_epoch_protocol_pubkey_bytes</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_protocol_pubkey_bytes">protocol_pubkey_bytes</a>)
         || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_network_pubkey_bytes">network_pubkey_bytes</a>)
         || other.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_network_pubkey_bytes">next_epoch_network_pubkey_bytes</a>.is_some_and!(|v| v == self.<a href="../sui_system/validator.md#sui_system_validator_worker_pubkey_bytes">worker_pubkey_bytes</a>)
@@ -2708,6 +2729,7 @@ Update protocol public key of this validator, taking effects from next epoch
     protocol_pubkey: vector&lt;u8&gt;,
     <a href="../sui_system/validator.md#sui_system_validator_proof_of_possession">proof_of_possession</a>: vector&lt;u8&gt;,
 ) {
+    <b>assert</b>!(protocol_pubkey.length() == 96, <a href="../sui_system/validator.md#sui_system_validator_EInvalidProtocolPubKeyLength">EInvalidProtocolPubKeyLength</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_protocol_pubkey_bytes">next_epoch_protocol_pubkey_bytes</a> = option::some(protocol_pubkey);
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_next_epoch_proof_of_possession">next_epoch_proof_of_possession</a> = option::some(<a href="../sui_system/validator.md#sui_system_validator_proof_of_possession">proof_of_possession</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.validate();
@@ -2740,6 +2762,7 @@ Update protocol public key of this candidate validator
     <a href="../sui_system/validator.md#sui_system_validator_proof_of_possession">proof_of_possession</a>: vector&lt;u8&gt;,
 ) {
     <b>assert</b>!(self.<a href="../sui_system/validator.md#sui_system_validator_is_preactive">is_preactive</a>(), <a href="../sui_system/validator.md#sui_system_validator_ENotValidatorCandidate">ENotValidatorCandidate</a>);
+    <b>assert</b>!(protocol_pubkey.length() == 96, <a href="../sui_system/validator.md#sui_system_validator_EInvalidProtocolPubKeyLength">EInvalidProtocolPubKeyLength</a>);
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_protocol_pubkey_bytes">protocol_pubkey_bytes</a> = protocol_pubkey;
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.<a href="../sui_system/validator.md#sui_system_validator_proof_of_possession">proof_of_possession</a> = <a href="../sui_system/validator.md#sui_system_validator_proof_of_possession">proof_of_possession</a>;
     self.<a href="../sui_system/validator.md#sui_system_validator_metadata">metadata</a>.validate();
@@ -2872,7 +2895,7 @@ Update Narwhal worker public key of this candidate validator
 
 ## Function `effectuate_staged_metadata`
 
-Effectutate all staged next epoch metadata for this validator.
+Effectuate all staged next epoch metadata for this validator.
 NOTE: this function SHOULD ONLY be called by validator_set when
 advancing an epoch.
 

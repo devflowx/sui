@@ -3,8 +3,8 @@
 
 use moka::ops::compute::Op;
 use moka::sync::Cache;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use sui_types::base_types::ObjectID;
 use sui_types::effects::{InputConsensusObject, TransactionEffects, TransactionEffectsAPI};
 use sui_types::execution_status::CongestedObjects;
@@ -94,7 +94,7 @@ impl CongestionTracker {
                 cleared_events.push((
                     gas_price,
                     effect
-                        .input_consensus_objects()
+                        .accessed_consensus_objects()
                         .into_iter()
                         .filter_map(|object| match object {
                             InputConsensusObject::Mutate((id, _, _)) => Some(id),
@@ -122,7 +122,7 @@ impl CongestionTracker {
             transaction
                 .shared_input_objects()
                 .into_iter()
-                .filter(|id| id.mutable)
+                .filter(|id| id.is_accessed_exclusively())
                 .map(|id| id.id),
         )
     }

@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use sui_rpc::proto::sui::rpc::v2::move_package_service_client::MovePackageServiceClient;
 use sui_rpc::proto::sui::rpc::v2::GetDatatypeRequest;
+use sui_rpc::proto::sui::rpc::v2::move_package_service_client::MovePackageServiceClient;
 use test_cluster::TestClusterBuilder;
 
 use crate::v2::move_package_service::system_package_expectations::validate_validator_operation_cap_datatype;
@@ -11,7 +11,10 @@ use sui_macros::sim_test;
 
 #[sim_test]
 async fn test_get_struct_datatype() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -30,7 +33,10 @@ async fn test_get_struct_datatype() {
 
 #[sim_test]
 async fn test_get_datatype_not_found() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -44,14 +50,19 @@ async fn test_get_datatype_not_found() {
 
     let error = service.get_datatype(request).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::Internal);
-    assert!(error
-        .message()
-        .contains("Datatype 'NonExistentType' not found"));
+    assert!(
+        error
+            .message()
+            .contains("Datatype 'NonExistentType' not found")
+    );
 }
 
 #[sim_test]
 async fn test_get_datatype_invalid_package() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -70,7 +81,10 @@ async fn test_get_datatype_invalid_package() {
 
 #[sim_test]
 async fn test_get_datatype_module_not_found() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -89,7 +103,10 @@ async fn test_get_datatype_module_not_found() {
 
 #[sim_test]
 async fn test_get_datatype_missing_package_id() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -107,7 +124,10 @@ async fn test_get_datatype_missing_package_id() {
 
 #[sim_test]
 async fn test_get_datatype_missing_module_name() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
@@ -125,7 +145,10 @@ async fn test_get_datatype_missing_module_name() {
 
 #[sim_test]
 async fn test_get_datatype_missing_name() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await

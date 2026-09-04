@@ -5,7 +5,7 @@ use move_core_types::account_address::AccountAddress;
 use move_symbol_pool::Symbol;
 
 use crate::{
-    diagnostics::codes::{DiagnosticInfo, Severity, custom},
+    diagnostics::codes::{DiagnosticInfo, DiagnosticOrigin, Severity, custom},
     shared::stdlib_definitions,
 };
 
@@ -31,6 +31,8 @@ pub const UTF_MODULE_NAME: Symbol = symbol!("string");
 pub const UTF_TYPE_NAME: Symbol = symbol!("String");
 pub const ASCII_MODULE_NAME: Symbol = symbol!("ascii");
 pub const ASCII_TYPE_NAME: Symbol = symbol!("String");
+pub const INTERNAL_MODULE_NAME: Symbol = symbol!("internal");
+pub const INTERNAL_PERMIT_FUNCTION_NAME: Symbol = symbol!("permit");
 
 pub const SUI_ADDR_NAME: Symbol = symbol!("sui");
 pub const OBJECT_MODULE_NAME: Symbol = symbol!("object");
@@ -75,7 +77,15 @@ pub const EVENT_AUTHENTICATED_FUNCTION_NAME: Symbol = symbol!("emit_authenticate
 
 pub const COIN_REGISTRY_MODULE_NAME: Symbol = symbol!("coin_registry");
 pub const DYNAMIC_COIN_CREATION_FUNCTION_NAME: Symbol = symbol!("new_currency");
-pub const COIN_REGISTRY_CREATE: Symbol = symbol!("create");
+pub const REGISTRY_CREATE_FUNCTION_NAME: Symbol = symbol!("create");
+
+pub const DISPLAY_REGISTRY_MODULE_NAME: Symbol = symbol!("display_registry");
+
+pub const ADDRESS_ALIAS_MODULE_NAME: Symbol = symbol!("address_alias");
+pub const ADDRESS_ALIAS_CREATE: Symbol = symbol!("create");
+
+pub const FORWARDING_ADDRESS_MODULE_NAME: Symbol = symbol!("forwarding_address");
+pub const FORWARDING_ADDRESS_CREATE: Symbol = symbol!("create");
 
 pub const TRANSFER_MODULE_NAME: Symbol = symbol!("transfer");
 pub const TRANSFER_FUNCTION_NAME: Symbol = symbol!("transfer");
@@ -97,82 +107,82 @@ pub const PRIVATE_TRANSFER_FUNCTIONS: &[Symbol] = &[
 // Diagnostics
 //**************************************************************************************************
 
-pub const SUI_DIAG_PREFIX: &str = "Sui ";
+pub const SUI_DIAG_ORIGIN: DiagnosticOrigin = DiagnosticOrigin::SuiCompiler;
 
 // Categories
 pub const ID_LEAK_CATEGORY: u8 = 1;
 pub const TYPING: u8 = 2;
 
 pub const ID_LEAK_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ ID_LEAK_CATEGORY,
     /* code */ 1,
     "invalid object construction",
 );
 
-pub const ENTRY_FUN_SIGNATURE_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
-    Severity::NonblockingError,
-    /* category */ TYPING,
-    /* code */ 2,
-    "invalid 'entry' function signature",
-);
 pub const INIT_FUN_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 3,
     "invalid 'init' function",
 );
 pub const OTW_DECL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 4,
     "invalid one-time witness declaration",
 );
 pub const OTW_USAGE_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 5,
     "invalid one-time witness usage",
 );
 pub const INIT_CALL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 6,
     "invalid 'init' call",
 );
 pub const OBJECT_DECL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 7,
     "invalid object declaration",
 );
 pub const EVENT_EMIT_CALL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 8,
     "invalid event",
 );
 pub const PRIVATE_TRANSFER_CALL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 9,
     "invalid private transfer call",
 );
 pub const DYNAMIC_COIN_CREATION_CALL_DIAG: DiagnosticInfo = custom(
-    SUI_DIAG_PREFIX,
+    SUI_DIAG_ORIGIN,
     Severity::NonblockingError,
     /* category */ TYPING,
     /* code */ 10,
     "invalid coin creation call",
+);
+pub const INTERNAL_PERMIT_CALL_DIAG: DiagnosticInfo = custom(
+    SUI_DIAG_ORIGIN,
+    Severity::NonblockingError,
+    /* category */ TYPING,
+    /* code */ 11,
+    "invalid internal permit call",
 );
 
 // Bridge supported asset

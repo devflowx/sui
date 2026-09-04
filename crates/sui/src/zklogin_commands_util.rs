@@ -9,8 +9,8 @@ use fastcrypto::traits::{EncodeDecodeBase64, KeyPair};
 use fastcrypto_zkp::bn254::utils::get_proof;
 use fastcrypto_zkp::bn254::utils::{gen_address_seed, get_salt};
 use fastcrypto_zkp::bn254::zk_login::ZkLoginInputs;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use regex::Regex;
 use reqwest::Client;
 use serde_json::json;
@@ -19,12 +19,11 @@ use std::io;
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
-use sui_json_rpc_types::SuiTransactionBlockResponseOptions;
 use sui_keys::keystore::{AccountKeystore, Keystore};
-use sui_sdk::SuiClientBuilder;
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{PublicKey, SuiKeyPair};
+use sui_types::gas_coin::GasCoin;
 use sui_types::multisig::{MultiSig, MultiSigPublicKey};
 use sui_types::signature::GenericSignature;
 use sui_types::transaction::Transaction;
@@ -38,10 +37,10 @@ pub fn read_cli_line() -> Result<String, anyhow::Error> {
     let full_url = s.trim_end().to_string();
     let mut parsed_token = "";
     let re = Regex::new(r"id_token=([^&]+)").unwrap();
-    if let Some(captures) = re.captures(&full_url) {
-        if let Some(id_token) = captures.get(1) {
-            parsed_token = id_token.as_str();
-        }
+    if let Some(captures) = re.captures(&full_url)
+        && let Some(id_token) = captures.get(1)
+    {
+        parsed_token = id_token.as_str();
     }
     Ok(parsed_token.to_string())
 }
@@ -120,22 +119,21 @@ pub async fn perform_zk_login_test_tx(
     println!("Sender: {:?}", sender);
 
     // Request some coin from faucet and build a test transaction.
-    let sui = SuiClientBuilder::default().build(fullnode_url).await?;
+    let mut sui = sui_rpc_api::Client::new(fullnode_url)?;
     request_tokens_from_faucet(sender, gas_url).await?; // transfer coin
     request_tokens_from_faucet(sender, gas_url).await?; // gas coin
     sleep(Duration::from_secs(10));
 
     let response = sui
-        .coin_read_api()
-        .get_coins(sender, None, None, Some(2))
+        .get_owned_objects(sender, Some(GasCoin::type_()), None, None)
         .await?;
 
-    if response.data.len() != 2 {
+    if response.items.len() != 2 {
         panic!("Faucet did not work correctly and the provided Sui address has no coins")
     }
 
-    let transfer_coin = response.data[0].coin_object_id;
-    let gas_coin = response.data[1].coin_object_id;
+    let transfer_coin = response.items[0].id();
+    let gas_coin = response.items[1].id();
 
     let txb_res = sui
         .transaction_builder()
@@ -206,14 +204,12 @@ pub async fn perform_zk_login_test_tx(
         single_sig
     };
     let transaction_response = sui
-        .quorum_driver_api()
-        .execute_transaction_block(
-            Transaction::from_generic_sig_data(txb_res, vec![final_sig]),
-            SuiTransactionBlockResponseOptions::full_content(),
-            None,
-        )
+        .execute_transaction(&Transaction::from_generic_sig_data(
+            txb_res,
+            vec![final_sig],
+        ))
         .await?;
-    Ok(transaction_response.digest.base58_encode())
+    Ok(transaction_response.transaction.digest().base58_encode())
 }
 
 fn get_config(network: &str) -> (&str, &str) {

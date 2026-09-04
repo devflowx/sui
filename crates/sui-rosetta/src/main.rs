@@ -7,22 +7,26 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::str::FromStr;
 
 use anyhow::anyhow;
 use clap::Parser;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::traits::EncodeDecodeBase64;
-use serde_json::{json, Value};
-use sui_config::{sui_config_dir, Config, NodeConfig, SUI_FULLNODE_CONFIG, SUI_KEYSTORE_FILENAME};
-use sui_node::SuiNode;
+use serde_json::{Value, json};
+use sui_config::{SUI_KEYSTORE_FILENAME, sui_config_dir};
 use sui_rosetta::types::{CurveType, PrefundedAccount, SuiEnv};
 use sui_rosetta::{RosettaOfflineServer, RosettaOnlineServer, SUI};
-use sui_sdk::{SuiClient, SuiClientBuilder};
+use sui_rpc::client::Client as GrpcClient;
+use sui_rpc::client::HeadersInterceptor;
+use sui_rpc::proto::sui::rpc::v2::GetServiceInfoRequest;
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::{KeypairTraits, SuiKeyPair, ToFromBytes};
+use sui_types::digests::{ChainIdentifier, CheckpointDigest};
+use tonic::metadata::Ascii;
+use tonic::metadata::MetadataKey;
+use tonic::metadata::MetadataValue;
 use tracing::info;
-use tracing::log::warn;
 
 #[derive(Parser)]
 #[clap(name = "sui-rosetta", rename_all = "kebab-case", author, version)]
@@ -46,16 +50,10 @@ pub enum RosettaServerCommand {
         full_node_url: String,
         #[clap(long, default_value = "/data")]
         data_path: PathBuf,
-    },
-    StartOnlineServer {
-        #[clap(long, default_value = "localnet")]
-        env: SuiEnv,
-        #[clap(long, default_value = "0.0.0.0:9002")]
-        addr: SocketAddr,
-        #[clap(long)]
-        node_config: Option<PathBuf>,
-        #[clap(long, default_value = "/data")]
-        data_path: PathBuf,
+        /// Additional gRPC header to send on every request to the full node as
+        /// `<name>:<value>`. May be provided multiple times.
+        #[clap(long = "sui-grpc-header", value_parser = parse_grpc_header)]
+        grpc_headers: Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>,
     },
     StartOfflineServer {
         #[clap(long, default_value = "localnet")]
@@ -136,47 +134,25 @@ impl RosettaServerCommand {
                 addr,
                 full_node_url,
                 data_path,
+                grpc_headers,
             } => {
                 info!(
                     "Starting Rosetta Online Server with remote Sui full node [{full_node_url}]."
                 );
-                let sui_client = wait_for_sui_client(full_node_url).await;
                 let rosetta_path = data_path.join("rosetta_db");
                 info!("Rosetta db path : {rosetta_path:?}");
-                let rosetta = RosettaOnlineServer::new(env, sui_client);
-                rosetta.serve(addr).await;
-            }
-
-            RosettaServerCommand::StartOnlineServer {
-                env,
-                addr,
-                node_config,
-                data_path,
-            } => {
-                info!("Starting Rosetta Online Server with embedded Sui full node.");
-                info!("Data directory path: {data_path:?}");
-
-                let node_config = node_config.unwrap_or_else(|| {
-                    let path = sui_config_dir().unwrap().join(SUI_FULLNODE_CONFIG);
-                    info!("Using default node config from {path:?}");
-                    path
-                });
-
-                let mut config = NodeConfig::load(&node_config)?;
-                config.db_path = data_path.join("sui_db");
-                info!("Overriding Sui db path to : {:?}", config.db_path);
-
-                let registry_service =
-                    mysten_metrics::start_prometheus_server(config.metrics_address);
-                // Staring a full node for the rosetta server.
-                let rpc_address = format!("http://127.0.0.1:{}", config.json_rpc_address.port());
-                let _node = SuiNode::start(config, registry_service).await?;
-
-                let sui_client = wait_for_sui_client(rpc_address).await;
-
-                let rosetta_path = data_path.join("rosetta_db");
-                info!("Rosetta db path : {rosetta_path:?}");
-                let rosetta = RosettaOnlineServer::new(env, sui_client);
+                let mut client = GrpcClient::new(&full_node_url)
+                    .map_err(|e| anyhow::anyhow!("Failed to create gRPC client: {}", e))?
+                    .with_max_decoding_message_size(128 * 1024 * 1024);
+                if !grpc_headers.is_empty() {
+                    let mut headers = HeadersInterceptor::new();
+                    for (name, value) in grpc_headers {
+                        headers.headers_mut().insert(name, value);
+                    }
+                    client = client.with_headers(headers);
+                }
+                let chain_id = fetch_chain_id(&mut client).await?;
+                let rosetta = RosettaOnlineServer::new(env, client, chain_id);
                 rosetta.serve(addr).await;
             }
         };
@@ -184,16 +160,28 @@ impl RosettaServerCommand {
     }
 }
 
-async fn wait_for_sui_client(rpc_address: String) -> SuiClient {
-    loop {
-        match SuiClientBuilder::default().build(&rpc_address).await {
-            Ok(client) => return client,
-            Err(e) => {
-                warn!("Error connecting to Sui RPC server [{rpc_address}]: {e}, retrying in 5 seconds.");
-                tokio::time::sleep(Duration::from_millis(5000)).await;
-            }
-        }
-    }
+async fn fetch_chain_id(client: &mut GrpcClient) -> Result<ChainIdentifier, anyhow::Error> {
+    let response = client
+        .ledger_client()
+        .get_service_info(GetServiceInfoRequest::default())
+        .await?
+        .into_inner();
+    let digest = CheckpointDigest::from_str(response.chain_id())?;
+    Ok(ChainIdentifier::from(digest))
+}
+
+fn parse_grpc_header(header: &str) -> Result<(MetadataKey<Ascii>, MetadataValue<Ascii>), String> {
+    let (name, value) = header
+        .split_once(':')
+        .ok_or_else(|| "gRPC header must be in `<name>:<value>` format".to_string())?;
+
+    let name = MetadataKey::from_bytes(name.as_bytes())
+        .map_err(|err| format!("invalid gRPC header name `{name}`: {err}"))?;
+    let mut value = MetadataValue::try_from(value)
+        .map_err(|err| format!("invalid gRPC header value for `{name}`: {err}"))?;
+    // Header values are likely auth tokens; keep them out of logs/debug output.
+    value.set_sensitive(true);
+    Ok((name, value))
 }
 
 /// This method reads the keypairs from the Sui keystore to create the PrefundedAccount objects,
@@ -285,6 +273,23 @@ async fn test_read_keystore() {
     let schema2: SignatureScheme = acc2.curve_type.into();
     assert!(matches!(schema1, SignatureScheme::ED25519));
     assert!(matches!(schema2, SignatureScheme::Secp256k1));
+}
+
+#[test]
+fn test_parse_grpc_header() {
+    let (name, value) = parse_grpc_header("x-token:secret").unwrap();
+    assert_eq!(name.as_str(), "x-token");
+    assert_eq!(value.to_str().unwrap(), "secret");
+    assert!(value.is_sensitive());
+
+    // Values may legitimately contain `:` (only the first delimiter splits).
+    let (name, value) = parse_grpc_header("authorization:Bearer a:b:c").unwrap();
+    assert_eq!(name.as_str(), "authorization");
+    assert_eq!(value.to_str().unwrap(), "Bearer a:b:c");
+
+    assert!(parse_grpc_header("no-delimiter").is_err());
+    assert!(parse_grpc_header("bad name:value").is_err());
+    assert!(parse_grpc_header("name:invalid\nvalue").is_err());
 }
 
 #[tokio::main]

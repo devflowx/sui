@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::reader::StateReader;
 use crate::ErrorReason;
 use crate::Result;
 use crate::RpcError;
@@ -9,29 +8,37 @@ use crate::RpcService;
 use itertools::Itertools;
 use sui_protocol_config::ProtocolConfig;
 use sui_rpc::field::FieldMaskTree;
+use sui_rpc::field::FieldMaskUtil;
 use sui_rpc::merge::Merge;
 use sui_rpc::proto::google::rpc::bad_request::FieldViolation;
 use sui_rpc::proto::sui::rpc::v2::Bcs;
 use sui_rpc::proto::sui::rpc::v2::CommandOutput;
 use sui_rpc::proto::sui::rpc::v2::CommandResult;
 use sui_rpc::proto::sui::rpc::v2::ExecutedTransaction;
-use sui_rpc::proto::sui::rpc::v2::Object;
 use sui_rpc::proto::sui::rpc::v2::ObjectSet;
 use sui_rpc::proto::sui::rpc::v2::SimulateTransactionRequest;
 use sui_rpc::proto::sui::rpc::v2::SimulateTransactionResponse;
 use sui_rpc::proto::sui::rpc::v2::Transaction;
-use sui_rpc::proto::sui::rpc::v2::TransactionEffects;
-use sui_rpc::proto::sui::rpc::v2::TransactionEvents;
 use sui_types::balance_change::derive_balance_changes_2;
-use sui_types::base_types::ObjectID;
-use sui_types::base_types::ObjectRef;
-use sui_types::base_types::SuiAddress;
 use sui_types::effects::TransactionEffectsAPI;
+use sui_types::error::SuiError;
+use sui_types::error::SuiErrorKind;
+use sui_types::execution_status::ExecutionFailure;
+use sui_types::execution_status::ExecutionStatus;
+use sui_types::transaction::AllowedProposers;
+use sui_types::transaction::InputObjectKind;
+use sui_types::transaction::InputObjects;
+use sui_types::transaction::MAX_UNPAID_ALLOWED_PROPOSERS;
+use sui_types::transaction::ObjectReadResult;
 use sui_types::transaction::TransactionDataAPI;
+use sui_types::transaction::TransactionExpiration;
+use sui_types::transaction::TransactionKind;
 use sui_types::transaction_executor::SimulateTransactionResult;
 use sui_types::transaction_executor::TransactionChecks;
 
 mod resolve;
+
+const GAS_COIN_SIZE_BYTES: u64 = 40;
 
 pub fn simulate_transaction(
     service: &RpcService,
@@ -42,11 +49,19 @@ pub fn simulate_transaction(
         .as_ref()
         .ok_or_else(|| RpcError::new(tonic::Code::Unimplemented, "no transaction executor"))?;
 
-    let read_mask = request
-        .read_mask
-        .as_ref()
-        .map(FieldMaskTree::from_field_mask)
-        .unwrap_or_else(FieldMaskTree::new_wildcard);
+    let read_mask = match request.read_mask.as_ref() {
+        Some(read_mask) => {
+            read_mask
+                .validate::<SimulateTransactionResponse>()
+                .map_err(|path| {
+                    FieldViolation::new("read_mask")
+                        .with_description(format!("invalid read_mask path: {path}"))
+                        .with_reason(ErrorReason::FieldInvalid)
+                })?;
+            FieldMaskTree::from_field_mask(read_mask)
+        }
+        None => FieldMaskTree::new_wildcard(),
+    };
 
     let transaction_proto = request
         .transaction
@@ -84,7 +99,7 @@ pub fn simulate_transaction(
             return Err(FieldViolation::new("transaction")
                 .with_description(format!("invalid transaction: {e}"))
                 .with_reason(ErrorReason::FieldInvalid)
-                .into())
+                .into());
         }
 
         // We weren't able to parse out a fully-formed transaction so we'll attempt to perform
@@ -97,161 +112,167 @@ pub fn simulate_transaction(
         )?,
     };
 
-    // Perform budgest estimation and gas selection if requested and if TransactionChecks are enabled (it
-    // makes no sense to do gas selection if checks are disabled because such a transaction can't
-    // ever be committed to the chain).
-    if request.do_gas_selection() && checks.enabled() {
-        // At this point, the budget on the transaction can be set to one of the following:
-        // - The budget from the request, if specified.
-        // - The total balance of all of the gas payment coins (clamped to the protocol
-        //   MAX_GAS_BUDGET) in the request if the budget was not
-        //   specified but the gas payment coins were specified.
-        // - Protocol MAX_GAS_BUDGET if the request did not specified neither gas payment or budget.
-        //
-        // If the request did not specify a budget, then simulate the transaction to get a budget estimate and
-        // overwrite the resolved budget with the more accurate estimate.
-        if request.transaction().gas_payment().budget.is_none()
-            && request.transaction().bcs_opt().is_none()
-        {
-            let simulation_result = executor
-                .simulate_transaction(transaction.clone(), TransactionChecks::Enabled)
-                .map_err(anyhow::Error::from)?;
+    let perform_gas_selection = request.do_gas_selection() && checks.enabled();
+    let simulation_result = 'simulate: {
+        // BCS transactions that are already in gasless shape (price=0, no payment) are simulated
+        // as-is — the caller pre-built the transaction, so gas selection is not needed and the
+        // priced flow must be skipped (it would fail with GasPriceUnderRGP for price=0).
+        let skip_gas_selection_for_bcs_gasless = perform_gas_selection
+            && request.transaction().bcs_opt().is_some()
+            && transaction.is_gasless_transaction();
 
-            let estimate = estimate_gas_budget_from_gas_cost(
-                simulation_result.effects.gas_cost_summary(),
-                reference_gas_price,
-            );
+        if perform_gas_selection && !skip_gas_selection_for_bcs_gasless {
+            // If the caller didn't set a non-zero price and the tx passes the cheap structural +
+            // object-input gasless checks, try a gasless simulate first. Post-execution gasless
+            // requirements (all input Coins consumed, minimum transfer amounts) can only be
+            // verified by running the tx. If that fails, we discard the gasless variant and
+            // fall through to the priced flow. `payment` is already empty here, verified by
+            // is_gasless_candidate.
+            if is_gasless_candidate(&request, &transaction, &protocol_config, service)? {
+                let mut gasless_tx = transaction.clone();
+                gasless_tx.gas_data_mut().price = 0;
+                gasless_tx.gas_data_mut().budget = 0;
+                // All gasless txns must carry an epoch-scoped validity window for replay
+                // protection.
+                configure_transaction_validity(service, &protocol_config, &mut gasless_tx)?;
 
-            // If the request specified gas payment, then transaction.gas_data().budget should have been
-            // resolved to the cumulative balance of those coins. We don't want to return a resolved transaction
-            // where the gas payment can't satisfy the budget, so validate that balance can actually cover the
-            // estimated budget.
-            let gas_balance = transaction.gas_data().budget;
-            if gas_balance < estimate {
-                return Err(RpcError::new(
-                    tonic::Code::InvalidArgument,
-                    format!("Insufficient gas balance to cover estimated transaction cost. \
-                        Available gas balance: {gas_balance} MIST. Estimated gas budget required: {estimate} MIST"),
-                ));
+                let simulation_result = executor
+                    .simulate_transaction(gasless_tx.clone(), checks, false)
+                    .map_err(simulation_error_to_rpc_error)?;
+
+                if !is_gasless_post_execution_failure(simulation_result.effects.status()) {
+                    transaction = gasless_tx;
+                    break 'simulate simulation_result;
+                }
             }
-            transaction.gas_data_mut().budget = estimate;
+
+            // Priced-flow budget estimation and gas selection.
+            // At this point, the budget on the transaction can be set to one of the following:
+            // - The budget from the request, if specified.
+            // - The total balance of all of the gas payment coins (clamped to the protocol
+            //   MAX_GAS_BUDGET) in the request if the budget was not
+            //   specified but the gas payment coins were specified.
+            // - Protocol MAX_GAS_BUDGET if the request did not specified neither gas payment or budget.
+            //
+            // If the request did not specify a budget, then simulate the transaction to get a budget estimate and
+            // overwrite the resolved budget with the more accurate estimate.
+            // When the request didn't specify a budget, the budget computed below covers
+            // computation + storage + safe-overhead, with the synthetic gas coin's storage
+            // cost subtracted (it doesn't exist at execution time). The cost of loading
+            // any additional payment objects is added either in `estimate_gas_budget_from_gas_cost`
+            // (when payment was specified) or incrementally inside `select_gas` (when gas
+            // selection picks the coins).
+            let budget_was_estimated = request.transaction().gas_payment().budget.is_none()
+                && request.transaction().bcs_opt().is_none();
+            if budget_was_estimated {
+                let mut estimation_transaction = transaction.clone();
+                estimation_transaction.gas_data_mut().payment = Vec::new();
+                estimation_transaction.gas_data_mut().budget = protocol_config.max_tx_gas();
+
+                let simulation_result = executor
+                    .simulate_transaction(
+                        estimation_transaction,
+                        TransactionChecks::Enabled,
+                        true, /* allow mock gas coin */
+                    )
+                    .map_err(simulation_error_to_rpc_error)?;
+
+                let estimate = estimate_gas_budget_from_gas_cost(
+                    simulation_result.effects.gas_cost_summary(),
+                    reference_gas_price,
+                    request.transaction().gas_payment().objects.len(),
+                    mock_gas_storage_cost(&simulation_result),
+                    &protocol_config,
+                );
+
+                // If the request specified gas payment, then transaction.gas_data().budget should have been
+                // resolved to the cumulative balance of those coins. We don't want to return a resolved transaction
+                // where the gas payment can't satisfy the budget, so validate that balance can actually cover the
+                // estimated budget.
+                let gas_balance = transaction.gas_data().budget;
+                if gas_balance < estimate {
+                    return Err(RpcError::new(
+                        tonic::Code::InvalidArgument,
+                        format!(
+                            "Insufficient gas balance to cover estimated transaction cost. \
+                            Available gas balance: {gas_balance} MIST. Estimated gas budget required: {estimate} MIST"
+                        ),
+                    ));
+                }
+                transaction.gas_data_mut().budget = estimate;
+            }
+
+            if transaction.gas_data().payment.is_empty() {
+                select_gas(
+                    service,
+                    &mut transaction,
+                    // Only adjust the budget for actually-selected coins when we just
+                    // computed the budget from estimation. A caller-supplied budget is
+                    // taken as-is.
+                    budget_was_estimated.then_some(reference_gas_price),
+                    &protocol_config,
+                )?;
+            }
+
+            // Coin-paid transactions get a proposer restriction too, so that nobody else can
+            // amplify them into consensus. A no-op on the address-balance paths, which already
+            // set their expiration above.
+            restrict_transaction_proposers(service, &protocol_config, &mut transaction)?;
         }
 
-        if transaction.gas_data().payment.is_empty() {
-            let input_objects = transaction
-                .input_objects()
-                .map_err(anyhow::Error::from)?
-                .iter()
-                .flat_map(|obj| match obj {
-                    sui_types::transaction::InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => {
-                        Some(*id)
-                    }
-                    _ => None,
-                })
-                .collect_vec();
-            let gas_coins = select_gas(
-                &service.reader,
-                transaction.gas_data().owner,
-                transaction.gas_data().budget,
-                protocol_config.max_gas_payment_objects(),
-                &input_objects,
-            )?;
-            transaction.gas_data_mut().payment = gas_coins;
-        }
-    }
+        executor
+            .simulate_transaction(transaction.clone(), checks, !perform_gas_selection)
+            .map_err(simulation_error_to_rpc_error)?
+    };
 
     let SimulateTransactionResult {
         effects,
         events,
         objects,
         execution_result,
-        mock_gas_id: _,
+        mock_gas_id,
         unchanged_loaded_runtime_objects,
-    } = executor
-        .simulate_transaction(transaction.clone(), checks)
-        .map_err(anyhow::Error::from)?;
+        suggested_gas_price,
+    } = simulation_result;
+
+    if perform_gas_selection && mock_gas_id.is_some() {
+        // If we don't allow for using a mock coin, but we still did, return a server error
+        return Err(RpcError::new(
+            tonic::Code::Internal,
+            "unexpected mock gas coin used",
+        ));
+    }
 
     let transaction = if let Some(submask) = read_mask.subtree("transaction") {
         let mut message = ExecutedTransaction::default();
         let transaction = sui_sdk_types::Transaction::try_from(transaction)?;
 
-        message.balance_changes = read_mask
-            .contains(ExecutedTransaction::BALANCE_CHANGES_FIELD.name)
-            .then(|| {
+        message.balance_changes =
+            if submask.contains(ExecutedTransaction::BALANCE_CHANGES_FIELD.name) {
                 derive_balance_changes_2(&effects, &objects)
                     .into_iter()
                     .map(Into::into)
                     .collect()
-            })
-            .unwrap_or_default();
+            } else {
+                vec![]
+            };
 
-        message.effects = {
-            let effects = sui_sdk_types::TransactionEffects::try_from(effects)?;
-            submask
-                .subtree(ExecutedTransaction::EFFECTS_FIELD)
-                .map(|mask| {
-                    let mut effects = TransactionEffects::merge_from(&effects, &mask);
-
-                    if submask.contains(TransactionEffects::UNCHANGED_LOADED_RUNTIME_OBJECTS_FIELD)
-                    {
-                        effects.unchanged_loaded_runtime_objects = unchanged_loaded_runtime_objects
-                            .iter()
-                            .map(Into::into)
-                            .collect();
-                    }
-
-                    if mask.contains(TransactionEffects::CHANGED_OBJECTS_FIELD.name) {
-                        for changed_object in effects.changed_objects.iter_mut() {
-                            let Ok(object_id) = changed_object.object_id().parse::<ObjectID>()
-                            else {
-                                continue;
-                            };
-
-                            if let Some(object) = objects.iter().find(|o| o.id() == object_id) {
-                                changed_object.object_type = Some(match object.struct_tag() {
-                                    Some(struct_tag) => struct_tag.to_canonical_string(true),
-                                    None => "package".to_owned(),
-                                });
-                            }
-                        }
-                    }
-
-                    if mask.contains(TransactionEffects::UNCHANGED_CONSENSUS_OBJECTS_FIELD.name) {
-                        for unchanged_consensus_object in
-                            effects.unchanged_consensus_objects.iter_mut()
-                        {
-                            let Ok(object_id) =
-                                unchanged_consensus_object.object_id().parse::<ObjectID>()
-                            else {
-                                continue;
-                            };
-
-                            if let Some(object) = objects.iter().find(|o| o.id() == object_id) {
-                                unchanged_consensus_object.object_type =
-                                    Some(match object.struct_tag() {
-                                        Some(struct_tag) => struct_tag.to_canonical_string(true),
-                                        None => "package".to_owned(),
-                                    });
-                            }
-                        }
-                    }
-
-                    // Try to render clever error info
-                    super::super::ledger_service::render_clever_error(service, &mut effects);
-
-                    effects
-                })
-        };
+        message.effects = submask
+            .subtree(ExecutedTransaction::EFFECTS_FIELD)
+            .map(|mask| {
+                service.render_effects_to_proto(
+                    &effects,
+                    &unchanged_loaded_runtime_objects,
+                    &objects,
+                    &mask,
+                )
+            });
 
         message.events = submask
             .subtree(ExecutedTransaction::EVENTS_FIELD.name)
             .and_then(|mask| {
-                events.map(|events| {
-                    sui_sdk_types::TransactionEvents::try_from(events)
-                        .map(|events| TransactionEvents::merge_from(events, &mask))
-                })
-            })
-            .transpose()?;
+                events.map(|events| service.render_events_to_proto(&events, &mask, &objects))
+            });
 
         message.transaction = submask
             .subtree(ExecutedTransaction::TRANSACTION_FIELD.name)
@@ -268,7 +289,7 @@ pub fn simulate_transaction(
                 ObjectSet::default().with_objects(
                     objects
                         .iter()
-                        .map(|o| Object::merge_from(o, &mask))
+                        .map(|o| service.render_object_to_proto(o, &mask, &objects))
                         .collect(),
                 )
             });
@@ -302,7 +323,22 @@ pub fn simulate_transaction(
     let mut response = SimulateTransactionResponse::default();
     response.transaction = transaction;
     response.command_outputs = outputs;
+    if read_mask.contains(SimulateTransactionResponse::SUGGESTED_GAS_PRICE_FIELD) {
+        response.suggested_gas_price = suggested_gas_price;
+    }
     Ok(response)
+}
+
+fn simulation_error_to_rpc_error(error: SuiError) -> RpcError {
+    match error.as_inner() {
+        SuiErrorKind::UserInputError { .. } => {
+            RpcError::new(tonic::Code::InvalidArgument, error.to_string())
+        }
+        SuiErrorKind::UnsupportedFeatureError { .. } => {
+            RpcError::new(tonic::Code::InvalidArgument, error.to_string())
+        }
+        _ => RpcError::new(tonic::Code::Internal, error.to_string()),
+    }
 }
 
 fn to_command_output(
@@ -318,13 +354,12 @@ fn to_command_output(
         .ok()
         .flatten()
         .and_then(|layout| {
-            sui_types::proto_value::ProtoVisitorBuilder::new(
-                service.config.max_json_move_value_size(),
-            )
-            .deserialize_value(&bcs, &layout)
-            .map_err(|e| tracing::debug!("unable to convert to JSON: {e}"))
-            .ok()
-            .map(Box::new)
+            let bound = service.config.max_json_move_value_size();
+            sui_types::object::rpc_visitor::proto::ProtoVisitor::new(bound)
+                .deserialize_value(&bcs, &layout)
+                .map_err(|e| tracing::debug!("unable to convert to JSON: {e}"))
+                .ok()
+                .map(Box::new)
         });
 
     let mut message = CommandOutput::default();
@@ -334,73 +369,534 @@ fn to_command_output(
     message
 }
 
-/// Estimate the gas budget using the gas_cost_summary from a previous DryRun
+/// Estimate the gas budget for a transaction based on simulation results.
 ///
-/// The estimated gas budget is computed as following:
-/// * the maximum between A and B, where:
-///     A = computation cost + GAS_SAFE_OVERHEAD * reference gas price
-///     B = computation cost + storage cost - storage rebate + GAS_SAFE_OVERHEAD * reference gas price
-///     overhead
-///
-/// This gas estimate is computed similarly as in the TypeScript SDK
+/// The estimation includes:
+/// 1. Base cost from gas_cost_summary (computation + storage costs), with the synthetic gas
+///    coin's storage cost subtracted (it doesn't exist at execution time).
+/// 2. Cost of loading additional gas payment objects beyond the synthetic gas coin already
+///    in the simulation. When the request didn't specify gas payment objects, this is 0 —
+///    `select_gas` will pick the actual coins (or address balance) and adjust the budget
+///    incrementally for each one.
+/// 3. Rounding up to the protocol gas rounding step (typically 1000 MIST).
+/// 4. Adding safe overhead buffer (1000 * reference_gas_price).
+/// 5. Clamping to max_tx_gas protocol limit.
 fn estimate_gas_budget_from_gas_cost(
     gas_cost_summary: &sui_types::gas::GasCostSummary,
     reference_gas_price: u64,
+    num_payment_objects_on_request: usize,
+    mock_gas_storage_cost: u64,
+    protocol_config: &ProtocolConfig,
 ) -> u64 {
     const GAS_SAFE_OVERHEAD: u64 = 1000;
 
-    let safe_overhead = GAS_SAFE_OVERHEAD * reference_gas_price;
-    let computation_cost_with_overhead = gas_cost_summary.computation_cost + safe_overhead;
+    // The simulation always loads a synthetic gas coin so that it can produce a gas cost
+    // summary even when the caller hasn't specified a gas payment. That coin's storage
+    // write is phantom — it is not written at execution time (real address-balance gas
+    // emits an accumulator event, real coin gas writes the user-provided coin instead) —
+    // so subtract its contribution from `storage_cost` before deriving the estimate.
+    let storage_cost = gas_cost_summary
+        .storage_cost
+        .saturating_sub(mock_gas_storage_cost);
+    let gas_used = gas_cost_summary
+        .computation_cost
+        .saturating_add(storage_cost);
+    let net_gas_usage = (gas_used as i64).saturating_sub(gas_cost_summary.storage_rebate as i64);
+    let base_estimate_mist = gas_cost_summary.computation_cost.max(if net_gas_usage < 0 {
+        0
+    } else {
+        net_gas_usage as u64
+    });
 
-    let gas_usage = gas_cost_summary.net_gas_usage() + safe_overhead as i64;
-    computation_cost_with_overhead.max(if gas_usage < 0 { 0 } else { gas_usage as u64 })
+    // Loading cost for additional gas coins beyond the synthetic gas coin already counted
+    // by the simulation. When the request did not specify any payment objects, the loading
+    // cost is added incrementally inside `select_gas` once the actual coins are known.
+    let extra_payment_objects = (num_payment_objects_on_request as u64).saturating_sub(1);
+    let gas_loading_cost_mist =
+        compute_gas_loading_cost_mist(extra_payment_objects, reference_gas_price, protocol_config);
+
+    let safe_overhead_mist = GAS_SAFE_OVERHEAD.saturating_mul(reference_gas_price);
+
+    base_estimate_mist
+        .saturating_add(gas_loading_cost_mist)
+        .saturating_add(safe_overhead_mist)
+        .min(protocol_config.max_tx_gas())
+}
+
+/// Cost in MIST of loading `extra_coins` gas-payment objects beyond the synthetic gas coin
+/// already accounted for by the estimation simulation. Mirrors the protocol's per-byte
+/// read cost, rounded up to the protocol gas rounding step in gas units before being
+/// converted to MIST.
+fn compute_gas_loading_cost_mist(
+    extra_coins: u64,
+    reference_gas_price: u64,
+    protocol_config: &ProtocolConfig,
+) -> u64 {
+    let units = extra_coins
+        .saturating_mul(GAS_COIN_SIZE_BYTES)
+        .saturating_mul(protocol_config.obj_access_cost_read_per_byte());
+    let rounded = if let Some(step) = protocol_config.gas_rounding_step_as_option() {
+        round_up_to_nearest(units, step)
+    } else {
+        units
+    };
+    rounded.saturating_mul(reference_gas_price)
+}
+
+/// Round up a value to the nearest multiple of `step` using saturating arithmetic.
+fn round_up_to_nearest(value: u64, step: u64) -> u64 {
+    let remainder = value % step;
+    if remainder == 0 {
+        value
+    } else {
+        value.saturating_add(step - remainder)
+    }
+}
+
+/// Storage cost (in MIST) of the synthetic gas coin that the simulator wrote during the
+/// estimation pass. The new `storage_rebate` on the written object equals the storage cost
+/// (see `track_storage_mutation` / `collect_storage_and_rebate`) so we can read it directly
+/// from the simulation's object set instead of re-deriving it from protocol parameters.
+/// Returns 0 when the simulation didn't use a mock gas coin.
+fn mock_gas_storage_cost(
+    simulation_result: &sui_types::transaction_executor::SimulateTransactionResult,
+) -> u64 {
+    let Some(mock_gas_id) = simulation_result.mock_gas_id else {
+        return 0;
+    };
+    // Both the input version (rebate 0, since the mock coin is fresh) and the written version
+    // (rebate set to the storage cost) end up in `objects`. The written version always carries
+    // the larger value, so taking the max is correct and avoids depending on iteration order.
+    simulation_result
+        .objects
+        .iter()
+        .filter(|o| o.id() == mock_gas_id)
+        .map(|o| o.storage_rebate)
+        .max()
+        .unwrap_or(0)
+}
+
+/// How many proposers a simulated transaction is restricted to.
+///
+/// Enough that the transaction stays submittable when some of them are offline, and no more than
+/// `MAX_UNPAID_ALLOWED_PROPOSERS` so that it remains valid at the reference gas price.
+const MAX_ALLOWED_PROPOSERS: usize = MAX_UNPAID_ALLOWED_PROPOSERS as usize;
+
+/// Populate an expiration covering the current epoch and the next one.
+///
+/// When this node can name the validators it would submit to, the expiration also restricts the
+/// transaction to them, so that nobody else can amplify it into consensus.
+fn configure_transaction_validity(
+    service: &RpcService,
+    protocol_config: &ProtocolConfig,
+    transaction: &mut sui_types::transaction::TransactionData,
+) -> Result<()> {
+    // Early return if the caller already chose an expiration with a validity window.
+    if matches!(
+        transaction.expiration(),
+        TransactionExpiration::ValidDuring { .. } | TransactionExpiration::Validity { .. }
+    ) {
+        return Ok(());
+    }
+
+    let current_epoch = service.reader.inner().get_latest_checkpoint()?.epoch();
+    let min_epoch = Some(current_epoch);
+    let max_epoch = Some(current_epoch.saturating_add(1));
+    let chain = service.chain_id;
+    let nonce = rand::random();
+
+    *transaction.expiration_mut() =
+        match select_allowed_proposers(service, protocol_config, current_epoch) {
+            Some(allowed_proposers) => TransactionExpiration::Validity {
+                min_epoch,
+                max_epoch,
+                min_timestamp: None,
+                max_timestamp: None,
+                chain,
+                nonce,
+                allowed_proposers: Some(allowed_proposers),
+            },
+            None => TransactionExpiration::ValidDuring {
+                min_epoch,
+                max_epoch,
+                min_timestamp: None,
+                max_timestamp: None,
+                chain,
+                nonce,
+            },
+        };
+    Ok(())
+}
+
+/// Restrict the transaction to the validators this node would submit to, even though its gas
+/// coins already provide replay protection.
+///
+/// Unlike the address-balance paths there is no window the transaction needs, so the expiration
+/// is only touched when the caller left it unset and a proposer set is actually available;
+/// otherwise the transaction is returned exactly as resolved.
+fn restrict_transaction_proposers(
+    service: &RpcService,
+    protocol_config: &ProtocolConfig,
+    transaction: &mut sui_types::transaction::TransactionData,
+) -> Result<()> {
+    if !matches!(transaction.expiration(), TransactionExpiration::None) {
+        return Ok(());
+    }
+
+    let current_epoch = service.reader.inner().get_latest_checkpoint()?.epoch();
+    let Some(allowed_proposers) = select_allowed_proposers(service, protocol_config, current_epoch)
+    else {
+        return Ok(());
+    };
+
+    *transaction.expiration_mut() = TransactionExpiration::Validity {
+        min_epoch: Some(current_epoch),
+        max_epoch: Some(current_epoch.saturating_add(1)),
+        min_timestamp: None,
+        max_timestamp: None,
+        chain: service.chain_id,
+        nonce: rand::random(),
+        allowed_proposers: Some(allowed_proposers),
+    };
+    Ok(())
+}
+
+/// The proposer set this node would restrict a transaction to, if one can be formed.
+///
+/// Only offered where the network accepts the `Validity` variant at all — otherwise
+/// validity_check would reject the very transaction simulate just handed back. `None` on nodes
+/// without a transaction driver, or before the driver has observed validator latencies.
+///
+/// Proposer sets are resolved against the committee of the epoch they name, so one selected now
+/// is only usable while this epoch lasts; a set naming any other epoch is not emitted, and the
+/// transaction simply stays unrestricted rather than becoming unproposable.
+fn select_allowed_proposers(
+    service: &RpcService,
+    protocol_config: &ProtocolConfig,
+    current_epoch: u64,
+) -> Option<AllowedProposers> {
+    if !protocol_config.allowed_proposers() {
+        return None;
+    }
+    service
+        .proposer_selector
+        .as_ref()
+        .and_then(|selector| selector.preferred_proposers(MAX_ALLOWED_PROPOSERS))
+        .filter(|allowed| allowed.epoch == current_epoch)
 }
 
 fn select_gas(
-    reader: &StateReader,
-    owner: SuiAddress,
-    budget: u64,
-    max_gas_payment_objects: u32,
-    input_objects: &[ObjectID],
-) -> Result<Vec<ObjectRef>> {
+    service: &RpcService,
+    transaction: &mut sui_types::transaction::TransactionData,
+    incremental_loading_rgp: Option<u64>,
+    protocol_config: &ProtocolConfig,
+) -> Result<()> {
+    use sui_types::accumulator_root::AccumulatorValue;
+    use sui_types::balance::Balance;
+    use sui_types::base_types::SequenceNumber;
+    use sui_types::coin_reservation::CoinReservationResolver;
+    use sui_types::coin_reservation::ParsedDigest;
+    use sui_types::coin_reservation::ParsedObjectRefWithdrawal;
+    use sui_types::gas_coin::GAS;
     use sui_types::gas_coin::GasCoin;
+    use sui_types::transaction::Command;
+    use sui_types::transaction::TransactionDataAPI;
 
-    let gas_coins = reader
-        .inner()
-        .indexes()
-        .ok_or_else(RpcError::not_found)?
-        .owned_objects_iter(owner, Some(GasCoin::type_()), None)?
-        .filter_ok(|info| !input_objects.contains(&info.object_id))
-        .filter_map_ok(|info| reader.inner().get_object(&info.object_id))
-        // filter for objects which are not ConsensusAddress owned,
-        // since only Address owned can be used for gas payments today
-        .filter_ok(|object| !object.is_consensus())
-        .filter_map_ok(|object| {
-            GasCoin::try_from(&object)
+    let reader = &service.reader;
+
+    let owner = transaction.gas_data().owner;
+    let budget = transaction.gas_data().budget;
+
+    let gas_coin_used = transaction
+        .kind()
+        .iter_commands()
+        .any(Command::is_gas_coin_used);
+    let address_balance = reader
+        .lookup_address_balance(owner, GAS::type_())
+        .map(|balance| {
+            // Sum up the explicit SUI reservations (excluding the implicit gas payment) for the
+            // `owner` so that we can deduct that from the available address balance. We use the
+            // estimation variant to avoid double-counting: the gas budget is what we're trying to
+            // satisfy, not a pre-existing reservation.
+            let coin_resolver = CoinReservationResolver::new(reader.inner().clone());
+
+            let reserved_sui = transaction
+                .process_funds_withdrawals_for_estimation(service.chain_id, &coin_resolver)
                 .ok()
-                .map(|coin| (object.compute_object_reference(), coin.value()))
-        })
-        .take(max_gas_payment_objects as usize);
+                .and_then(|withdrawals| {
+                    let sui_type = Balance::type_tag(GAS::type_tag());
+                    let sui_account_id = AccumulatorValue::get_field_id(owner, &sui_type).ok()?;
+                    withdrawals
+                        .get(&sui_account_id)
+                        .map(|(amount, _, _)| *amount)
+                })
+                .unwrap_or(0);
 
-    let mut selected_gas = vec![];
-    let mut selected_gas_value = 0;
+            balance.saturating_sub(reserved_sui)
+        });
 
-    for maybe_coin in gas_coins {
-        let (object_ref, value) =
-            maybe_coin.map_err(|e| RpcError::new(tonic::Code::Internal, e.to_string()))?;
-        selected_gas.push(object_ref);
-        selected_gas_value += value;
-    }
+    // If the gas coin isn't used and there is sufficient address balance budget to satisfy the
+    // required budget then we will use the `owner`s address balance to pay for gas. Otherwise we
+    // fallback to doing coin selection
+    let selected_gas_value = if !gas_coin_used
+        && let Some(address_balance) = address_balance
+        && address_balance >= budget
+    {
+        // We probably don't need to do this, but explicitly clear out the payment to force using
+        // Address balance
+        transaction.gas_data_mut().payment.clear();
 
-    if selected_gas_value >= budget {
-        Ok(selected_gas)
+        if matches!(transaction.expiration(), TransactionExpiration::None) {
+            configure_transaction_validity(service, protocol_config, transaction)?;
+        }
+
+        budget
+    } else {
+        let input_objects = transaction
+            .input_objects()
+            .map_err(anyhow::Error::from)?
+            .iter()
+            .flat_map(|obj| match obj {
+                sui_types::transaction::InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect_vec();
+
+        let gas_coins = reader
+            .inner()
+            .indexes()
+            .ok_or_else(RpcError::not_found)?
+            .owned_objects_iter(owner, Some(GasCoin::type_()), None)?
+            .filter_ok(|info| !input_objects.contains(&info.object_id))
+            .filter_map_ok(|info| reader.inner().get_object(&info.object_id))
+            // filter for objects which are not ConsensusAddress owned,
+            // since only Address owned can be used for gas payments today
+            .filter_ok(|object| !object.is_consensus())
+            .filter_map_ok(|object| {
+                GasCoin::try_from(&object)
+                    .ok()
+                    .map(|coin| (object.compute_object_reference(), coin.value()))
+            })
+            .take(protocol_config.max_gas_payment_objects() as usize);
+
+        let mut selected_gas = vec![];
+        let mut selected_gas_value = 0;
+
+        for maybe_coin in gas_coins {
+            let (object_ref, value) =
+                maybe_coin.map_err(|e| RpcError::new(tonic::Code::Internal, e.to_string()))?;
+            selected_gas.push(object_ref);
+            selected_gas_value += value;
+        }
+
+        // When GasCoin is used and there's address balance, prepend a coin reservation
+        // to make all SUI in the account available (coins + address balance)
+        if protocol_config.enable_coin_reservation_obj_refs()
+            && gas_coin_used
+            && let Some(ab_value) = address_balance
+            && ab_value > 0
+        {
+            let current_epoch = service.reader.inner().get_latest_checkpoint()?.epoch();
+
+            let accumulator_obj_id =
+                AccumulatorValue::get_field_id(owner, &Balance::type_tag(GAS::type_tag()))
+                    .map_err(|e| {
+                        RpcError::new(
+                            tonic::Code::Internal,
+                            format!("Failed to get accumulator object ID: {e}"),
+                        )
+                    })?;
+
+            let reservation = ParsedObjectRefWithdrawal::new(
+                *accumulator_obj_id.inner(),
+                current_epoch,
+                ab_value,
+            );
+            let coin_reservation = reservation.encode(SequenceNumber::new(), service.chain_id);
+
+            // Prepend coin reservation to make address balance accessible via GasCoin
+            selected_gas.insert(0, coin_reservation);
+            selected_gas_value += ab_value;
+
+            if matches!(transaction.expiration(), TransactionExpiration::None) {
+                configure_transaction_validity(service, protocol_config, transaction)?;
+            }
+        }
+
+        transaction.gas_data_mut().payment = selected_gas;
+
+        selected_gas_value
+    };
+
+    // When the caller asked us to top up the budget for the loading cost of the just-picked
+    // payment objects, do so before the balance check. The simulation already counted the
+    // synthetic gas coin's load, so charge for the rest. Coin reservations don't load real
+    // gas-coin objects and are excluded.
+    let final_budget = if let Some(rgp) = incremental_loading_rgp {
+        let real_coins = transaction
+            .gas_data()
+            .payment
+            .iter()
+            .filter(|obj_ref| !ParsedDigest::is_coin_reservation_digest(&obj_ref.2))
+            .count() as u64;
+        let extra_loading_mist =
+            compute_gas_loading_cost_mist(real_coins.saturating_sub(1), rgp, protocol_config);
+        let new_budget = budget
+            .saturating_add(extra_loading_mist)
+            .min(protocol_config.max_tx_gas());
+        transaction.gas_data_mut().budget = new_budget;
+        new_budget
+    } else {
+        budget
+    };
+
+    if selected_gas_value >= final_budget {
+        Ok(())
     } else {
         Err(RpcError::new(
             tonic::Code::InvalidArgument,
             format!(
-                "unable to select sufficient gas coins from account {owner} \
-                    to satisfy required budget {budget}"
+                "Unable to perform gas selection due to insufficient SUI \
+                balance (in address balance or coins) for account {owner} \
+                to satisfy required budget {final_budget}."
             ),
         ))
+    }
+}
+
+/// Returns true if the simulate request is eligible for auto gas_price=0 handling.
+///
+/// Requires: gasless enabled by protocol, caller did not set price (or set it to 0) and did not
+/// set gas payment objects, tx is a PTB that passes the structural gasless checks, and all loaded
+/// Move object inputs pass the runtime gasless input check (`Coin<T>` with `T` allowlisted,
+/// AddressOwner/ConsensusAddressOwner).
+fn is_gasless_candidate(
+    request: &SimulateTransactionRequest,
+    transaction: &sui_types::transaction::TransactionData,
+    protocol_config: &ProtocolConfig,
+    service: &RpcService,
+) -> Result<bool> {
+    if !protocol_config.enable_gasless() {
+        return Ok(false);
+    }
+    // When the caller passed a full BCS TransactionData, treat it as explicit — don't second-guess
+    // their gas choice. Only auto-switch in the unresolved/proto path.
+    if request.transaction().bcs_opt().is_some() {
+        return Ok(false);
+    }
+    // An explicit non-zero price opts out of gasless. price=0 is treated the same as unset: the
+    // caller is either asserting gasless intent or echoing the suggestion from a prior simulate.
+    if request
+        .transaction()
+        .gas_payment()
+        .price
+        .is_some_and(|p| p != 0)
+    {
+        return Ok(false);
+    }
+    if !request.transaction().gas_payment().objects.is_empty() {
+        return Ok(false);
+    }
+    let TransactionKind::ProgrammableTransaction(pt) = transaction.kind() else {
+        return Ok(false);
+    };
+    if pt.validate_gasless_transaction(protocol_config).is_err() {
+        return Ok(false);
+    }
+
+    // Load Move object inputs so we can run the runtime input check. Packages need not be loaded
+    // since check_gasless_object_inputs skips them.
+    let input_object_kinds = match transaction.input_objects() {
+        Ok(kinds) => kinds,
+        Err(_) => return Ok(false),
+    };
+    let mut loaded = Vec::with_capacity(input_object_kinds.len());
+    for kind in input_object_kinds {
+        match kind {
+            InputObjectKind::MovePackage(_) => continue,
+            InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
+                let Some(object) = service.reader.inner().get_object(&object_ref.0) else {
+                    return Ok(false);
+                };
+                loaded.push(ObjectReadResult::new(kind, object.into()));
+            }
+            InputObjectKind::SharedMoveObject { id, .. } => {
+                let Some(object) = service.reader.inner().get_object(&id) else {
+                    return Ok(false);
+                };
+                loaded.push(ObjectReadResult::new(kind, object.into()));
+            }
+        }
+    }
+    let input_objects = InputObjects::new(loaded);
+    Ok(
+        sui_transaction_checks::check_gasless_object_inputs(&input_objects, protocol_config)
+            .is_ok(),
+    )
+}
+
+/// The executor maps a post-execution gasless-requirements failure
+/// (`TemporaryStore::check_gasless_execution_requirements`) to
+/// `ExecutionErrorKind::InsufficientGas` on the effects (see
+/// `sui-execution/latest/sui-adapter/src/execution_engine.rs`). During a gasless simulate, that's
+/// the only way InsufficientGas can surface (gasless uses a large compute cap and ignores budget),
+/// so we treat it as the fallback trigger.
+fn is_gasless_post_execution_failure(status: &ExecutionStatus) -> bool {
+    matches!(
+        status,
+        ExecutionStatus::Failure(ExecutionFailure {
+            error: sui_types::execution_status::ExecutionErrorKind::InsufficientGas,
+            ..
+        })
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sui_types::base_types::ObjectID;
+    use sui_types::error::UserInputError;
+
+    #[test]
+    fn maps_simulation_user_input_errors_to_invalid_argument() {
+        let error = SuiErrorKind::UserInputError {
+            error: UserInputError::ObjectNotFound {
+                object_id: ObjectID::ZERO,
+                version: None,
+            },
+        }
+        .into();
+
+        let status = simulation_error_to_rpc_error(error).into_status_proto();
+
+        assert_eq!(status.code, tonic::Code::InvalidArgument as i32);
+        assert!(
+            status
+                .message
+                .contains("Error checking transaction input objects")
+        );
+    }
+
+    #[test]
+    fn maps_simulation_unsupported_feature_errors_to_invalid_argument() {
+        let error = SuiErrorKind::UnsupportedFeatureError {
+            error: "not supported".to_string(),
+        }
+        .into();
+
+        let status = simulation_error_to_rpc_error(error).into_status_proto();
+
+        assert_eq!(status.code, tonic::Code::InvalidArgument as i32);
+    }
+
+    #[test]
+    fn maps_uncategorized_simulation_errors_to_internal() {
+        let error = SuiErrorKind::Unknown("boom".to_string()).into();
+
+        let status = simulation_error_to_rpc_error(error).into_status_proto();
+
+        assert_eq!(status.code, tonic::Code::Internal as i32);
     }
 }

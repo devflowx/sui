@@ -9,12 +9,13 @@ use std::{
 
 use consensus_types::block::{BlockRef, Round};
 use itertools::Itertools as _;
+use mysten_common::ZipDebugEqIteratorExt;
 use mysten_metrics::monitored_scope;
 use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    block::{BlockAPI, VerifiedBlock, GENESIS_ROUND},
+    block::{BlockAPI, GENESIS_ROUND, VerifiedBlock},
     context::Context,
     dag_state::DagState,
 };
@@ -238,7 +239,7 @@ impl BlockManager {
             .read()
             .contains_blocks(block_refs.clone())
             .into_iter()
-            .zip(block_refs.iter())
+            .zip_debug_eq(block_refs.iter())
         {
             if found || self.suspended_blocks.contains_key(block_ref) {
                 continue;
@@ -316,7 +317,7 @@ impl BlockManager {
         for (found, ancestor) in dag_state
             .contains_blocks(ancestors.clone())
             .into_iter()
-            .zip(ancestors.iter())
+            .zip_debug_eq(ancestors.iter())
         {
             if !found {
                 missing_ancestors.insert(*ancestor);
@@ -483,7 +484,10 @@ impl BlockManager {
                 .with_label_values(&[hostname])
                 .inc();
 
-            assert!(!self.suspended_blocks.contains_key(block_ref), "Block should not be suspended, as we are causally GC'ing and no suspended block should exist for a missing ancestor.");
+            assert!(
+                !self.suspended_blocks.contains_key(block_ref),
+                "Block should not be suspended, as we are causally GC'ing and no suspended block should exist for a missing ancestor."
+            );
 
             // Also remove it from the missing list - we don't want to keep looking for it.
             self.missing_blocks.remove(block_ref);
@@ -604,10 +608,11 @@ mod tests {
     use consensus_config::AuthorityIndex;
     use consensus_types::block::{BlockDigest, BlockRef, Round};
     use parking_lot::RwLock;
-    use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
+    use rand::{SeedableRng, prelude::StdRng, seq::SliceRandom};
     use rstest::rstest;
 
     use crate::{
+        CommitDigest,
         block::{BlockAPI, VerifiedBlock},
         block_manager::BlockManager,
         commit::TrustedCommit,
@@ -616,7 +621,6 @@ mod tests {
         storage::mem_store::MemStore,
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,
-        CommitDigest,
     };
 
     #[tokio::test]
@@ -643,8 +647,8 @@ mod tests {
         // Take only the blocks of round 2 and try to accept them
         let round_2_blocks = dag_builder
             .blocks
-            .into_iter()
-            .filter_map(|(_, block)| (block.round() == 2).then_some(block))
+            .into_values()
+            .filter_map(|block| (block.round() == 2).then_some(block))
             .collect::<Vec<VerifiedBlock>>();
 
         // WHEN
@@ -755,9 +759,7 @@ mod tests {
         let (mut context, _key_pairs) = Context::new_for_test(4);
 
         // We set the gc depth to 4
-        context
-            .protocol_config
-            .set_consensus_gc_depth_for_testing(4);
+        context.protocol_config.set_gc_depth_for_testing(4);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
@@ -844,9 +846,7 @@ mod tests {
         // GIVEN
         let (mut context, _key_pairs) = Context::new_for_test(4);
         // We set the gc depth to 4
-        context
-            .protocol_config
-            .set_consensus_gc_depth_for_testing(4);
+        context.protocol_config.set_gc_depth_for_testing(4);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
@@ -889,9 +889,7 @@ mod tests {
     async fn accept_blocks_unsuspend_children_blocks() {
         // GIVEN
         let (mut context, _key_pairs) = Context::new_for_test(4);
-        context
-            .protocol_config
-            .set_consensus_gc_depth_for_testing(10);
+        context.protocol_config.set_gc_depth_for_testing(10);
 
         let context = Arc::new(context);
 
@@ -938,9 +936,7 @@ mod tests {
         telemetry_subscribers::init_for_testing();
         // GIVEN
         let (mut context, _key_pairs) = Context::new_for_test(4);
-        context
-            .protocol_config
-            .set_consensus_gc_depth_for_testing(gc_depth);
+        context.protocol_config.set_gc_depth_for_testing(gc_depth);
 
         let context = Arc::new(context);
 
@@ -1016,9 +1012,7 @@ mod tests {
         // GIVEN
         let (mut context, _key_pairs) = Context::new_for_test(4);
         // We set the gc depth to 4
-        context
-            .protocol_config
-            .set_consensus_gc_depth_for_testing(4);
+        context.protocol_config.set_gc_depth_for_testing(4);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
@@ -1091,17 +1085,19 @@ mod tests {
         // Take only the blocks of round 2 and try to accept them
         let round_2_blocks = dag_builder
             .blocks
-            .iter()
-            .filter_map(|(_, block)| (block.round() == 2).then_some(block.clone()))
+            .values()
+            .filter_map(|block| (block.round() == 2).then_some(block.clone()))
             .collect::<Vec<VerifiedBlock>>();
 
         // All blocks should be missing
         let missing_block_refs_from_find =
             block_manager.try_find_blocks(round_2_blocks.iter().map(|b| b.reference()).collect());
         assert_eq!(missing_block_refs_from_find.len(), 10);
-        assert!(missing_block_refs_from_find
-            .iter()
-            .all(|block_ref| block_ref.round == 2));
+        assert!(
+            missing_block_refs_from_find
+                .iter()
+                .all(|block_ref| block_ref.round == 2)
+        );
 
         // Try accept blocks which will cause blocks to be suspended and added to missing
         // in block manager.
@@ -1125,8 +1121,8 @@ mod tests {
 
         let round_3_blocks = dag_builder
             .blocks
-            .iter()
-            .filter_map(|(_, block)| (block.round() == 3).then_some(block.reference()))
+            .values()
+            .filter_map(|block| (block.round() == 3).then_some(block.reference()))
             .collect::<Vec<BlockRef>>();
 
         let missing_block_refs_from_find = block_manager.try_find_blocks(
@@ -1138,9 +1134,11 @@ mod tests {
         );
 
         assert_eq!(missing_block_refs_from_find.len(), 4);
-        assert!(missing_block_refs_from_find
-            .iter()
-            .all(|block_ref| block_ref.round == 3));
+        assert!(
+            missing_block_refs_from_find
+                .iter()
+                .all(|block_ref| block_ref.round == 3)
+        );
         assert_eq!(
             block_manager.missing_blocks(),
             missing_block_refs_from_accept

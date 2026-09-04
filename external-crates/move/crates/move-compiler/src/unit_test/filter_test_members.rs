@@ -70,7 +70,7 @@ impl FilterContext for Context<'_> {
     }
 
     // Mode filtering happens in the mode filter for `#[mode(test)]`. We further remove any
-    // `#[test]` or `#[rand_test]` that is not in our source definition. This means we will filter
+    // `#[test]` or `#[random_test]` that is not in our source definition. This means we will filter
     // the following definitions:
     // * Definitions annotated as a test function (test, random_test, abort) and test mode is not set
     // * Definitions in a library annotated with the same
@@ -113,27 +113,27 @@ fn check_has_unit_test_module(
 ) -> bool {
     let has_unit_test_module = has_unit_test_module(prog, pre_compiled_lib);
 
-    if !has_unit_test_module && compilation_env.test_mode() {
-        if let Some(P::PackageDefinition { def, .. }) = prog
+    if !has_unit_test_module
+        && compilation_env.test_mode()
+        && let Some(P::PackageDefinition { def, .. }) = prog
             .source_definitions
             .iter()
             .chain(prog.lib_definitions.iter())
             .next()
-        {
-            let loc = match def {
-                P::Definition::Module(P::ModuleDefinition { name, .. }) => name.0.loc,
-                P::Definition::Address(P::AddressDefinition { loc, .. }) => *loc,
-            };
-            reporter.add_diag(diag!(
-                Attributes::InvalidTest,
-                (
-                    loc,
-                    "Compilation in test mode requires passing the UnitTest module in the Move \
+    {
+        let loc = match def {
+            P::Definition::Module(P::ModuleDefinition { name, .. }) => name.0.loc,
+            P::Definition::Address(P::AddressDefinition { loc, .. }) => *loc,
+        };
+        reporter.add_diag(diag!(
+            Attributes::InvalidTest,
+            (
+                loc,
+                "Compilation in test mode requires passing the UnitTest module in the Move \
                      stdlib as a dependency",
-                )
-            ));
-            return false;
-        }
+            )
+        ));
+        return false;
     }
 
     true
@@ -196,6 +196,9 @@ fn test_attribute_kinds(attrs: &P::Attributes) -> Vec<(Loc, known_attributes::At
             | P::Attribute_::Mode { .. }
             | P::Attribute_::Syntax { .. }
             | P::Attribute_::Allow { .. }
+            | P::Attribute_::Deny { .. }
+            | P::Attribute_::Expect { .. }
+            | P::Attribute_::Warn { .. }
             | P::Attribute_::LintAllow { .. } => None,
             // -- testing attributes
             P::Attribute_::Test => Some((attr.loc, known_attributes::AttributeKind_::Test)),

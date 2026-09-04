@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod client;
+mod restore;
 mod v2;
-mod v2beta2;
 
 async fn transfer_coin(context: &sui_sdk::wallet_context::WalletContext) -> sui_sdk_types::Digest {
     let gas_price = context.get_reference_gas_price().await.unwrap();
@@ -25,7 +25,7 @@ async fn transfer_coin(context: &sui_sdk::wallet_context::WalletContext) -> sui_
         )
         .await;
     let resp = context.execute_transaction_must_succeed(txn).await;
-    resp.digest.into()
+    resp.transaction.digest().into()
 }
 
 async fn stake_with_validator(cluster: &test_cluster::TestCluster) -> sui_sdk_types::Digest {
@@ -46,5 +46,5 @@ async fn stake_with_validator(cluster: &test_cluster::TestCluster) -> sui_sdk_ty
         )
         .await;
     let resp = context.execute_transaction_must_succeed(txn).await;
-    resp.digest.into()
+    resp.transaction.digest().into()
 }

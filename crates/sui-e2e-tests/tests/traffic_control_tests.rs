@@ -1,35 +1,47 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(deprecated)]
+
 //! NB: Most tests in this module expect real network connections and interactions, thus
 //! they should nearly all be tokio::test rather than simtest.
 
 use core::panic;
 use fastcrypto::encoding::Base64;
 use jsonrpsee::{core::client::ClientT, rpc_params};
+use move_core_types::identifier::Identifier;
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::time::Duration;
-use sui_core::authority_client::make_network_authority_clients_with_network_config;
 use sui_core::authority_client::AuthorityAPI;
+use sui_core::authority_client::make_network_authority_clients_with_network_config;
 use sui_core::traffic_controller::{
-    nodefw_test_server::NodeFwTestServer, TrafficController, TrafficSim,
+    TrafficController, TrafficSim, nodefw_test_server::NodeFwTestServer,
 };
 use sui_json_rpc_types::{
     SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
 use sui_macros::sim_test;
 use sui_network::default_mysten_network_config;
+use sui_protocol_config::ProtocolConfig;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_test_transaction_builder::batch_make_transfer_transactions;
+use sui_types::gas_coin::GAS;
 use sui_types::traffic_control::TrafficControlReconfigParams;
 use sui_types::{
+    SUI_FRAMEWORK_PACKAGE_ID,
     crypto::Ed25519SuiSignature,
-    quorum_driver_types::ExecuteTransactionRequestType,
+    messages_grpc::SubmitTxRequest,
+    programmable_transaction_builder::ProgrammableTransactionBuilder,
     signature::GenericSignature,
     traffic_control::{
         FreqThresholdConfig, PolicyConfig, PolicyType, RemoteFirewallConfig, Weight,
     },
+    transaction::{
+        FundsWithdrawalArg, GasData, TransactionData, TransactionDataV1, TransactionExpiration,
+        TransactionKind, add_gasless_token_for_testing,
+    },
+    transaction_driver_types::ExecuteTransactionRequestType,
 };
 use test_cluster::{TestCluster, TestClusterBuilder};
 
@@ -252,19 +264,21 @@ async fn test_validator_traffic_control_error_blocked() -> Result<(), anyhow::Er
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..n {
-        let response = auth_client.handle_transaction(tx.clone(), None).await;
-        if let Err(err) = response {
-            if err.to_string().contains("Too many requests") {
-                return Ok(());
-            }
+        let response = auth_client
+            .submit_transaction(SubmitTxRequest::new_transaction(tx.clone()), None)
+            .await;
+        if let Err(err) = response
+            && err.to_string().contains("Too many requests")
+        {
+            return Ok(());
         }
     }
     panic!("Expected error policy to trigger within {n} requests");
 }
 
 #[tokio::test]
-async fn test_validator_traffic_control_error_blocked_with_policy_reconfig(
-) -> Result<(), anyhow::Error> {
+async fn test_validator_traffic_control_error_blocked_with_policy_reconfig()
+-> Result<(), anyhow::Error> {
     telemetry_subscribers::init_for_testing();
     let n = 5;
     let policy_config = PolicyConfig {
@@ -299,7 +313,9 @@ async fn test_validator_traffic_control_error_blocked_with_policy_reconfig(
     // Before reconfiguring the policy, we should not block any requests due to dry run mode,
     // even after far exceeding the threshold. However the blocklist should be updated.
     for _ in 0..(2 * n) {
-        let response = auth_client.handle_transaction(tx.clone(), None).await;
+        let response = auth_client
+            .submit_transaction(SubmitTxRequest::new_transaction(tx.clone()), None)
+            .await;
         if let Err(err) = response {
             assert!(
                 !err.to_string().contains("Too many requests"),
@@ -321,11 +337,13 @@ async fn test_validator_traffic_control_error_blocked_with_policy_reconfig(
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     // If Node and TrafficController has not crashed, blocklist and policy freq state should still
     // be intact. A single additional erroneous request from the client should trigger enforcement.
-    let response = auth_client.handle_transaction(tx.clone(), None).await;
-    if let Err(err) = response {
-        if err.to_string().contains("Too many requests") {
-            return Ok(());
-        }
+    let response = auth_client
+        .submit_transaction(SubmitTxRequest::new_transaction(tx.clone()), None)
+        .await;
+    if let Err(err) = response
+        && err.to_string().contains("Too many requests")
+    {
+        return Ok(());
     }
     panic!("Expected error policy to trigger on next requests after reconfiguration");
 }
@@ -511,11 +529,13 @@ async fn test_validator_traffic_control_error_delegated() -> Result<(), anyhow::
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..n {
-        let response = auth_client.handle_transaction(tx.clone(), None).await;
-        if let Err(err) = response {
-            if err.to_string().contains("Too many requests") {
-                return Ok(());
-            }
+        let response = auth_client
+            .submit_transaction(SubmitTxRequest::new_transaction(tx.clone()), None)
+            .await;
+        if let Err(err) = response
+            && err.to_string().contains("Too many requests")
+        {
+            return Ok(());
         }
     }
     let fw_blocklist = server.list_addresses_rpc().await;
@@ -964,4 +984,96 @@ async fn assert_validator_traffic_control_dry_run(
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn test_validator_traffic_control_gasless_spam_blocked() -> Result<(), anyhow::Error> {
+    telemetry_subscribers::init_for_testing();
+    let n = 5;
+    let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut cfg| {
+        cfg.enable_gasless_for_testing();
+        cfg
+    });
+    let policy_config = PolicyConfig {
+        connection_blocklist_ttl_sec: 1,
+        proxy_blocklist_ttl_sec: 5,
+        spam_policy_type: PolicyType::TestNConnIP(n - 1),
+        spam_sample_rate: Weight::one(),
+        error_policy_type: PolicyType::TestPanicOnInvocation,
+        dry_run: false,
+        ..Default::default()
+    };
+    let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .with_policy_config(Some(policy_config))
+        .build();
+    let committee = network_config.committee_with_network();
+    let test_cluster = TestClusterBuilder::new()
+        .set_network_config(network_config)
+        .build()
+        .await;
+    let local_clients = make_network_authority_clients_with_network_config(
+        &committee,
+        &default_mysten_network_config(),
+    );
+    let (_, auth_client) = local_clients.first_key_value().unwrap();
+
+    let chain_id = test_cluster.get_chain_identifier();
+    let sender = test_cluster.wallet.get_addresses()[0];
+    let recipient = test_cluster.wallet.get_addresses()[1];
+
+    // Register SUI as an allowed gasless token type for this test.
+    add_gasless_token_for_testing(GAS::type_tag().to_canonical_string(true), 0);
+
+    // Build a gasless transaction with a valid balance::send_funds MoveCall.
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let withdraw_arg = FundsWithdrawalArg::balance_from_sender(1000, GAS::type_tag());
+    let withdraw_arg = builder.funds_withdrawal(withdraw_arg).unwrap();
+    let balance = builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        Identifier::new("balance").unwrap(),
+        Identifier::new("redeem_funds").unwrap(),
+        vec![GAS::type_tag()],
+        vec![withdraw_arg],
+    );
+    let recipient_arg = builder.pure(recipient).unwrap();
+    builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        Identifier::new("balance").unwrap(),
+        Identifier::new("send_funds").unwrap(),
+        vec![GAS::type_tag()],
+        vec![balance, recipient_arg],
+    );
+    let tx_kind = TransactionKind::ProgrammableTransaction(builder.finish());
+    let tx_data = TransactionData::V1(TransactionDataV1 {
+        kind: tx_kind,
+        sender,
+        gas_data: GasData {
+            payment: vec![],
+            owner: sender,
+            price: 0,
+            budget: 0,
+        },
+        expiration: TransactionExpiration::ValidDuring {
+            min_epoch: Some(0),
+            max_epoch: Some(0),
+            min_timestamp: None,
+            max_timestamp: None,
+            chain: chain_id,
+            nonce: 0,
+        },
+    });
+    let tx = test_cluster.wallet.sign_transaction(&tx_data).await;
+
+    for _ in 0..n {
+        let response = auth_client
+            .submit_transaction(SubmitTxRequest::new_transaction(tx.clone()), None)
+            .await;
+        if let Err(err) = response
+            && err.to_string().contains("Too many requests")
+        {
+            return Ok(());
+        }
+    }
+    panic!("Expected spam policy to trigger within {n} requests for gasless transactions");
 }

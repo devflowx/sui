@@ -14,21 +14,21 @@ use serde::{Deserialize, Serialize};
 use super::authority_per_epoch_store::AuthorityPerEpochStore;
 use super::weighted_moving_average::WeightedMovingAverage;
 use crate::consensus_adapter::SubmitToConsensus;
-use governor::{clock::MonotonicClock, Quota, RateLimiter};
+use governor::{Quota, RateLimiter, clock::MonotonicClock};
 use itertools::Itertools;
 use lru::LruCache;
 #[cfg(not(msim))]
 use mysten_common::in_antithesis;
 use mysten_common::{assert_reachable, debug_fatal, in_test_configuration};
 use mysten_metrics::{monitored_scope, spawn_monitored_task};
-use rand::{random, rngs, thread_rng, Rng, SeedableRng};
-use simple_moving_average::{SingleSumSMA, SMA};
+use rand::{Rng, SeedableRng, random, rngs, thread_rng};
+use simple_moving_average::{SMA, SingleSumSMA};
 use sui_config::node::ExecutionTimeObserverConfig;
 use sui_protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
 use sui_types::{
     base_types::ObjectID,
     committee::Committee,
-    error::SuiError,
+    error::SuiErrorKind,
     execution::{ExecutionTimeObservationKey, ExecutionTiming},
     messages_consensus::{AuthorityIndex, ConsensusTransaction, ExecutionTimeObservation},
     transaction::{
@@ -43,6 +43,27 @@ use tracing::{debug, info, trace, warn};
 // implmentation without the window size in the type.
 const SMA_LOCAL_OBSERVATION_WINDOW_SIZE: usize = 20;
 const OBJECT_UTILIZATION_METRIC_HASH_MODULUS: u8 = 32;
+
+/// Determines whether to inject synthetic execution time in Antithesis environments.
+///
+/// This function checks two conditions:
+/// 1. Whether the code is running in an Antithesis environment
+/// 2. Whether injection is enabled via the `ANTITHESIS_ENABLE_EXECUTION_TIME_INJECTION` env var
+///    (enabled by default)
+#[cfg(not(msim))]
+fn antithesis_enable_injecting_synthetic_execution_time() -> bool {
+    use std::sync::OnceLock;
+    static ENABLE_INJECTION: OnceLock<bool> = OnceLock::new();
+    *ENABLE_INJECTION.get_or_init(|| {
+        if !in_antithesis() {
+            return false;
+        }
+
+        std::env::var("ANTITHESIS_ENABLE_EXECUTION_TIME_INJECTION")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(true)
+    })
+}
 
 // Collects local execution time estimates to share via consensus.
 pub struct ExecutionTimeObserver {
@@ -163,7 +184,9 @@ impl ExecutionTimeObserver {
             .protocol_config()
             .per_object_congestion_control_mode()
         else {
-            info!("ExecutionTimeObserver disabled because per-object congestion control mode is not ExecutionTimeEstimate");
+            info!(
+                "ExecutionTimeObserver disabled because per-object congestion control mode is not ExecutionTimeEstimate"
+            );
             return;
         };
 
@@ -223,7 +246,9 @@ impl ExecutionTimeObserver {
             .protocol_config()
             .per_object_congestion_control_mode()
         else {
-            panic!("tried to construct test ExecutionTimeObserver when congestion control mode is not ExecutionTimeEstimate");
+            panic!(
+                "tried to construct test ExecutionTimeObserver when congestion control mode is not ExecutionTimeEstimate"
+            );
         };
         Self {
             epoch_store: Arc::downgrade(&epoch_store),
@@ -269,7 +294,7 @@ impl ExecutionTimeObserver {
         #[cfg(msim)]
         let should_inject = self.config.inject_synthetic_execution_time();
         #[cfg(not(msim))]
-        let should_inject = in_antithesis();
+        let should_inject = antithesis_enable_injecting_synthetic_execution_time();
 
         if should_inject {
             let (generated_timings, generated_duration) = self.generate_test_timings(tx, timings);
@@ -291,20 +316,28 @@ impl ExecutionTimeObserver {
         total_duration: Duration,
         gas_price: u64,
     ) {
-        assert!(tx.commands.len() >= timings.len());
-
         let Some(epoch_store) = self.epoch_store.upgrade() else {
             debug!("epoch is ending, dropping execution time observation");
             return;
         };
+        let timings = if timings.len() > tx.commands.len() {
+            warn!(
+                executed_commands = timings.len(),
+                original_commands = tx.commands.len(),
+                "execution produced more timings than the original PTB commands; using the trailing timings for local execution-time observations"
+            );
+            &timings[timings.len() - tx.commands.len()..]
+        } else {
+            timings
+        };
 
         let mut uses_indebted_object = false;
 
-        // Update the accumulated excess execution time for each mutable shared object
-        // used in this transaction, and determine the max overage.
+        // Update the accumulated excess execution time for shared object
+        // used for exclusive access in this transaction, and determine the max overage.
         let max_excess_per_object_execution_time = tx
             .shared_input_objects()
-            .filter_map(|obj| obj.mutable.then_some(obj.id))
+            .filter_map(|obj| obj.is_accessed_exclusively().then_some(obj.id))
             .map(|id| {
                 // Mark if any object used in the tx is indebted.
                 if !uses_indebted_object && self.indebted_objects.binary_search(&id).is_ok() {
@@ -476,9 +509,11 @@ impl ExecutionTimeObserver {
         tx: &ProgrammableTransaction,
         timings: &[ExecutionTiming],
     ) -> (Vec<ExecutionTiming>, Duration) {
+        #[allow(clippy::disallowed_methods)]
         let generated_timings: Vec<_> = tx
             .commands
             .iter()
+            // TODO: migrate to zip_debug_eq once PR #26125 fixes the timings/commands length mismatch
             .zip(timings.iter())
             .map(|(command, timing)| {
                 let key = ExecutionTimeObservationKey::from_command(command);
@@ -510,9 +545,7 @@ impl ExecutionTimeObserver {
             panic!("get_test_duration called in non-test configuration");
         }
 
-        thread_local! {
-            static PER_TEST_SEED: u64 = random::<u64>();
-        }
+        static PER_TEST_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
@@ -529,7 +562,7 @@ impl ExecutionTimeObserver {
             .is_some();
 
         if !checkpoint_digest_used {
-            PER_TEST_SEED.with(|seed| seed.hash(&mut hasher));
+            PER_TEST_SEED.get_or_init(random::<u64>).hash(&mut hasher);
         }
 
         key.hash(&mut hasher);
@@ -570,7 +603,7 @@ impl ExecutionTimeObserver {
             &epoch_store,
             Duration::from_secs(5),
         ) {
-            if !matches!(e, SuiError::EpochEnded(_)) {
+            if !matches!(e.as_inner(), SuiErrorKind::EpochEnded(_)) {
                 epoch_store
                     .metrics
                     .epoch_execution_time_observations_dropped
@@ -611,6 +644,9 @@ impl ExecutionTimeObserver {
 // Key used to save StoredExecutionTimeObservations in the Sui system state object's
 // `extra_fields` Bag.
 pub const EXTRA_FIELD_EXECUTION_TIME_ESTIMATES_KEY: u64 = 0;
+
+// Key used to save the chunk count for chunked execution time observations
+pub const EXTRA_FIELD_EXECUTION_TIME_ESTIMATES_CHUNK_COUNT_KEY: u64 = 1;
 
 // Tracks global execution time observations provided by validators from consensus
 // and computes deterministic per-command estimates for use in congestion control.
@@ -860,12 +896,13 @@ mod tests {
     use crate::authority::test_authority_builder::TestAuthorityBuilder;
     use crate::checkpoints::CheckpointStore;
     use crate::consensus_adapter::{
-        ConnectionMonitorStatusForTests, ConsensusAdapter, ConsensusAdapterMetrics,
-        MockConsensusClient,
+        ConsensusAdapter, ConsensusAdapterMetrics, MockConsensusClient,
     };
     use sui_protocol_config::ProtocolConfig;
     use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress};
-    use sui_types::transaction::{Argument, CallArg, ObjectArg, ProgrammableMoveCall};
+    use sui_types::transaction::{
+        Argument, CallArg, ObjectArg, ProgrammableMoveCall, SharedObjectMutability,
+    };
     use {
         rand::{Rng, SeedableRng},
         sui_protocol_config::ProtocolVersion,
@@ -888,6 +925,7 @@ mod tests {
                         stored_observations_limit: u64::MAX,
                         stake_weighted_median_threshold: 0,
                         default_none_duration_for_new_keys: true,
+                        observations_chunk_size: Some(18),
                     },
                 ),
             );
@@ -901,13 +939,10 @@ mod tests {
             Arc::new(mock_consensus_client),
             CheckpointStore::new_for_tests(),
             authority.name,
-            Arc::new(ConnectionMonitorStatusForTests {}),
             100_000,
             100_000,
-            None,
-            None,
             ConsensusAdapterMetrics::new_test(),
-            epoch_store.protocol_config().clone(),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut observer = ExecutionTimeObserver::new_for_testing(
             epoch_store.clone(),
@@ -1025,6 +1060,7 @@ mod tests {
                         stored_observations_limit: u64::MAX,
                         stake_weighted_median_threshold: 0,
                         default_none_duration_for_new_keys: true,
+                        observations_chunk_size: Some(18),
                     },
                 ),
             );
@@ -1038,13 +1074,10 @@ mod tests {
             Arc::new(mock_consensus_client),
             CheckpointStore::new_for_tests(),
             authority.name,
-            Arc::new(ConnectionMonitorStatusForTests {}),
             100_000,
             100_000,
-            None,
-            None,
             ConsensusAdapterMetrics::new_test(),
-            epoch_store.protocol_config().clone(),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut observer = ExecutionTimeObserver::new_for_testing(
             epoch_store.clone(),
@@ -1120,6 +1153,7 @@ mod tests {
                         stored_observations_limit: u64::MAX,
                         stake_weighted_median_threshold: 0,
                         default_none_duration_for_new_keys: true,
+                        observations_chunk_size: Some(18),
                     },
                 ),
             );
@@ -1133,13 +1167,10 @@ mod tests {
             Arc::new(mock_consensus_client),
             CheckpointStore::new_for_tests(),
             authority.name,
-            Arc::new(ConnectionMonitorStatusForTests {}),
             100_000,
             100_000,
-            None,
-            None,
             ConsensusAdapterMetrics::new_test(),
-            epoch_store.protocol_config().clone(),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut observer = ExecutionTimeObserver::new_for_testing(
             epoch_store.clone(),
@@ -1219,6 +1250,7 @@ mod tests {
                         stored_observations_limit: u64::MAX,
                         stake_weighted_median_threshold: 0,
                         default_none_duration_for_new_keys: true,
+                        observations_chunk_size: Some(18),
                     },
                 ),
             );
@@ -1232,13 +1264,10 @@ mod tests {
             Arc::new(mock_consensus_client),
             CheckpointStore::new_for_tests(),
             authority.name,
-            Arc::new(ConnectionMonitorStatusForTests {}),
             100_000,
             100_000,
-            None,
-            None,
             ConsensusAdapterMetrics::new_test(),
-            epoch_store.protocol_config().clone(),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut observer = ExecutionTimeObserver::new_for_testing(
             epoch_store.clone(),
@@ -1256,7 +1285,7 @@ mod tests {
             inputs: vec![CallArg::Object(ObjectArg::SharedObject {
                 id: shared_object_id,
                 initial_shared_version: SequenceNumber::new(),
-                mutable: true,
+                mutability: SharedObjectMutability::Mutable,
             })],
             commands: vec![Command::MoveCall(Box::new(ProgrammableMoveCall {
                 package,
@@ -1278,12 +1307,14 @@ mod tests {
         // First observation - should not share due to low utilization
         let timings = vec![ExecutionTiming::Success(Duration::from_secs(1))];
         observer.record_local_observations(&ptb, &timings, Duration::from_secs(2), 1);
-        assert!(observer
-            .local_observations
-            .get(&key)
-            .unwrap()
-            .last_shared
-            .is_none());
+        assert!(
+            observer
+                .local_observations
+                .get(&key)
+                .unwrap()
+                .last_shared
+                .is_none()
+        );
 
         // Second observation - no time has passed, so now utilization is high; should share upward change
         let timings = vec![ExecutionTiming::Success(Duration::from_secs(1))];
@@ -1362,6 +1393,7 @@ mod tests {
                         stored_observations_limit: u64::MAX,
                         stake_weighted_median_threshold: 0,
                         default_none_duration_for_new_keys: true,
+                        observations_chunk_size: Some(18),
                     },
                 ),
             );
@@ -1375,13 +1407,10 @@ mod tests {
             Arc::new(mock_consensus_client),
             CheckpointStore::new_for_tests(),
             authority.name,
-            Arc::new(ConnectionMonitorStatusForTests {}),
             100_000,
             100_000,
-            None,
-            None,
             ConsensusAdapterMetrics::new_test(),
-            epoch_store.protocol_config().clone(),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut observer = ExecutionTimeObserver::new_for_testing(
             epoch_store.clone(),
@@ -1399,7 +1428,7 @@ mod tests {
             inputs: vec![CallArg::Object(ObjectArg::SharedObject {
                 id: shared_object_id,
                 initial_shared_version: SequenceNumber::new(),
-                mutable: true,
+                mutability: SharedObjectMutability::Mutable,
             })],
             commands: vec![Command::MoveCall(Box::new(ProgrammableMoveCall {
                 package,
@@ -1421,12 +1450,14 @@ mod tests {
         // First observation - should not share due to low utilization
         let timings = vec![ExecutionTiming::Success(Duration::from_secs(1))];
         observer.record_local_observations(&ptb, &timings, Duration::from_secs(1), 1);
-        assert!(observer
-            .local_observations
-            .get(&key)
-            .unwrap()
-            .last_shared
-            .is_none());
+        assert!(
+            observer
+                .local_observations
+                .get(&key)
+                .unwrap()
+                .last_shared
+                .is_none()
+        );
 
         // Second observation - no time has passed, so now utilization is high; should share upward change
         let timings = vec![ExecutionTiming::Success(Duration::from_secs(2))];
@@ -1469,7 +1500,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // TODO-DNS add tests for min stake amt
     async fn test_stake_weighted_median() {
         telemetry_subscribers::init_for_testing();
 
@@ -1642,6 +1672,7 @@ mod tests {
                 stored_observations_limit: u64::MAX,
                 stake_weighted_median_threshold: 0,
                 default_none_duration_for_new_keys: true,
+                observations_chunk_size: Some(18),
             },
             std::iter::empty(),
         );
@@ -1846,7 +1877,7 @@ mod tests {
     )> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-        let observation_keys = vec![
+        let observation_keys = [
             ExecutionTimeObservationKey::MoveEntryPoint {
                 package: ObjectID::from_hex_literal("0x1").unwrap(),
                 module: "coin".to_string(),
@@ -2162,7 +2193,7 @@ mod tests {
             }
 
             let mut final_observations = estimator.get_observations();
-            final_observations.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+            final_observations.sort_by_key(|a| a.0.to_string());
 
             let test_transactions = generate_test_transactions(version);
             let mut transaction_estimates = Vec::new();

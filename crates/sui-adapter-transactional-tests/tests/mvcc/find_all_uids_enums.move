@@ -38,8 +38,8 @@ module test::m {
             wrapped: wrapped(ctx),
             many: vector[wrapped(ctx), wrapped(ctx)],
         };
-        field::add(&mut s.id, KEY, 0);
-        field::add(s.other.get_wrapped_uid(), KEY, 0);
+        field::add(&mut s.id, KEY, 0u64);
+        field::add(s.other.get_wrapped_uid(), KEY, 0u64);
         s
     }
 
@@ -48,8 +48,8 @@ module test::m {
             id: object::new(ctx),
             other: EnumWrapper::Wrapped(object::new(ctx)),
         };
-        field::add(&mut w.id, KEY, 0);
-        field::add(w.other.get_wrapped_uid(), KEY, 0);
+        field::add(&mut w.id, KEY, 0u64);
+        field::add(w.other.get_wrapped_uid(), KEY, 0u64);
         w
     }
 
@@ -137,39 +137,39 @@ module test::m {
 //> 0: test::m::new();
 //> TransferObjects([Result(0)], Input(0))
 
-//# view-object 2,8
+//# view-object 2,0
 
-//# programmable --sender A --inputs object(2,8) 112
+//# programmable --sender A --inputs object(2,0) 112
 //> test::m::set(Input(0), Input(1))
 
-//# view-object 2,8
+//# view-object 2,0
 
-//# programmable --sender A --inputs object(2,8) 112
+//# programmable --sender A --inputs object(2,0) 112
 //> test::m::remove(Input(0))
 
-//# view-object 2,8
+//# view-object 2,0
 
 // dev-inspect with 'check' and correct values
 
-//# programmable --sender A --inputs object(2,8)@2 vector[0] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@2 vector[0] --dev-inspect
 //> test::m::check(Input(0), Input(1))
 
-//# programmable --sender A --inputs object(2,8)@3 vector[112] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@3 vector[112] --dev-inspect
 //> test::m::check(Input(0), Input(1))
 
-//# programmable --sender A --inputs object(2,8)@4 vector[] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@4 vector[] --dev-inspect
 //> test::m::check(Input(0), Input(1))
 
 // dev-inspect with 'check' and _incorrect_ values
 
 // Should fail since the field exists but with a different field.
-//# programmable --sender A --inputs object(2,8)@3 vector[0] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@3 vector[0] --dev-inspect
 //> test::m::check(Input(0), Input(1))
 
 // Should fail since the field has been deleted.
-//# programmable --sender A --inputs object(2,8)@4 vector[112] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@4 vector[112] --dev-inspect
 //> test::m::check(Input(0), Input(1))
 
 // Should fail since at the version of the object we're passing in the field exists still
-//# programmable --sender A --inputs object(2,8)@2 vector[] --dev-inspect
+//# programmable --sender A --inputs object(2,0)@2 vector[] --dev-inspect
 //> test::m::check(Input(0), Input(1))

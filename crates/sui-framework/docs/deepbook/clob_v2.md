@@ -81,12 +81,13 @@ title: Module `deepbook::clob_v2`
 <b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -105,6 +106,7 @@ title: Module `deepbook::clob_v2`
 <b>use</b> <a href="../sui/linked_table.md#sui_linked_table">sui::linked_table</a>;
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/sui.md#sui_sui">sui::sui</a>;
 <b>use</b> <a href="../sui/table.md#sui_table">sui::table</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
@@ -2164,7 +2166,7 @@ and they should correspond to the order IDs one by one.
     account_cap: &AccountCap
 ): vector&lt;<a href="../deepbook/clob_v2.md#deepbook_clob_v2_Order">Order</a>&gt; {
     <b>let</b> <a href="../deepbook/clob_v2.md#deepbook_clob_v2_owner">owner</a> = account_owner(account_cap);
-    <b>let</b> <b>mut</b> <a href="../deepbook/clob_v2.md#deepbook_clob_v2_open_orders">open_orders</a> = vector::empty&lt;<a href="../deepbook/clob_v2.md#deepbook_clob_v2_Order">Order</a>&gt;();
+    <b>let</b> <b>mut</b> <a href="../deepbook/clob_v2.md#deepbook_clob_v2_open_orders">open_orders</a> = vector[];
     <b>if</b> (!<a href="../deepbook/clob_v2.md#deepbook_clob_v2_usr_open_orders_exist">usr_open_orders_exist</a>(pool, <a href="../deepbook/clob_v2.md#deepbook_clob_v2_owner">owner</a>)) {
         <b>return</b> <a href="../deepbook/clob_v2.md#deepbook_clob_v2_open_orders">open_orders</a>
     };
@@ -2294,8 +2296,8 @@ The latter is the corresponding depth list
     <b>mut</b> price_high: u64,
     clock: &Clock
 ): (vector&lt;u64&gt;, vector&lt;u64&gt;) {
-    <b>let</b> <b>mut</b> price_vec = vector::empty&lt;u64&gt;();
-    <b>let</b> <b>mut</b> depth_vec = vector::empty&lt;u64&gt;();
+    <b>let</b> <b>mut</b> price_vec = vector[];
+    <b>let</b> <b>mut</b> depth_vec = vector[];
     <b>if</b> (<a href="../deepbook/critbit.md#deepbook_critbit_is_empty">critbit::is_empty</a>(&pool.<a href="../deepbook/clob_v2.md#deepbook_clob_v2_bids">bids</a>)) { <b>return</b> (price_vec, depth_vec) };
     <b>let</b> (price_low_, _) = <a href="../deepbook/critbit.md#deepbook_critbit_min_leaf">critbit::min_leaf</a>(&pool.<a href="../deepbook/clob_v2.md#deepbook_clob_v2_bids">bids</a>);
     <b>let</b> (price_high_, _) = <a href="../deepbook/critbit.md#deepbook_critbit_max_leaf">critbit::max_leaf</a>(&pool.<a href="../deepbook/clob_v2.md#deepbook_clob_v2_bids">bids</a>);
@@ -2354,8 +2356,8 @@ The latter is the corresponding depth list
     <b>mut</b> price_high: u64,
     clock: &Clock
 ): (vector&lt;u64&gt;, vector&lt;u64&gt;) {
-    <b>let</b> <b>mut</b> price_vec = vector::empty&lt;u64&gt;();
-    <b>let</b> <b>mut</b> depth_vec = vector::empty&lt;u64&gt;();
+    <b>let</b> <b>mut</b> price_vec = vector[];
+    <b>let</b> <b>mut</b> depth_vec = vector[];
     <b>if</b> (<a href="../deepbook/critbit.md#deepbook_critbit_is_empty">critbit::is_empty</a>(&pool.<a href="../deepbook/clob_v2.md#deepbook_clob_v2_asks">asks</a>)) { <b>return</b> (price_vec, depth_vec) };
     <b>let</b> (price_low_, _) = <a href="../deepbook/critbit.md#deepbook_critbit_min_leaf">critbit::min_leaf</a>(&pool.<a href="../deepbook/clob_v2.md#deepbook_clob_v2_asks">asks</a>);
     // Price_high is less than the lowest leaf in the tree then we <b>return</b> an empty array

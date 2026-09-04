@@ -2,13 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use crate::authority::{AuthorityMetrics, AuthorityState, ExecutionEnv};
-use crate::checkpoints::CheckpointServiceNoop;
+use crate::authority::{AuthorityState, ExecutionEnv};
 use crate::consensus_adapter::{BlockStatusReceiver, ConsensusClient, SubmitToConsensus};
-use crate::consensus_handler::SequencedConsensusTransaction;
 
 use consensus_types::block::BlockRef;
-use prometheus::Registry;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use sui_types::committee::EpochId;
@@ -17,7 +14,7 @@ use sui_types::executable_transaction::VerifiedExecutableTransaction;
 use sui_types::messages_consensus::{
     ConsensusPosition, ConsensusTransaction, ConsensusTransactionKind,
 };
-use sui_types::transaction::{VerifiedCertificate, VerifiedTransaction};
+use sui_types::transaction::VerifiedTransaction;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -57,8 +54,6 @@ impl MockConsensusClient {
         mut tx_receiver: mpsc::Receiver<ConsensusTransaction>,
         consensus_mode: ConsensusMode,
     ) {
-        let checkpoint_service = Arc::new(CheckpointServiceNoop {});
-        let authority_metrics = Arc::new(AuthorityMetrics::new(&Registry::new()));
         while let Some(tx) = tx_receiver.recv().await {
             let Some(validator) = validator.upgrade() else {
                 debug!("validator shut down; exiting MockConsensusClient");
@@ -68,54 +63,61 @@ impl MockConsensusClient {
             let env = match consensus_mode {
                 ConsensusMode::Noop => ExecutionEnv::new(),
                 ConsensusMode::DirectSequencing => {
-                    let (_, assigned_versions) = epoch_store
-                        .process_consensus_transactions_for_tests(
-                            vec![SequencedConsensusTransaction::new_test(tx.clone())],
-                            &checkpoint_service,
-                            validator.get_object_cache_reader().as_ref(),
-                            &authority_metrics,
-                            true,
-                        )
-                        .await
-                        .unwrap();
-                    let assigned_versions = assigned_versions
-                        .0
-                        .into_iter()
-                        .next()
-                        .map(|(_, v)| v)
-                        .unwrap_or_default();
-                    ExecutionEnv::new().with_assigned_versions(assigned_versions)
+                    // Extract the executable transaction from the consensus transaction.
+                    // DEPRECATED: CertifiedTransaction and UserTransaction are no longer
+                    // produced (MFP uses UserTransactionV2).
+                    let executable_tx = match &tx.kind {
+                        ConsensusTransactionKind::UserTransactionV2(tx) => {
+                            Some(VerifiedExecutableTransaction::new_from_consensus(
+                                VerifiedTransaction::new_unchecked(tx.tx().clone()),
+                                0,
+                            ))
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(exec_tx) = executable_tx {
+                        // Use the simpler assign_shared_object_versions_for_tests API
+                        let assigned_versions = epoch_store
+                            .assign_shared_object_versions_for_tests(
+                                validator.get_object_cache_reader().as_ref(),
+                                std::slice::from_ref(&exec_tx),
+                            )
+                            .unwrap();
+
+                        let assigned_version = assigned_versions
+                            .into_map()
+                            .into_iter()
+                            .next()
+                            .map(|(_, v)| v)
+                            .unwrap_or_else(crate::authority::shared_object_version_manager::AssignedVersions::empty);
+                        ExecutionEnv::new().with_assigned_versions(assigned_version)
+                    } else {
+                        ExecutionEnv::new()
+                    }
                 }
             };
             match &tx.kind {
-                ConsensusTransactionKind::CertifiedTransaction(tx) => {
-                    if tx.is_consensus_tx() {
-                        validator.execution_scheduler().enqueue(
-                            vec![(
-                                VerifiedExecutableTransaction::new_from_certificate(
-                                    VerifiedCertificate::new_unchecked(*tx.clone()),
-                                )
-                                .into(),
-                                env,
-                            )],
-                            &epoch_store,
-                        );
-                    }
+                // DEPRECATED: CertifiedTransaction and UserTransaction are no longer produced.
+                ConsensusTransactionKind::CertifiedTransaction(_)
+                | ConsensusTransactionKind::UserTransaction(_) => {
+                    debug!(
+                        "Ignoring deprecated {:?} in MockConsensusClient",
+                        std::mem::discriminant(&tx.kind)
+                    );
                 }
-                ConsensusTransactionKind::UserTransaction(tx) => {
-                    if tx.is_consensus_tx() {
-                        validator.execution_scheduler().enqueue(
-                            vec![(
-                                VerifiedExecutableTransaction::new_from_consensus(
-                                    VerifiedTransaction::new_unchecked(*tx.clone()),
-                                    0,
-                                )
-                                .into(),
-                                env,
-                            )],
-                            &epoch_store,
-                        );
-                    }
+                ConsensusTransactionKind::UserTransactionV2(tx) if tx.tx().is_consensus_tx() => {
+                    validator.execution_scheduler().enqueue(
+                        vec![(
+                            VerifiedExecutableTransaction::new_from_consensus(
+                                VerifiedTransaction::new_unchecked(tx.tx().clone()),
+                                0,
+                            )
+                            .into(),
+                            env,
+                        )],
+                        &epoch_store,
+                    );
                 }
                 _ => {}
             }
@@ -159,7 +161,8 @@ impl SubmitToConsensus for MockConsensusClient {
         _epoch_store: &Arc<AuthorityPerEpochStore>,
         _timeout: Duration,
     ) -> SuiResult {
-        self.submit_impl(&[transaction.clone()]).map(|_response| ())
+        self.submit_impl(std::slice::from_ref(transaction))
+            .map(|_response| ())
     }
 }
 

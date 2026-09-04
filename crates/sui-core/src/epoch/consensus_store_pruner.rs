@@ -4,14 +4,16 @@
 use consensus_config::Epoch;
 use mysten_metrics::spawn_logged_monitored_task;
 use prometheus::{
-    register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_with_registry, IntCounter, IntCounterVec, IntGauge, Registry,
+    IntCounter, IntCounterVec, IntGauge, Registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry,
 };
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::{sync::mpsc, time::Instant};
-use tracing::{error, info, warn};
+#[cfg(not(tidehunter))]
+use tracing::warn;
+use tracing::{error, info};
 use typed_store::rocks::safe_drop_db;
 
 struct Metrics {
@@ -62,7 +64,9 @@ impl ConsensusStorePruner {
         let metrics = Metrics::new(registry);
 
         let _handle = spawn_logged_monitored_task!(async {
-            info!("Starting consensus store pruner with epoch retention {epoch_retention} and prune period {epoch_prune_period:?}");
+            info!(
+                "Starting consensus store pruner with epoch retention {epoch_retention} and prune period {epoch_prune_period:?}"
+            );
 
             let mut timeout = tokio::time::interval_at(
                 Instant::now() + Duration::from_secs(60), // allow some time for the node to boot etc before attempting to prune
@@ -158,31 +162,11 @@ impl ConsensusStorePruner {
             };
 
             if file_epoch < drop_boundary {
-                const WAIT_BEFORE_FORCE_DELETE: Duration = Duration::from_secs(5);
-                if let Err(e) = safe_drop_db(f.path(), WAIT_BEFORE_FORCE_DELETE).await {
-                    warn!(
-                        "Could not prune old consensus storage \"{:?}\" directory with safe approach. Will fallback to force delete: {:?}",
-                        f.path(),
-                        e
-                    );
-                    metrics
-                        .error_pruning_consensus_dbs
-                        .with_label_values(&["safe"])
-                        .inc();
-
-                    if let Err(err) = fs::remove_dir_all(f.path()) {
-                        error!(
-                            "Could not prune old consensus storage \"{:?}\" directory with force delete: {:?}",
-                            f.path(),
-                            err
-                        );
-                        metrics
-                            .error_pruning_consensus_dbs
-                            .with_label_values(&["force"])
-                            .inc();
-                    } else {
+                const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+                match safe_drop_db(f.path(), WAIT_TIMEOUT).await {
+                    Ok(()) => {
                         info!(
-                            "Successfully pruned consensus epoch storage directory with force delete: {:?}",
+                            "Successfully pruned consensus epoch storage directory: {:?}",
                             f.path()
                         );
                         let last_epoch = metrics.last_pruned_consensus_db_epoch.get();
@@ -191,16 +175,54 @@ impl ConsensusStorePruner {
                             .set(last_epoch.max(file_epoch as i64));
                         metrics.successfully_pruned_consensus_dbs.inc();
                     }
-                } else {
-                    info!(
-                        "Successfully pruned consensus epoch storage directory: {:?}",
-                        f.path()
-                    );
-                    let last_epoch = metrics.last_pruned_consensus_db_epoch.get();
-                    metrics
-                        .last_pruned_consensus_db_epoch
-                        .set(last_epoch.max(file_epoch as i64));
-                    metrics.successfully_pruned_consensus_dbs.inc();
+                    Err(e) => {
+                        #[cfg(not(tidehunter))]
+                        {
+                            warn!(
+                                "Could not prune old consensus storage \"{:?}\" directory with safe approach. Will fallback to force delete: {:?}",
+                                f.path(),
+                                e
+                            );
+                            metrics
+                                .error_pruning_consensus_dbs
+                                .with_label_values(&["safe"])
+                                .inc();
+
+                            if let Err(err) = fs::remove_dir_all(f.path()) {
+                                error!(
+                                    "Could not prune old consensus storage \"{:?}\" directory with force delete: {:?}",
+                                    f.path(),
+                                    err
+                                );
+                                metrics
+                                    .error_pruning_consensus_dbs
+                                    .with_label_values(&["force"])
+                                    .inc();
+                            } else {
+                                info!(
+                                    "Successfully pruned consensus epoch storage directory with force delete: {:?}",
+                                    f.path()
+                                );
+                                let last_epoch = metrics.last_pruned_consensus_db_epoch.get();
+                                metrics
+                                    .last_pruned_consensus_db_epoch
+                                    .set(last_epoch.max(file_epoch as i64));
+                                metrics.successfully_pruned_consensus_dbs.inc();
+                            }
+                        }
+                        #[cfg(tidehunter)]
+                        {
+                            error!(
+                                "Could not prune old consensus storage \"{:?}\" directory: {:?}",
+                                f.path(),
+                                e
+                            );
+                            metrics
+                                .error_pruning_consensus_dbs
+                                .with_label_values(&["safe"])
+                                .inc();
+                        }
+                    }
                 }
             }
         }

@@ -4,15 +4,18 @@
 use std::path::{Path, PathBuf};
 
 use move_binary_format::{
+    CompiledModule,
     compatibility::{self, Compatibility, InclusionCheck},
-    normalized, CompiledModule,
+    normalized,
 };
-use sui_move_build::{BuildConfig, SuiPackageHooks};
+use mysten_common::ZipDebugEqIteratorExt;
+use sui_move_build::BuildConfig;
 
 pub const TEST_DIR: &str = "tests";
 
-fn run_test(path: &Path) -> datatest_stable::Result<()> {
-    move_package::package_hooks::register_package_hooks(Box::new(SuiPackageHooks));
+#[cfg_attr(not(msim), tokio::main)]
+#[cfg_attr(msim, msim::main)]
+async fn run_test(path: &Path) -> datatest_stable::Result<()> {
     let mut pathbuf = path.to_path_buf();
     pathbuf.pop();
     pathbuf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(pathbuf);
@@ -20,10 +23,10 @@ fn run_test(path: &Path) -> datatest_stable::Result<()> {
     let upgraded_path = pathbuf.join("upgraded");
 
     let pool = &mut normalized::RcPool::new();
-    let base = compile(&base_path)?;
+    let base = compile(&base_path).await?;
     let base_normalized = normalize(pool, &base);
 
-    let upgraded = compile(&upgraded_path)?;
+    let upgraded = compile(&upgraded_path).await?;
     let upgraded_normalized = normalize(pool, &upgraded);
 
     check_all_compatibilities(
@@ -33,9 +36,10 @@ fn run_test(path: &Path) -> datatest_stable::Result<()> {
     )
 }
 
-fn compile(path: &Path) -> anyhow::Result<Vec<CompiledModule>> {
+async fn compile(path: &Path) -> anyhow::Result<Vec<CompiledModule>> {
     Ok(BuildConfig::new_for_testing()
-        .build(path)
+        .build_async(path)
+        .await
         .unwrap()
         .into_modules())
 }
@@ -72,7 +76,7 @@ fn check_all_compatibilities(
         .map(|compat| {
             let compatibility_checks: Vec<_> = base
                 .iter()
-                .zip(upgraded.iter())
+                .zip_debug_eq(upgraded.iter())
                 .map(|(base, upgraded)| {
                     format!(
                         "{}::{}:\n\tbase->upgrade: {}\n\tupgrade->base: {}",
@@ -98,7 +102,7 @@ fn check_all_compatibilities(
         .map(|compat| {
             let compatibility_checks: Vec<_> = base
                 .iter()
-                .zip(upgraded.iter())
+                .zip_debug_eq(upgraded.iter())
                 .map(|(base, upgraded)| {
                     format!(
                         "{}::{}:\n\tbase->upgrade: {}\n\tupgrade->base: {}",
@@ -124,4 +128,15 @@ fn check_all_compatibilities(
     Ok(())
 }
 
+#[cfg(not(msim))]
 datatest_stable::harness!(run_test, TEST_DIR, r".*\.package$");
+
+// These tests only compile Move packages and compare them, with no network or
+// timing behavior for the simulator to perturb, so running them under msim only
+// costs time. Expose an empty harness so nextest still sees a well-formed binary.
+#[cfg(msim)]
+fn main() {
+    // Referenced so the otherwise-unused test fn does not trip dead-code warnings.
+    let _ = (run_test, TEST_DIR);
+    datatest_stable::runner(&[]);
+}

@@ -1,17 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::ExecutionEffects;
+use crate::ValidatorProxy;
 use crate::drivers::Interval;
 use crate::system_state_observer::SystemStateObserver;
 use crate::workloads::payload::Payload;
 use crate::workloads::workload::{
-    ExpectedFailureType, WorkloadBuilder, ESTIMATED_COMPUTATION_COST, MAX_GAS_FOR_TESTING,
-    STORAGE_COST_PER_COIN,
+    ESTIMATED_COMPUTATION_COST, ExpectedFailureType, MAX_GAS_FOR_TESTING, STORAGE_COST_PER_COIN,
+    WorkloadBuilder,
 };
 use crate::workloads::{Gas, GasCoinConfig, Workload, WorkloadBuilderInfo, WorkloadParams};
-use crate::ExecutionEffects;
-use crate::ValidatorProxy;
 use async_trait::async_trait;
+use mysten_common::ZipDebugEqIteratorExt;
 use rand::seq::IteratorRandom;
 use std::collections::HashMap;
 use std::fmt;
@@ -54,6 +55,7 @@ impl ExpectedFailurePayload {
                 tx
             }
             ExpectedFailureType::Random => unreachable!(),
+            ExpectedFailureType::ObjectLockConflict => unreachable!(),
             ExpectedFailureType::NoFailure => unreachable!(),
         }
     }
@@ -214,14 +216,16 @@ pub struct ExpectedFailureWorkload {
 impl Workload<dyn Payload> for ExpectedFailureWorkload {
     async fn init(
         &mut self,
-        _proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        _execution_proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        _fullnode_proxies: Vec<Arc<dyn ValidatorProxy + Sync + Send>>,
         _system_state_observer: Arc<SystemStateObserver>,
     ) {
     }
 
     async fn make_test_payloads(
         &self,
-        _proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        _execution_proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        _fullnode_proxies: Vec<Arc<dyn ValidatorProxy + Sync + Send>>,
         system_state_observer: Arc<SystemStateObserver>,
     ) -> Vec<Box<dyn Payload>> {
         let (transfer_tokens, payload_gas) = self.payload_gas.split_at(self.num_tokens as usize);
@@ -244,7 +248,7 @@ impl Workload<dyn Payload> for ExpectedFailureWorkload {
         }
         let refs: Vec<(Vec<Gas>, Gas)> = transfer_gas
             .into_iter()
-            .zip(transfer_tokens.iter())
+            .zip_debug_eq(transfer_tokens.iter())
             .map(|(g, t)| (g, t.clone()))
             .collect();
         refs.iter()

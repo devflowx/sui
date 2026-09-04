@@ -1,39 +1,36 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::bail;
 use async_trait::async_trait;
 use fullnode_reconfig_observer::FullNodeReconfigObserver;
-use prometheus::Registry;
-use rand::Rng;
+use futures::TryStreamExt;
+use mysten_common::{fatal, in_antithesis, random::get_rng};
+use rand::{Rng, seq::IteratorRandom};
 use sui_config::genesis::Genesis;
 use sui_core::{
     authority_aggregator::{AuthorityAggregator, AuthorityAggregatorBuilder},
     authority_client::NetworkAuthorityClient,
-    quorum_driver::{
-        reconfig_observer::ReconfigObserver, QuorumDriver, QuorumDriverHandler,
-        QuorumDriverHandlerBuilder, QuorumDriverMetrics,
-    },
+    epoch::committee_store::CommitteeStore,
+    safe_client::SafeClientMetricsBase,
     transaction_driver::{
-        choose_transaction_driver_percentage, SubmitTransactionOptions, TransactionDriver,
-        TransactionDriverMetrics,
+        ReconfigObserver, SubmitTransactionOptions, TransactionDriver, TransactionDriverMetrics,
     },
     validator_client_monitor::ValidatorClientMetrics,
 };
-use sui_json_rpc_types::{
-    SuiObjectDataOptions, SuiObjectResponse, SuiObjectResponseQuery, SuiTransactionBlockEffects,
-    SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions,
-};
 use sui_protocol_config::ProtocolConfig;
-use sui_sdk::{SuiClient, SuiClientBuilder};
-use sui_types::quorum_driver_types::EffectsFinalityInfo;
-use sui_types::quorum_driver_types::FinalizedEffects;
-use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
+use sui_rpc_api::{Client, client::ExecutedTransaction};
 use sui_types::transaction::Argument;
 use sui_types::transaction::CallArg;
 use sui_types::transaction::ObjectArg;
+use sui_types::transaction_driver_types::EffectsFinalityInfo;
+use sui_types::transaction_driver_types::FinalizedEffects;
 use sui_types::{
     base_types::ObjectID,
     committee::{Committee, EpochId},
@@ -43,24 +40,52 @@ use sui_types::{
 use sui_types::{base_types::ObjectRef, crypto::AuthorityStrongQuorumSignInfo, object::Owner};
 use sui_types::{base_types::SequenceNumber, gas_coin::GasCoin};
 use sui_types::{
+    base_types::TransactionDigest,
+    messages_grpc::{
+        RawSubmitTxRequest, SubmitTxRequest, SubmitTxResult, SubmitTxType, WaitForEffectsRequest,
+        WaitForEffectsResponse,
+    },
+    programmable_transaction_builder::ProgrammableTransactionBuilder,
+};
+use sui_types::{
     base_types::{AuthorityName, SuiAddress},
     sui_system_state::SuiSystemStateTrait,
 };
-use sui_types::{digests::ChainIdentifier, gas::GasCostSummary};
+use sui_types::{
+    digests::ChainIdentifier, gas::GasCostSummary, transaction::SharedObjectMutability,
+};
 use sui_types::{
     effects::{TransactionEffectsAPI, TransactionEvents},
-    execution_status::ExecutionFailureStatus,
+    execution_status::{ExecutionErrorKind, ExecutionFailure, ExecutionStatus},
 };
-use sui_types::{
-    messages_grpc::SubmitTxRequest,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-};
-use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use sui_types::{gas_coin::GAS, sui_system_state::sui_system_state_summary::SuiSystemStateSummary};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info, instrument, warn};
 
-use crate::drivers::bench_driver::ClientType;
+use crate::drivers::{SubmissionAmplification, SubmissionAmplificationSample, ValidatorSelection};
 
 pub mod bank;
+
+/// Shared metrics for benchmark proxies that use TransactionDriver.
+/// Creating these metrics multiple times with the same registry would cause
+/// duplicate metric registration panics, so they must be shared.
+#[derive(Clone)]
+pub struct BenchmarkProxyMetrics {
+    pub safe_client_metrics_base: SafeClientMetricsBase,
+    pub transaction_driver_metrics: Arc<TransactionDriverMetrics>,
+    pub client_metrics: Arc<ValidatorClientMetrics>,
+}
+
+impl BenchmarkProxyMetrics {
+    pub fn new(registry: &prometheus::Registry) -> Self {
+        Self {
+            safe_client_metrics_base: SafeClientMetricsBase::new(registry),
+            transaction_driver_metrics: Arc::new(TransactionDriverMetrics::new(registry)),
+            client_metrics: Arc::new(ValidatorClientMetrics::new(registry)),
+        }
+    }
+}
 pub mod benchmark_setup;
 pub mod drivers;
 pub mod fullnode_reconfig_observer;
@@ -69,7 +94,6 @@ pub mod options;
 pub mod system_state_observer;
 pub mod util;
 pub mod workloads;
-use sui_types::quorum_driver_types::{QuorumDriverError, QuorumDriverResponse};
 
 #[derive(Debug)]
 /// A wrapper on execution results to accommodate different types of
@@ -77,31 +101,32 @@ use sui_types::quorum_driver_types::{QuorumDriverError, QuorumDriverResponse};
 #[allow(clippy::large_enum_variant)]
 pub enum ExecutionEffects {
     FinalizedTransactionEffects(FinalizedEffects, TransactionEvents),
-    SuiTransactionBlockEffects(SuiTransactionBlockEffects),
+    ExecutedTransaction(ExecutedTransaction),
 }
 
 impl ExecutionEffects {
+    pub fn digest(&self) -> TransactionDigest {
+        match self {
+            ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
+                *effects.data().transaction_digest()
+            }
+            ExecutionEffects::ExecutedTransaction(txn) => *txn.effects.transaction_digest(),
+        }
+    }
+
     pub fn mutated(&self) -> Vec<(ObjectRef, Owner)> {
         match self {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 effects.data().mutated().to_vec()
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => sui_tx_effects
-                .mutated()
-                .iter()
-                .map(|refe| (refe.reference.to_object_ref(), refe.owner.clone()))
-                .collect(),
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.mutated(),
         }
     }
 
     pub fn created(&self) -> Vec<(ObjectRef, Owner)> {
         match self {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => effects.data().created(),
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => sui_tx_effects
-                .created()
-                .iter()
-                .map(|refe| (refe.reference.to_object_ref(), refe.owner.clone()))
-                .collect(),
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.created(),
         }
     }
 
@@ -110,11 +135,7 @@ impl ExecutionEffects {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 effects.data().deleted().to_vec()
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => sui_tx_effects
-                .deleted()
-                .iter()
-                .map(|refe| refe.to_object_ref())
-                .collect(),
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.deleted(),
         }
     }
 
@@ -126,20 +147,39 @@ impl ExecutionEffects {
                     _ => None,
                 }
             }
-            ExecutionEffects::SuiTransactionBlockEffects(_) => None,
+            ExecutionEffects::ExecutedTransaction(_) => None,
         }
     }
 
     pub fn gas_object(&self) -> (ObjectRef, Owner) {
         match self {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
+                effects.data().gas_object().unwrap()
+            }
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.gas_object().unwrap(),
+        }
+    }
+
+    /// Find the post-execution `ObjectRef` of a specific tracked object — typically the
+    /// gas coin a workload is chaining transactions off. Prefer this over `gas_object()`
+    /// in code paths that may see the IFFW short-circuit: those transactions return
+    /// `effects.gas_object() == None` (the executor never builds gas-charge metadata),
+    /// but the input gas coin is still version-bumped via `ensure_active_inputs_mutated`
+    /// and shows up in `mutated()`.
+    pub fn updated_gas(&self, prev_id: ObjectID) -> Option<ObjectRef> {
+        if let Some((obj_ref, _)) = match self {
+            ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 effects.data().gas_object()
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => {
-                let refe = &sui_tx_effects.gas_object();
-                (refe.reference.to_object_ref(), refe.owner.clone())
-            }
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.gas_object(),
+        } && obj_ref.0 == prev_id
+        {
+            return Some(obj_ref);
         }
+        self.mutated()
+            .into_iter()
+            .find(|(obj_ref, _)| obj_ref.0 == prev_id)
+            .map(|(obj_ref, _)| obj_ref)
     }
 
     pub fn sender(&self) -> SuiAddress {
@@ -148,7 +188,8 @@ impl ExecutionEffects {
             Owner::ObjectOwner(_)
             | Owner::Shared { .. }
             | Owner::Immutable
-            | Owner::ConsensusAddressOwner { .. } => unreachable!(), // owner of gas object is always an address
+            | Owner::ConsensusAddressOwner { .. }
+            | Owner::Party { .. } => unreachable!(), // owner of gas object is always an address
         }
     }
 
@@ -157,9 +198,7 @@ impl ExecutionEffects {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 effects.data().status().is_ok()
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => {
-                sui_tx_effects.status().is_ok()
-            }
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.status().is_ok(),
         }
     }
 
@@ -167,21 +206,91 @@ impl ExecutionEffects {
         match self {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 match effects.data().status() {
-                    sui_types::execution_status::ExecutionStatus::Success => false,
-                    sui_types::execution_status::ExecutionStatus::Failure {
+                    ExecutionStatus::Success => false,
+                    ExecutionStatus::Failure(ExecutionFailure {
                         error:
-                            ExecutionFailureStatus::ExecutionCancelledDueToSharedObjectCongestion {
-                                ..
-                            },
+                            ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { .. },
                         ..
-                    } => true,
+                    }) => true,
                     _ => false,
                 }
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => {
-                let status = format!("{}", sui_tx_effects.status());
-                status.contains("ExecutionCancelledDueToSharedObjectCongestion")
+            ExecutionEffects::ExecutedTransaction(txn) => match txn.effects.status() {
+                ExecutionStatus::Success => false,
+                ExecutionStatus::Failure(ExecutionFailure {
+                    error: ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { .. },
+                    ..
+                }) => true,
+                _ => false,
+            },
+        }
+    }
+
+    pub fn is_insufficient_funds(&self) -> bool {
+        match self {
+            ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
+                match effects.data().status() {
+                    ExecutionStatus::Success => false,
+                    ExecutionStatus::Failure(ExecutionFailure {
+                        error: ExecutionErrorKind::InsufficientFundsForWithdraw,
+                        ..
+                    }) => true,
+                    _ => false,
+                }
             }
+            ExecutionEffects::ExecutedTransaction(txn) => match txn.effects.status() {
+                ExecutionStatus::Success => false,
+                ExecutionStatus::Failure(ExecutionFailure {
+                    error: ExecutionErrorKind::InsufficientFundsForWithdraw,
+                    ..
+                }) => true,
+                _ => false,
+            },
+        }
+    }
+
+    pub fn is_invalid_transaction(&self) -> bool {
+        match self {
+            ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
+                match effects.data().status() {
+                    ExecutionStatus::Failure(ExecutionFailure { error, .. }) => {
+                        matches!(
+                            error,
+                            ExecutionErrorKind::VMVerificationOrDeserializationError
+                                | ExecutionErrorKind::VMInvariantViolation
+                                | ExecutionErrorKind::FunctionNotFound
+                                | ExecutionErrorKind::ArityMismatch
+                                | ExecutionErrorKind::TypeArityMismatch
+                                | ExecutionErrorKind::NonEntryFunctionInvoked
+                                | ExecutionErrorKind::CommandArgumentError { .. }
+                                | ExecutionErrorKind::TypeArgumentError { .. }
+                                | ExecutionErrorKind::UnusedValueWithoutDrop { .. }
+                                | ExecutionErrorKind::InvalidPublicFunctionReturnType { .. }
+                                | ExecutionErrorKind::InvalidTransferObject
+                        )
+                    }
+                    _ => false,
+                }
+            }
+            ExecutionEffects::ExecutedTransaction(txn) => match txn.effects.status() {
+                ExecutionStatus::Failure(ExecutionFailure { error, .. }) => {
+                    matches!(
+                        error,
+                        ExecutionErrorKind::VMVerificationOrDeserializationError
+                            | ExecutionErrorKind::VMInvariantViolation
+                            | ExecutionErrorKind::FunctionNotFound
+                            | ExecutionErrorKind::ArityMismatch
+                            | ExecutionErrorKind::TypeArityMismatch
+                            | ExecutionErrorKind::NonEntryFunctionInvoked
+                            | ExecutionErrorKind::CommandArgumentError { .. }
+                            | ExecutionErrorKind::TypeArgumentError { .. }
+                            | ExecutionErrorKind::UnusedValueWithoutDrop { .. }
+                            | ExecutionErrorKind::InvalidPublicFunctionReturnType { .. }
+                            | ExecutionErrorKind::InvalidTransferObject
+                    )
+                }
+                _ => false,
+            },
         }
     }
 
@@ -190,8 +299,8 @@ impl ExecutionEffects {
             ExecutionEffects::FinalizedTransactionEffects(effects, ..) => {
                 format!("{:#?}", effects.data().status())
             }
-            ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => {
-                format!("{:#?}", sui_tx_effects.status())
+            ExecutionEffects::ExecutedTransaction(txn) => {
+                format!("{:#?}", txn.effects.status())
             }
         }
     }
@@ -201,9 +310,7 @@ impl ExecutionEffects {
             crate::ExecutionEffects::FinalizedTransactionEffects(a, _) => {
                 a.data().gas_cost_summary().clone()
             }
-            crate::ExecutionEffects::SuiTransactionBlockEffects(b) => {
-                std::convert::Into::<GasCostSummary>::into(b.gas_cost_summary().clone())
-            }
+            ExecutionEffects::ExecutedTransaction(txn) => txn.effects.gas_cost_summary().clone(),
         }
     }
 
@@ -239,6 +346,8 @@ impl ExecutionEffects {
 pub trait ValidatorProxy {
     async fn get_object(&self, object_id: ObjectID) -> Result<Object, anyhow::Error>;
 
+    async fn get_sui_address_balance(&self, address: SuiAddress) -> Result<u64, anyhow::Error>;
+
     async fn get_owned_objects(
         &self,
         account_address: SuiAddress,
@@ -246,10 +355,22 @@ pub trait ValidatorProxy {
 
     async fn get_latest_system_state_object(&self) -> Result<SuiSystemStateSummary, anyhow::Error>;
 
-    async fn execute_transaction_block(
+    async fn execute_transaction_block(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects>;
+
+    /// Submit a transaction with optional duplicate/amplified validator traffic.
+    /// Only the local validator proxy supports this direct validator submission path.
+    async fn execute_transaction_block_with_submission_amplification(
         &self,
         tx: Transaction,
-    ) -> (ClientType, anyhow::Result<ExecutionEffects>);
+        submission_amplification: SubmissionAmplification,
+    ) -> anyhow::Result<ExecutionEffects> {
+        if submission_amplification.is_enabled() {
+            bail!(
+                "duplicate/amplified validator submissions are only supported by LocalValidatorAggregatorProxy"
+            );
+        }
+        self.execute_transaction_block(tx).await
+    }
 
     fn clone_committee(&self) -> Arc<Committee>;
 
@@ -258,60 +379,61 @@ pub trait ValidatorProxy {
     fn clone_new(&self) -> Box<dyn ValidatorProxy + Send + Sync>;
 
     async fn get_validators(&self) -> Result<Vec<SuiAddress>, anyhow::Error>;
+
+    /// Execute multiple transactions as a soft bundle.
+    /// Soft bundles guarantee that all transactions are ordered together in consensus,
+    /// preserving their relative order within the bundle.
+    /// Returns a vector of (digest, response) for each transaction.
+    async fn execute_soft_bundle(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> anyhow::Result<Vec<(TransactionDigest, WaitForEffectsResponse)>>;
+
+    fn get_chain_identifier(&self) -> ChainIdentifier;
+
+    async fn is_transaction_checkpointed(&self, digest: &TransactionDigest)
+    -> anyhow::Result<bool>;
 }
 
 // TODO: Eventually remove this proxy because we shouldn't rely on validators to read objects.
 pub struct LocalValidatorAggregatorProxy {
-    _qd_handler: QuorumDriverHandler<NetworkAuthorityClient>,
-    // Stress client does not verify individual validator signatures since this is very expensive
-    qd: Arc<QuorumDriver<NetworkAuthorityClient>>,
     td: Arc<TransactionDriver<NetworkAuthorityClient>>,
     committee: Committee,
     clients: BTreeMap<AuthorityName, NetworkAuthorityClient>,
-    td_percentage: u8,
+    chain_identifier: ChainIdentifier,
+    sui_client: Client,
 }
 
 impl LocalValidatorAggregatorProxy {
     pub async fn from_genesis(
         genesis: &Genesis,
-        registry: &Registry,
         reconfig_fullnode_rpc_url: &str,
-        transaction_driver_percentage: Option<u8>,
+        metrics: &BenchmarkProxyMetrics,
     ) -> Self {
         let (aggregator, clients) = AuthorityAggregatorBuilder::from_genesis(genesis)
-            .with_registry(registry)
+            .with_safe_client_metrics_base(metrics.safe_client_metrics_base.clone())
             .build_network_clients();
-        let committee = genesis.committee().unwrap();
-
-        let td_percentage = if let Some(tx_driver_percentage) = transaction_driver_percentage {
-            tx_driver_percentage
-        } else {
-            // We don't need to gate transaction driver for benchmark since we
-            // are not running it on mainnet.
-            choose_transaction_driver_percentage(None)
-        };
-
+        let committee = genesis.committee();
+        let chain_identifier = ChainIdentifier::from(*genesis.checkpoint().digest());
         Self::new_impl(
             aggregator,
-            registry,
             reconfig_fullnode_rpc_url,
             clients,
             committee,
-            td_percentage,
+            chain_identifier,
+            metrics,
         )
         .await
     }
 
     async fn new_impl(
         aggregator: AuthorityAggregator<NetworkAuthorityClient>,
-        registry: &Registry,
         reconfig_fullnode_rpc_url: &str,
         clients: BTreeMap<AuthorityName, NetworkAuthorityClient>,
         committee: Committee,
-        td_percentage: u8,
+        chain_identifier: ChainIdentifier,
+        metrics: &BenchmarkProxyMetrics,
     ) -> Self {
-        let quorum_driver_metrics = Arc::new(QuorumDriverMetrics::new(registry));
-        let transaction_driver_metrics = Arc::new(TransactionDriverMetrics::new(registry));
         let (aggregator, reconfig_observer): (
             Arc<_>,
             Arc<dyn ReconfigObserver<NetworkAuthorityClient> + Sync + Send>,
@@ -326,35 +448,36 @@ impl LocalValidatorAggregatorProxy {
                     reconfig_fullnode_rpc_url,
                     committee_store,
                     aggregator.safe_client_metrics_base.clone(),
-                    aggregator.metrics.clone(),
                 )
                 .await,
             );
             (Arc::new(aggregator), reconfig_observer)
         };
 
-        let qd_handler_builder =
-            QuorumDriverHandlerBuilder::new(aggregator.clone(), quorum_driver_metrics.clone())
-                .with_reconfig_observer(reconfig_observer.clone());
-        let qd_handler = qd_handler_builder.start();
-        let qd = qd_handler.clone_quorum_driver();
-        let client_metrics = Arc::new(ValidatorClientMetrics::new(registry));
-
         // For benchmark, pass None to use default validator client monitor config
         let td = TransactionDriver::new(
             aggregator,
             reconfig_observer,
-            transaction_driver_metrics,
+            metrics.transaction_driver_metrics.clone(),
             None,
-            client_metrics,
+            metrics.client_metrics.clone(),
         );
+
+        let http_url = if reconfig_fullnode_rpc_url.starts_with("http://")
+            || reconfig_fullnode_rpc_url.starts_with("https://")
+        {
+            reconfig_fullnode_rpc_url.to_string()
+        } else {
+            format!("http://{reconfig_fullnode_rpc_url}")
+        };
+        let sui_client = Client::new(&http_url).expect("Failed to create RPC client");
+
         Self {
-            _qd_handler: qd_handler,
-            qd,
             td,
             clients,
             committee,
-            td_percentage,
+            chain_identifier,
+            sui_client,
         }
     }
 
@@ -373,12 +496,112 @@ impl LocalValidatorAggregatorProxy {
             response.events.unwrap_or_default(),
         ))
     }
+
+    async fn submit_transaction_with_submission_amplification(
+        &self,
+        tx: Transaction,
+        submission_amplification: SubmissionAmplification,
+    ) -> anyhow::Result<ExecutionEffects> {
+        use sui_core::authority_client::AuthorityAPI;
+
+        const EXTRA_SUBMIT_TIMEOUT: Duration = Duration::from_secs(2);
+        const PREFERRED_VALIDATOR_LATENCY_DELTA: f64 = 0.02;
+
+        let sample = {
+            let mut rng = rand::thread_rng();
+            submission_amplification.sample(&mut rng)
+        };
+        if sample.total_submissions() == 1 {
+            return self.submit_transaction_block(tx).await;
+        }
+
+        let tx_digest = *tx.digest();
+        let validators = self.select_validators_for_submission_amplification(
+            sample,
+            PREFERRED_VALIDATOR_LATENCY_DELTA,
+        )?;
+        let request = SubmitTxRequest::new_transaction(tx.clone());
+        let mut additional_requests = JoinSet::new();
+
+        for (validator_name, client) in validators.iter() {
+            for _ in 0..sample.copies_per_validator {
+                let req = request.clone();
+                let client = client.clone();
+                additional_requests.spawn(async move {
+                    let _ =
+                        timeout(EXTRA_SUBMIT_TIMEOUT, client.submit_transaction(req, None)).await;
+                });
+            }
+            debug!(
+                ?tx_digest,
+                ?validator_name,
+                copies_per_validator = sample.copies_per_validator,
+                "spawned direct validator submissions for amplification"
+            );
+        }
+
+        debug!(
+            ?tx_digest,
+            ?sample,
+            "submitting transaction with extra direct validator amplification"
+        );
+
+        let result = self.submit_transaction_block(tx).await;
+        additional_requests.abort_all();
+        result
+    }
+
+    fn select_validators_for_submission_amplification(
+        &self,
+        sample: SubmissionAmplificationSample,
+        preferred_validator_latency_delta: f64,
+    ) -> anyhow::Result<Vec<(AuthorityName, NetworkAuthorityClient)>> {
+        let num_validators = sample
+            .validators_per_tx
+            .min(self.committee.num_members())
+            .min(self.clients.len());
+
+        let validator_names = match sample.validator_selection {
+            ValidatorSelection::Random => {
+                let mut rng = rand::thread_rng();
+                self.clients
+                    .keys()
+                    .copied()
+                    .choose_multiple(&mut rng, num_validators)
+            }
+            ValidatorSelection::HighestPerformance => self
+                .td
+                .select_preferred_validators(preferred_validator_latency_delta)
+                .into_iter()
+                .filter(|name| self.clients.contains_key(name))
+                .take(num_validators)
+                .collect(),
+        };
+
+        let validators = validator_names
+            .into_iter()
+            .filter_map(|name| {
+                self.clients
+                    .get(&name)
+                    .cloned()
+                    .map(|client| (name, client))
+            })
+            .collect::<Vec<_>>();
+        if validators.is_empty() {
+            bail!("No validators available for submission amplification");
+        }
+        Ok(validators)
+    }
 }
 
 #[async_trait]
 impl ValidatorProxy for LocalValidatorAggregatorProxy {
+    async fn get_sui_address_balance(&self, _: SuiAddress) -> Result<u64, anyhow::Error> {
+        unimplemented!("Not available for LocalValidatorAggregatorProxy");
+    }
+
     async fn get_object(&self, object_id: ObjectID) -> Result<Object, anyhow::Error> {
-        let auth_agg = self.qd.authority_aggregator().load();
+        let auth_agg = self.td.authority_aggregator().load();
         Ok(auth_agg
             .get_latest_object_version_for_testing(object_id)
             .await?)
@@ -392,83 +615,556 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
     }
 
     async fn get_latest_system_state_object(&self) -> Result<SuiSystemStateSummary, anyhow::Error> {
-        let auth_agg = self.qd.authority_aggregator().load();
+        let auth_agg = self.td.authority_aggregator().load();
         Ok(auth_agg
             .get_latest_system_state_object_for_testing()
             .await?
             .into_sui_system_state_summary())
     }
 
-    async fn execute_transaction_block(
+    async fn execute_transaction_block(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects> {
+        let tx_digest = *tx.digest();
+        debug!("Using TransactionDriver for transaction {:?}", tx_digest);
+        self.submit_transaction_block(tx).await
+    }
+
+    async fn execute_transaction_block_with_submission_amplification(
         &self,
         tx: Transaction,
-    ) -> (ClientType, anyhow::Result<ExecutionEffects>) {
-        let tx_digest = *tx.digest();
-        if self.td_percentage > 0 {
-            let random_value = rand::thread_rng().gen_range(1..=100);
-            if random_value <= self.td_percentage {
-                debug!("Using TransactionDriver for transaction {:?}", tx_digest);
-                return (
-                    ClientType::TransactionDriver,
-                    self.submit_transaction_block(tx).await,
-                );
+        submission_amplification: SubmissionAmplification,
+    ) -> anyhow::Result<ExecutionEffects> {
+        self.submit_transaction_with_submission_amplification(tx, submission_amplification)
+            .await
+    }
+
+    fn clone_committee(&self) -> Arc<Committee> {
+        self.td.authority_aggregator().load().committee.clone()
+    }
+
+    fn get_current_epoch(&self) -> EpochId {
+        self.td.authority_aggregator().load().committee.epoch
+    }
+
+    fn clone_new(&self) -> Box<dyn ValidatorProxy + Send + Sync> {
+        Box::new(Self {
+            td: self.td.clone(),
+            clients: self.clients.clone(),
+            committee: self.committee.clone(),
+            chain_identifier: self.chain_identifier,
+            sui_client: self.sui_client.clone(),
+        })
+    }
+
+    async fn get_validators(&self) -> Result<Vec<SuiAddress>, anyhow::Error> {
+        let system_state = self.get_latest_system_state_object().await?;
+        Ok(system_state
+            .active_validators
+            .iter()
+            .map(|v| v.sui_address)
+            .collect())
+    }
+
+    async fn execute_soft_bundle(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> anyhow::Result<Vec<(TransactionDigest, WaitForEffectsResponse)>> {
+        execute_soft_bundle_with_retries(&self.td, &txs).await
+    }
+
+    fn get_chain_identifier(&self) -> ChainIdentifier {
+        self.chain_identifier
+    }
+
+    async fn is_transaction_checkpointed(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Result<bool, anyhow::Error> {
+        match self.sui_client.clone().get_transaction(digest).await {
+            Ok(executed_tx) => Ok(executed_tx.checkpoint.is_some()),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+async fn warn_and_backoff_for_retry(
+    digests: &[TransactionDigest],
+    retry_cnt: &mut u32,
+    reason: impl std::fmt::Display,
+) {
+    let delay = Duration::from_millis(rand::thread_rng().gen_range(100..1000));
+    warn!(
+        ?digests,
+        retry_cnt = *retry_cnt,
+        "Soft bundle retry: {}. Sleeping for {:?} ...",
+        reason,
+        delay,
+    );
+    *retry_cnt += 1;
+    sleep(delay).await;
+}
+
+#[instrument(level = "debug", skip_all, fields(digests = ?txs.iter().map(|tx| *tx.digest()).collect::<Vec<_>>()))]
+async fn execute_soft_bundle_with_retries(
+    td: &TransactionDriver<NetworkAuthorityClient>,
+    txs: &[Transaction],
+) -> anyhow::Result<Vec<(TransactionDigest, WaitForEffectsResponse)>> {
+    use sui_network::tonic::IntoRequest;
+
+    let digests: Vec<_> = txs.iter().map(|tx| *tx.digest()).collect();
+
+    let mut retry_cnt = 0;
+    let max_retries = 10;
+    let min_retry_duration = Duration::from_secs(60);
+    let start = Instant::now();
+
+    loop {
+        let request = RawSubmitTxRequest {
+            transactions: txs
+                .iter()
+                .map(|tx| bcs::to_bytes(tx).unwrap().into())
+                .collect(),
+            submit_type: SubmitTxType::SoftBundle.into(),
+        };
+
+        // Get a validator client - use grpc client directly for soft bundle
+        // Re-select on each retry in case the previous validator is halting
+        let auth_agg = td.authority_aggregator().load();
+        let safe_client = auth_agg
+            .authority_clients
+            .values()
+            .choose(&mut get_rng())
+            .unwrap();
+
+        let mut validator_client = match safe_client.authority_client().get_client_for_testing() {
+            Ok(client) => client,
+            Err(err) => {
+                // Check if this is a retriable error before retrying
+                if err.is_retryable().0
+                    && (retry_cnt < max_retries || start.elapsed() < min_retry_duration)
+                {
+                    warn_and_backoff_for_retry(
+                        &digests,
+                        &mut retry_cnt,
+                        format!("get validator client failed: {err:?}"),
+                    )
+                    .await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        };
+
+        debug!("submitting soft bundle via grpc");
+
+        // Submit the soft bundle via grpc
+        let result = match validator_client
+            .submit_transaction(request.into_request())
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(err) => {
+                debug!("error submitting soft bundle via grpc: {:?}", err);
+                // Convert tonic error to SuiError to check if retriable
+                let sui_error: sui_types::error::SuiError = err.into();
+                if sui_error.is_retryable().0
+                    && (retry_cnt < max_retries || start.elapsed() < min_retry_duration)
+                {
+                    warn_and_backoff_for_retry(
+                        &digests,
+                        &mut retry_cnt,
+                        format!("submission failed: {sui_error:?}"),
+                    )
+                    .await;
+                    continue;
+                }
+                return Err(sui_error.into());
+            }
+        };
+
+        if result.results.len() != txs.len() {
+            fatal!(
+                "Expected {} results, got {}",
+                txs.len(),
+                result.results.len()
+            );
+        }
+
+        // Extract consensus positions from submission results
+        // Track which transactions were submitted vs rejected/executed
+        // Index -> Either consensus position (for waiting) or immediate response
+        enum SubmissionOutcome {
+            Submitted(sui_types::messages_consensus::ConsensusPosition),
+            ImmediateResponse(WaitForEffectsResponse),
+        }
+        let mut outcomes: Vec<SubmissionOutcome> = Vec::with_capacity(txs.len());
+        let mut should_retry = false;
+        let mut last_error = None;
+
+        for raw_result in result.results.iter() {
+            let submit_result: SubmitTxResult = raw_result.clone().try_into()?;
+            match submit_result {
+                SubmitTxResult::Submitted { consensus_position } => {
+                    outcomes.push(SubmissionOutcome::Submitted(consensus_position));
+                }
+                SubmitTxResult::Executed {
+                    effects_digest,
+                    details,
+                } => {
+                    // Transaction was already executed - return the effects directly
+                    outcomes.push(SubmissionOutcome::ImmediateResponse(
+                        WaitForEffectsResponse::Executed {
+                            effects_digest,
+                            details,
+                        },
+                    ));
+                }
+                SubmitTxResult::Rejected { error } => {
+                    // Check if this is a retriable error (e.g., ValidatorHaltedAtEpochEnd)
+                    // If ANY transaction has a retriable error, retry the whole bundle
+                    if error.is_retryable().0
+                        && (retry_cnt < max_retries || start.elapsed() < min_retry_duration)
+                    {
+                        should_retry = true;
+                        last_error = Some(error);
+                        break;
+                    }
+                    // Non-retriable rejection - record as rejected response
+                    outcomes.push(SubmissionOutcome::ImmediateResponse(
+                        WaitForEffectsResponse::Rejected { error: Some(error) },
+                    ));
+                }
             }
         }
 
-        debug!("Using QuorumDriver for transaction {tx_digest:?}");
+        if should_retry {
+            warn_and_backoff_for_retry(
+                &digests,
+                &mut retry_cnt,
+                format!("submission rejected: {last_error:?}"),
+            )
+            .await;
+            continue;
+        }
+
+        // Collect indices and consensus positions for transactions that need to wait for effects
+        let wait_indices: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, outcome)| match outcome {
+                SubmissionOutcome::Submitted(_) => Some(i),
+                SubmissionOutcome::ImmediateResponse(_) => None,
+            })
+            .collect();
+
+        let wait_futures: Vec<_> = wait_indices
+            .iter()
+            .map(|&i| {
+                let consensus_position = match &outcomes[i] {
+                    SubmissionOutcome::Submitted(pos) => pos,
+                    _ => unreachable!(),
+                };
+                let request = WaitForEffectsRequest {
+                    transaction_digest: Some(digests[i]),
+                    consensus_position: Some(*consensus_position),
+                    include_details: true,
+                    ping_type: None,
+                };
+                safe_client.wait_for_effects(request, None)
+            })
+            .collect();
+
+        let wait_responses = futures::future::join_all(wait_futures).await;
+
+        // Re-submit if any wait_for_effects returned a retriable signal (Rejected
+        // with a retriable reason, or Expired) — the tx was never ordered.
+        // TODO: when error is None, poll other validators for a reject reason
+        // before giving up — our chosen validator didn't vote reject so won't
+        // have one cached, but a different validator may.
+        let retriable_wait_failure = wait_responses.iter().find_map(|r| match r {
+            Ok(WaitForEffectsResponse::Rejected { error: Some(e) }) if e.is_retryable().0 => {
+                Some(format!("rejected: {e:?}"))
+            }
+            Ok(WaitForEffectsResponse::Expired { epoch, round }) => {
+                Some(format!("expired (epoch {epoch}, round {round:?})"))
+            }
+            _ => None,
+        });
+        if let Some(reason) = retriable_wait_failure
+            && (retry_cnt < max_retries || start.elapsed() < min_retry_duration)
+        {
+            warn_and_backoff_for_retry(
+                &digests,
+                &mut retry_cnt,
+                format!("wait_for_effects retriable failure: {reason}"),
+            )
+            .await;
+            continue;
+        }
+
+        // Build final results by combining immediate responses with waited responses
+        let mut wait_response_iter = wait_responses.into_iter();
+        let mut results = Vec::with_capacity(digests.len());
+
+        for (i, outcome) in outcomes.into_iter().enumerate() {
+            let response = match outcome {
+                SubmissionOutcome::Submitted(_) => {
+                    // Get the next waited response
+                    wait_response_iter.next().unwrap()?
+                }
+                SubmissionOutcome::ImmediateResponse(resp) => resp,
+            };
+            results.push((digests[i], response));
+        }
+
+        return Ok(results);
+    }
+}
+
+pub struct FullNodeProxy {
+    sui_client: Client,
+
+    // Committee and protocol config are initialized on startup and not updated on epoch changes.
+    committee: Arc<Committee>,
+    protocol_config: Arc<ProtocolConfig>,
+    chain_identifier: ChainIdentifier,
+
+    // TransactionDriver for soft bundle support (size > 1)
+    td: Arc<TransactionDriver<NetworkAuthorityClient>>,
+}
+
+impl FullNodeProxy {
+    pub async fn from_url(
+        http_url: &str,
+        genesis_committee: &Committee,
+        metrics: &BenchmarkProxyMetrics,
+    ) -> Result<Self, anyhow::Error> {
+        let http_url = if http_url.starts_with("http://") || http_url.starts_with("https://") {
+            http_url.to_string()
+        } else {
+            format!("http://{http_url}")
+        };
+
+        // Each request times out after 60s (default value)
+        let sui_client = Client::new(&http_url)?;
+
+        let committee = sui_client.get_committee(None).await?;
+
+        let chain_identifier = sui_client.get_chain_identifier().await?;
+
+        let protocol_config = {
+            let resp = sui_client.get_protocol_config(None).await?;
+            let chain = chain_identifier.chain();
+            ProtocolConfig::get_for_version(resp.protocol_version().into(), chain)
+        };
+
+        // Build AuthorityAggregator and TransactionDriver for soft bundle support
+        let sui_system_state = sui_client.get_system_state_summary(None).await?;
+        let new_committee = sui_system_state.get_sui_committee_for_benchmarking();
+        let committee_store = Arc::new(CommitteeStore::new_for_testing(genesis_committee));
+        if new_committee.committee().epoch > 0 {
+            committee_store.insert_new_committee(new_committee.committee())?;
+        }
+
+        let aggregator = AuthorityAggregator::new_from_committee(
+            new_committee,
+            Arc::new(sui_system_state.get_committee_authority_names_to_hostnames()),
+            sui_system_state.reference_gas_price,
+            &committee_store,
+            metrics.safe_client_metrics_base.clone(),
+        );
+
+        let reconfig_observer = Arc::new(
+            FullNodeReconfigObserver::new(
+                &http_url,
+                committee_store,
+                metrics.safe_client_metrics_base.clone(),
+            )
+            .await,
+        );
+
+        let td = TransactionDriver::new(
+            Arc::new(aggregator),
+            reconfig_observer,
+            metrics.transaction_driver_metrics.clone(),
+            None,
+            metrics.client_metrics.clone(),
+        );
+
+        Ok(Self {
+            sui_client,
+            committee: Arc::new(committee),
+            protocol_config: Arc::new(protocol_config),
+            chain_identifier,
+            td,
+        })
+    }
+
+    /// Wait for the effects of a transaction that may already have executed.
+    ///
+    /// A transaction can commit while the client is unable to observe the response - the
+    /// checkpoint wait times out, or the connection drops after submission. Resubmitting then
+    /// fails input checks against objects the transaction itself consumed, which is reported as
+    /// a non-retriable error even though the transaction succeeded.
+    ///
+    /// GetTransaction only serves transactions that have been checkpointed, so one that
+    /// committed moments ago reads as not found. Poll until it lands or the budget expires.
+    async fn await_executed_effects(&self, digest: &TransactionDigest) -> Option<ExecutionEffects> {
+        let budget = rpc_retry_budget();
+        let start = Instant::now();
+        loop {
+            match self.sui_client.clone().get_transaction(digest).await {
+                Ok(txn) => return Some(ExecutionEffects::ExecutedTransaction(txn)),
+                Err(status) => {
+                    if start.elapsed() >= budget {
+                        debug!(
+                            ?digest,
+                            "transaction not observed within {:?}: {:?}", budget, status
+                        );
+                        return None;
+                    }
+                    sleep(retry_delay()).await;
+                }
+            }
+        }
+    }
+}
+
+/// A non-retriable error reporting the transaction's own inputs as consumed is the signature of
+/// a resubmission: the transaction committed, but the client never saw the result.
+fn indicates_already_executed(err: &impl std::fmt::Debug) -> bool {
+    let err_str = format!("{:?}", err);
+    err_str.contains("Error checking transaction input objects")
+        || err_str.contains("is unavailable for consumption")
+}
+
+fn is_retryable_sdk_error(err: &impl std::fmt::Debug) -> bool {
+    let err_str = format!("{:?}", err);
+    !(err_str.contains("Error checking transaction input objects")
+        || err_str.contains("Transaction Expired")
+        || err_str.contains("already locked by a different transaction")
+        || err_str.contains("is unavailable for consumption"))
+        || err_str.contains("Transaction executed but checkpoint wait timed out")
+}
+
+fn max_rpc_retries() -> usize {
+    if in_antithesis() { 20 } else { 10 }
+}
+
+/// Antithesis stops and partitions nodes for stretches that routinely outlast the default
+/// budget, so the client gives up while the fault is still in effect.
+fn rpc_retry_budget() -> Duration {
+    if in_antithesis() {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+fn retry_delay() -> Duration {
+    Duration::from_millis(get_rng().gen_range(100..1000))
+}
+
+#[async_trait]
+impl ValidatorProxy for FullNodeProxy {
+    async fn get_sui_address_balance(&self, address: SuiAddress) -> Result<u64, anyhow::Error> {
+        let balance = self.sui_client.get_balance(address, &GAS::type_()).await?;
+
+        Ok(balance.address_balance())
+    }
+
+    async fn get_object(&self, object_id: ObjectID) -> Result<Object, anyhow::Error> {
+        // Workload init reads objects before it can generate any load, and an unretried
+        // transport failure here aborts the process. Give reads the same budget as writes.
+        let start = Instant::now();
         let mut retry_cnt = 0;
-        while retry_cnt < 3 {
-            let ticket = match self
-                .qd
-                .submit_transaction(
-                    sui_types::quorum_driver_types::ExecuteTransactionRequestV3 {
-                        transaction: tx.clone(),
-                        include_events: true,
-                        include_input_objects: false,
-                        include_output_objects: false,
-                        include_auxiliary_data: false,
-                    },
-                )
+        let mut last_err = None;
+        while retry_cnt < max_rpc_retries() || start.elapsed() < rpc_retry_budget() {
+            match self.sui_client.clone().get_object(object_id).await {
+                Ok(object) => return Ok(object),
+                Err(err) => {
+                    let delay = retry_delay();
+                    warn!(
+                        ?object_id,
+                        retry_cnt,
+                        "get_object failed with err: {:?}. Sleeping for {:?} ...",
+                        err,
+                        delay,
+                    );
+                    last_err = Some(err);
+                    retry_cnt += 1;
+                    sleep(delay).await;
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "get_object {:?} failed for {retry_cnt} times, last error: {:?}",
+            object_id,
+            last_err
+        ))
+    }
+
+    async fn get_owned_objects(
+        &self,
+        account_address: SuiAddress,
+    ) -> Result<Vec<(u64, Object)>, anyhow::Error> {
+        let objects: Vec<Object> = self
+            .sui_client
+            .list_owned_objects(account_address, Some(GasCoin::type_()))
+            .try_collect()
+            .await?;
+
+        let mut values_objects = Vec::new();
+
+        for object in objects {
+            let gas_coin = GasCoin::try_from(&object)?;
+            values_objects.push((gas_coin.value(), object));
+        }
+
+        Ok(values_objects)
+    }
+
+    async fn get_latest_system_state_object(&self) -> Result<SuiSystemStateSummary, anyhow::Error> {
+        Ok(self.sui_client.get_system_state_summary(None).await?)
+    }
+
+    async fn execute_transaction_block(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects> {
+        let tx_digest = *tx.digest();
+        let start = Instant::now();
+        let mut retry_cnt = 0;
+        // Set once an attempt fails without telling us whether the transaction landed.
+        let mut outcome_unknown = false;
+        let max_retries = max_rpc_retries();
+        while retry_cnt < max_retries || start.elapsed() < rpc_retry_budget() {
+            // Fullnode could time out after WAIT_FOR_FINALITY_TIMEOUT (30s) in TransactionOrchestrator
+            // SuiClient times out after 60s
+            match self
+                .sui_client
+                .clone()
+                .execute_transaction_and_wait_for_checkpoint(&tx)
                 .await
             {
-                Ok(ticket) => ticket,
-                Err(err) => {
-                    return (
-                        ClientType::QuorumDriver,
-                        Err(anyhow::anyhow!("Failed to submit transaction: {}", err)),
-                    );
-                }
-            };
-            // The ticket only times out when QuorumDriver exceeds the retry times
-            match ticket.await {
                 Ok(resp) => {
-                    let QuorumDriverResponse {
-                        effects_cert,
-                        events,
-                        ..
-                    } = resp;
-                    return (
-                        ClientType::QuorumDriver,
-                        Ok(ExecutionEffects::FinalizedTransactionEffects(
-                            FinalizedEffects::new_from_effects_cert(effects_cert.into()),
-                            events.unwrap_or_default(),
-                        )),
-                    );
-                }
-                Err(QuorumDriverError::NonRecoverableTransactionError { errors }) => {
-                    warn!(
-                        ?tx_digest,
-                        retry_cnt, "Transaction failed with non-recoverable err: {:?}", errors
-                    );
-                    return (
-                        ClientType::QuorumDriver,
-                        Err(anyhow::anyhow!(
-                            QuorumDriverError::NonRecoverableTransactionError { errors }
-                        )),
-                    );
+                    return Ok(ExecutionEffects::ExecutedTransaction(resp));
                 }
                 Err(err) => {
-                    let delay = Duration::from_millis(rand::thread_rng().gen_range(100..1000));
+                    if !is_retryable_sdk_error(&err) {
+                        // Only worth looking up when an earlier attempt left the outcome unknown.
+                        // Workloads submit conflicting transactions on purpose, so a first-attempt
+                        // rejection is the transaction being refused, not a lost response.
+                        if outcome_unknown
+                            && indicates_already_executed(&err)
+                            && let Some(effects) = self.await_executed_effects(&tx_digest).await
+                        {
+                            return Ok(effects);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Transaction {:?} failed with non-retriable error: {:?}",
+                            tx_digest,
+                            err
+                        ));
+                    }
+                    outcome_unknown = true;
+                    let delay = retry_delay();
                     warn!(
                         ?tx_digest,
                         retry_cnt,
@@ -481,205 +1177,10 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
                 }
             }
         }
-        (
-            ClientType::QuorumDriver,
-            Err(anyhow::anyhow!(
-                "Transaction {:?} failed for {retry_cnt} times",
-                tx_digest
-            )),
-        )
-    }
-
-    fn clone_committee(&self) -> Arc<Committee> {
-        self.qd.clone_committee()
-    }
-
-    fn get_current_epoch(&self) -> EpochId {
-        self.qd.current_epoch()
-    }
-
-    fn clone_new(&self) -> Box<dyn ValidatorProxy + Send + Sync> {
-        let qdh = self._qd_handler.clone_new();
-        let qd = qdh.clone_quorum_driver();
-        Box::new(Self {
-            _qd_handler: qdh,
-            qd,
-            td: self.td.clone(),
-            clients: self.clients.clone(),
-            committee: self.committee.clone(),
-            td_percentage: self.td_percentage,
-        })
-    }
-
-    async fn get_validators(&self) -> Result<Vec<SuiAddress>, anyhow::Error> {
-        let system_state = self.get_latest_system_state_object().await?;
-        Ok(system_state
-            .active_validators
-            .iter()
-            .map(|v| v.sui_address)
-            .collect())
-    }
-}
-
-pub struct FullNodeProxy {
-    sui_client: SuiClient,
-
-    // Committee and protocol config are initialized on startup and not updated on epoch changes.
-    committee: Arc<Committee>,
-    protocol_config: Arc<ProtocolConfig>,
-}
-
-impl FullNodeProxy {
-    pub async fn from_url(http_url: &str) -> Result<Self, anyhow::Error> {
-        let http_url = if http_url.starts_with("http://") || http_url.starts_with("https://") {
-            http_url.to_string()
-        } else {
-            format!("http://{http_url}")
-        };
-
-        // Each request times out after 60s (default value)
-        let sui_client = SuiClientBuilder::default()
-            .max_concurrent_requests(500_000)
-            .build(http_url)
-            .await?;
-
-        let committee = {
-            let resp = sui_client.read_api().get_committee_info(None).await?;
-            let epoch = resp.epoch;
-            let committee_map = resp.validators.into_iter().collect();
-            Committee::new(epoch, committee_map)
-        };
-
-        let protocol_config = {
-            let resp = sui_client.read_api().get_protocol_config(None).await?;
-            // Basically set by the SUI_PROTOCOL_CONFIG_CHAIN_OVERRIDE env var.
-            let chain = ChainIdentifier::default().chain();
-            ProtocolConfig::get_for_version(resp.protocol_version, chain)
-        };
-
-        Ok(Self {
-            sui_client,
-            committee: Arc::new(committee),
-            protocol_config: Arc::new(protocol_config),
-        })
-    }
-}
-
-#[async_trait]
-impl ValidatorProxy for FullNodeProxy {
-    async fn get_object(&self, object_id: ObjectID) -> Result<Object, anyhow::Error> {
-        let response = self
-            .sui_client
-            .read_api()
-            .get_object_with_options(object_id, SuiObjectDataOptions::bcs_lossless())
-            .await?;
-
-        if let Some(sui_object) = response.data {
-            sui_object.try_into_object(&self.protocol_config)
-        } else if let Some(error) = response.error {
-            bail!("Error getting object {:?}: {}", object_id, error)
-        } else {
-            bail!("Object {:?} not found and no error provided", object_id)
-        }
-    }
-
-    async fn get_owned_objects(
-        &self,
-        account_address: SuiAddress,
-    ) -> Result<Vec<(u64, Object)>, anyhow::Error> {
-        let mut objects: Vec<SuiObjectResponse> = Vec::new();
-        let mut cursor = None;
-        loop {
-            let response = self
-                .sui_client
-                .read_api()
-                .get_owned_objects(
-                    account_address,
-                    Some(SuiObjectResponseQuery::new_with_options(
-                        SuiObjectDataOptions::bcs_lossless(),
-                    )),
-                    cursor,
-                    None,
-                )
-                .await?;
-
-            objects.extend(response.data);
-
-            if response.has_next_page {
-                cursor = response.next_cursor;
-            } else {
-                break;
-            }
-        }
-
-        let mut values_objects = Vec::new();
-
-        for object in objects {
-            let o = object.data;
-            if let Some(o) = o {
-                let temp: Object = o.clone().try_into_object(&self.protocol_config)?;
-                let gas_coin = GasCoin::try_from(&temp)?;
-                values_objects.push((
-                    gas_coin.value(),
-                    o.clone().try_into_object(&self.protocol_config)?,
-                ));
-            }
-        }
-
-        Ok(values_objects)
-    }
-
-    async fn get_latest_system_state_object(&self) -> Result<SuiSystemStateSummary, anyhow::Error> {
-        Ok(self
-            .sui_client
-            .governance_api()
-            .get_latest_sui_system_state()
-            .await?)
-    }
-
-    async fn execute_transaction_block(
-        &self,
-        tx: Transaction,
-    ) -> (ClientType, anyhow::Result<ExecutionEffects>) {
-        let tx_digest = *tx.digest();
-        let mut retry_cnt = 0;
-        while retry_cnt < 10 {
-            // Fullnode could time out after WAIT_FOR_FINALITY_TIMEOUT (30s) in TransactionOrchestrator
-            // SuiClient times out after 60s
-            match self
-                .sui_client
-                .quorum_driver_api()
-                .execute_transaction_block(
-                    tx.clone(),
-                    SuiTransactionBlockResponseOptions::new().with_effects(),
-                    None,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    return (
-                        ClientType::QuorumDriver,
-                        Ok(ExecutionEffects::SuiTransactionBlockEffects(
-                            resp.effects.expect("effects field should not be None"),
-                        )),
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        ?tx_digest,
-                        retry_cnt, "Transaction failed with err: {:?}", err
-                    );
-                    retry_cnt += 1;
-                }
-            }
-        }
-        (
-            ClientType::QuorumDriver,
-            Err(anyhow::anyhow!(
-                "Transaction {:?} failed for {retry_cnt} times",
-                tx_digest
-            )),
-        )
+        Err(anyhow::anyhow!(
+            "Transaction {:?} failed for {retry_cnt} times",
+            tx_digest
+        ))
     }
 
     fn clone_committee(&self) -> Arc<Committee> {
@@ -695,24 +1196,46 @@ impl ValidatorProxy for FullNodeProxy {
             sui_client: self.sui_client.clone(),
             committee: self.clone_committee(),
             protocol_config: self.protocol_config.clone(),
+            chain_identifier: self.chain_identifier,
+            td: self.td.clone(),
         })
     }
 
     async fn get_validators(&self) -> Result<Vec<SuiAddress>, anyhow::Error> {
         let validators = self
             .sui_client
-            .governance_api()
-            .get_latest_sui_system_state()
+            .get_system_state_summary(None)
             .await?
             .active_validators;
         Ok(validators.into_iter().map(|v| v.sui_address).collect())
+    }
+
+    async fn execute_soft_bundle(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> anyhow::Result<Vec<(TransactionDigest, WaitForEffectsResponse)>> {
+        execute_soft_bundle_with_retries(&self.td, &txs).await
+    }
+
+    fn get_chain_identifier(&self) -> ChainIdentifier {
+        self.chain_identifier
+    }
+
+    async fn is_transaction_checkpointed(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Result<bool, anyhow::Error> {
+        match self.sui_client.clone().get_transaction(digest).await {
+            Ok(executed_tx) => Ok(executed_tx.checkpoint.is_some()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum BenchMoveCallArg {
     Pure(Vec<u8>),
-    Shared((ObjectID, SequenceNumber, bool)),
+    Shared((ObjectID, SequenceNumber, SharedObjectMutability)),
     ImmOrOwnedObject(ObjectRef),
     ImmOrOwnedObjectVec(Vec<ObjectRef>),
     SharedObjectVec(Vec<(ObjectID, SequenceNumber, bool)>),
@@ -782,8 +1305,8 @@ impl From<CallArg> for BenchMoveCallArg {
                 ObjectArg::SharedObject {
                     id,
                     initial_shared_version,
-                    mutable,
-                } => BenchMoveCallArg::Shared((id, initial_shared_version, mutable)),
+                    mutability,
+                } => BenchMoveCallArg::Shared((id, initial_shared_version, mutability)),
                 ObjectArg::Receiving(_) => {
                     unimplemented!("Receiving is not supported for benchmarks")
                 }
@@ -806,11 +1329,11 @@ pub fn convert_move_call_args(
             BenchMoveCallArg::Pure(bytes) => {
                 pt_builder.input(CallArg::Pure(bytes.clone())).unwrap()
             }
-            BenchMoveCallArg::Shared((id, initial_shared_version, mutable)) => pt_builder
+            BenchMoveCallArg::Shared((id, initial_shared_version, mutability)) => pt_builder
                 .input(CallArg::Object(ObjectArg::SharedObject {
                     id: *id,
                     initial_shared_version: *initial_shared_version,
-                    mutable: *mutable,
+                    mutability: *mutability,
                 }))
                 .unwrap(),
             BenchMoveCallArg::ImmOrOwnedObject(obj_ref) => {
@@ -827,7 +1350,11 @@ pub fn convert_move_call_args(
                             |(id, initial_shared_version, mutable)| ObjectArg::SharedObject {
                                 id: *id,
                                 initial_shared_version: *initial_shared_version,
-                                mutable: *mutable,
+                                mutability: if *mutable {
+                                    SharedObjectMutability::Mutable
+                                } else {
+                                    SharedObjectMutability::Immutable
+                                },
                             },
                         ),
                 )

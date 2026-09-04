@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
+use prost_types::FieldMask;
 use sui_config::local_ip_utils;
 use sui_keys::keystore::AccountKeystore;
 use sui_keys::keystore::Keystore;
@@ -25,12 +26,27 @@ use sui_rosetta::types::{
     TransactionIdentifierResponse,
 };
 use sui_rosetta::{RosettaOfflineServer, RosettaOnlineServer};
-use sui_sdk::SuiClient;
+use sui_rpc::client::Client as GrpcClient;
+use sui_rpc::field::FieldMaskUtil;
+use sui_rpc::proto::sui::rpc::v2::GetCheckpointRequest;
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::SuiSignature;
+use sui_types::digests::{ChainIdentifier, CheckpointDigest};
 
-pub async fn start_rosetta_test_server(client: SuiClient) -> (RosettaClient, Vec<JoinHandle<()>>) {
-    let online_server = RosettaOnlineServer::new(SuiEnv::LocalNet, client);
+pub async fn start_rosetta_test_server(
+    mut client: GrpcClient,
+) -> (RosettaClient, Vec<JoinHandle<()>>) {
+    let request = GetCheckpointRequest::by_sequence_number(0)
+        .with_read_mask(FieldMask::from_paths(["digest"]));
+    let response = client
+        .ledger_client()
+        .get_checkpoint(request)
+        .await
+        .expect("Failed to fetch genesis checkpoint");
+    let digest = CheckpointDigest::from_str(response.into_inner().checkpoint().digest())
+        .expect("Failed to parse genesis checkpoint digest");
+    let chain_id = ChainIdentifier::from(digest);
+    let online_server = RosettaOnlineServer::new(SuiEnv::LocalNet, client, chain_id);
     let offline_server = RosettaOfflineServer::new(SuiEnv::LocalNet);
     let local_ip = local_ip_utils::localhost_for_testing();
     let port = local_ip_utils::get_available_port(&local_ip);
@@ -138,7 +154,7 @@ impl RosettaClient {
         }
     }
 
-    /// rosetta construction e2e flow, see https://www.rosetta-api.org/docs/flow.html#construction-api
+    /// mesh construction e2e flow, see https://docs.cdp.coinbase.com/mesh/product-overview/flow-of-operations
     pub async fn rosetta_flow(
         &self,
         operations: &Operations,
@@ -150,7 +166,6 @@ impl RosettaClient {
             network: SuiEnv::LocalNet,
         };
         let mut resps = FlowResponses::default();
-        // Preprocess
         let preprocess = self
             .call(
                 RosettaEndpoint::Preprocess,
@@ -165,8 +180,6 @@ impl RosettaClient {
         let Ok(preprocess) = &resps.preprocess.as_ref().unwrap() else {
             return resps;
         };
-        println!("Preprocess : {preprocess:?}");
-        // Metadata
         let metadata = self
             .call(
                 RosettaEndpoint::Metadata,
@@ -182,8 +195,6 @@ impl RosettaClient {
             return resps;
         };
 
-        println!("Metadata : {metadata:?}");
-        // Payload
         let payloads = self
             .call(
                 RosettaEndpoint::Payloads,
@@ -199,8 +210,6 @@ impl RosettaClient {
         let Ok(payloads) = resps.payloads.as_ref().unwrap() else {
             return resps;
         };
-        println!("Payload : {payloads:?}");
-        // Combine
         let signing_payload = payloads.payloads.first().unwrap();
         let bytes = Hex::decode(&signing_payload.hex_bytes).unwrap();
         let signer = signing_payload.account_identifier.address;
@@ -225,8 +234,6 @@ impl RosettaClient {
         let Ok(combine) = resps.combine.as_ref().unwrap() else {
             return resps;
         };
-        println!("Combine : {combine:?}");
-        // Submit
         let submit = self
             .call(
                 RosettaEndpoint::Submit,
@@ -240,6 +247,7 @@ impl RosettaClient {
         resps
     }
 
+    #[allow(dead_code)]
     pub async fn get_balance(
         &self,
         network_identifier: NetworkIdentifier,

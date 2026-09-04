@@ -7,13 +7,15 @@ mod read_store;
 mod shared_in_memory_store;
 mod write_store;
 
+use crate::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 use crate::base_types::{
-    ConsensusObjectSequenceKey, FullObjectID, FullObjectRef, SuiAddress, TransactionDigest,
-    VersionNumber,
+    ConsensusObjectSequenceKey, ConsensusObjectVersion, FullObjectID, FullObjectRef, SuiAddress,
+    SystemObjectVersions, TransactionDigest, VersionNumber,
 };
 use crate::committee::EpochId;
+use crate::effects::InputConsensusObject;
 use crate::effects::{TransactionEffects, TransactionEffectsAPI};
-use crate::error::{ExecutionError, SuiError};
+use crate::error::{ExecutionError, SuiError, SuiErrorKind};
 use crate::execution::{DynamicallyLoadedObjectMetadata, ExecutionResults};
 use crate::full_checkpoint_content::ObjectSet;
 use crate::message_envelope::Message;
@@ -29,13 +31,20 @@ use crate::{
 use itertools::Itertools;
 use move_binary_format::CompiledModule;
 use move_core_types::language_storage::{ModuleId, TypeTag};
+use move_core_types::resolver::SerializedPackage;
 pub use object_store_trait::ObjectStore;
 pub use read_store::BalanceInfo;
 pub use read_store::BalanceIterator;
 pub use read_store::CoinInfo;
 pub use read_store::DynamicFieldIndexInfo;
+pub use read_store::DynamicFieldIteratorItem;
 pub use read_store::DynamicFieldKey;
 pub use read_store::EpochInfo;
+pub use read_store::LedgerBitmapBucket;
+pub use read_store::LedgerBitmapBucketIter;
+pub use read_store::LedgerBitmapBucketIterator;
+pub use read_store::LedgerTxSeqDigest;
+pub use read_store::LedgerTxSeqDigestIterator;
 pub use read_store::OwnedObjectInfo;
 pub use read_store::ReadStore;
 pub use read_store::RpcIndexes;
@@ -175,12 +184,12 @@ pub enum ObjectChange {
     Delete(DeleteKindWithOldVersion),
 }
 
-pub trait StorageView: Storage + ParentSync + ChildObjectResolver {}
-impl<T: Storage + ParentSync + ChildObjectResolver> StorageView for T {}
+pub trait StorageView: Storage + ParentSync + RuntimeObjectResolver {}
+impl<T: Storage + ParentSync + RuntimeObjectResolver> StorageView for T {}
 
 /// An abstraction of the (possibly distributed) store for objects. This
 /// API only allows for the retrieval of objects, not any state changes
-pub trait ChildObjectResolver {
+pub trait RuntimeObjectResolver: BackingPackageStore {
     /// `child` must have an `ObjectOwner` ownership equal to `owner`.
     fn read_child_object(
         &self,
@@ -201,6 +210,36 @@ pub trait ChildObjectResolver {
         receive_object_at_version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<Object>>;
+
+    /// Get's the package at the given version. Returns `Some(package)` only if the `package_id` is
+    /// a `MovePackage` with the given `package_version`. Returns `None` in all other cases.
+    ///
+    /// Since the has the _possibility_ of doing unsequenced reads of object IDs it is important
+    /// here that:
+    /// * If the package object does not exist; or
+    /// * If the package object exists but is not a Move package; or
+    /// * If the package object exists and is a Move package, but the version is not the supplied version.
+    ///
+    /// All return the same error.
+    ///
+    /// To be extra careful, we simply return `None` in all cases unless the object is a package
+    /// with the exact version supplied, and let the caller decide how to handle it.
+    fn get_package_at_version(
+        &self,
+        package_id: &ObjectID,
+        package_version: SequenceNumber,
+    ) -> Option<MovePackage> {
+        let move_pkg = self
+            .get_package_object(package_id)
+            .ok()
+            .flatten()?
+            .into_move_package();
+        if move_pkg.version() == package_version {
+            Some(move_pkg)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct DenyListResult {
@@ -217,7 +256,8 @@ pub trait Storage {
 
     fn read_object(&self, id: &ObjectID) -> Option<&Object>;
 
-    fn record_execution_results(&mut self, results: ExecutionResults);
+    fn record_execution_results(&mut self, results: ExecutionResults)
+    -> Result<(), ExecutionError>;
 
     fn save_loaded_runtime_objects(
         &mut self,
@@ -259,6 +299,14 @@ impl PackageObject {
     pub fn move_package(&self) -> &MovePackage {
         self.package_object.data.try_as_package().unwrap()
     }
+
+    pub fn into_move_package(self) -> MovePackage {
+        self.package_object
+            .into_inner()
+            .data
+            .try_into_package()
+            .unwrap()
+    }
 }
 
 impl From<PackageObject> for Object {
@@ -295,6 +343,41 @@ impl<S: ?Sized + BackingPackageStore> BackingPackageStore for &mut S {
     }
 }
 
+/// A BackingPackageStore that overlays objects on top of a backing store.
+/// This allows resolving packages from a set of objects (e.g., output objects from a transaction)
+/// before falling back to the backing store.
+pub struct OverlayBackingPackageStore<'a, S> {
+    overlay: &'a ObjectSet,
+    backing: S,
+}
+
+impl<'a, S> OverlayBackingPackageStore<'a, S> {
+    pub fn new(overlay: &'a ObjectSet, backing: S) -> Self {
+        Self { overlay, backing }
+    }
+}
+
+impl<S: BackingPackageStore> BackingPackageStore for OverlayBackingPackageStore<'_, S> {
+    fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<PackageObject>> {
+        // First check the overlay for the object
+        for obj in self.overlay.iter() {
+            if &obj.id() == package_id {
+                // Found in overlay - check if it's a package
+                fp_ensure!(
+                    obj.is_package(),
+                    SuiErrorKind::BadObjectType {
+                        error: format!("Package expected, Move object found: {package_id}"),
+                    }
+                    .into()
+                );
+                return Ok(Some(PackageObject::new(obj.clone())));
+            }
+        }
+        // Not in overlay, fall back to the backing store
+        self.backing.get_package_object(package_id)
+    }
+}
+
 pub fn load_package_object_from_object_store(
     store: &impl ObjectStore,
     package_id: &ObjectID,
@@ -303,9 +386,10 @@ pub fn load_package_object_from_object_store(
     if let Some(obj) = &package {
         fp_ensure!(
             obj.is_package(),
-            SuiError::BadObjectType {
+            SuiErrorKind::BadObjectType {
                 error: format!("Package expected, Move object found: {package_id}"),
             }
+            .into()
         );
     }
     Ok(package.map(PackageObject::new))
@@ -348,6 +432,16 @@ pub fn get_module(
                 .get(module_id.name().as_str())
                 .cloned()
         }))
+}
+
+pub fn get_package(
+    store: impl BackingPackageStore,
+    id: &ObjectID,
+) -> SuiResult<Option<SerializedPackage>> {
+    store
+        .get_package_object(id)?
+        .map(|package| package.move_package().into_serialized_move_package())
+        .transpose()
 }
 
 pub fn get_module_by_id<S: BackingPackageStore>(
@@ -424,14 +518,14 @@ impl<S: ParentSync> ParentSync for &mut S {
     }
 }
 
-impl<S: ChildObjectResolver> ChildObjectResolver for std::sync::Arc<S> {
+impl<S: RuntimeObjectResolver> RuntimeObjectResolver for std::sync::Arc<S> {
     fn read_child_object(
         &self,
         parent: &ObjectID,
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::read_child_object(
+        RuntimeObjectResolver::read_child_object(
             self.as_ref(),
             parent,
             child,
@@ -445,7 +539,7 @@ impl<S: ChildObjectResolver> ChildObjectResolver for std::sync::Arc<S> {
         receive_object_at_version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::get_object_received_at_version(
+        RuntimeObjectResolver::get_object_received_at_version(
             self.as_ref(),
             owner,
             receiving_object_id,
@@ -455,14 +549,14 @@ impl<S: ChildObjectResolver> ChildObjectResolver for std::sync::Arc<S> {
     }
 }
 
-impl<S: ChildObjectResolver> ChildObjectResolver for &S {
+impl<S: RuntimeObjectResolver> RuntimeObjectResolver for &S {
     fn read_child_object(
         &self,
         parent: &ObjectID,
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::read_child_object(*self, parent, child, child_version_upper_bound)
+        RuntimeObjectResolver::read_child_object(*self, parent, child, child_version_upper_bound)
     }
     fn get_object_received_at_version(
         &self,
@@ -471,7 +565,7 @@ impl<S: ChildObjectResolver> ChildObjectResolver for &S {
         receive_object_at_version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::get_object_received_at_version(
+        RuntimeObjectResolver::get_object_received_at_version(
             *self,
             owner,
             receiving_object_id,
@@ -481,14 +575,14 @@ impl<S: ChildObjectResolver> ChildObjectResolver for &S {
     }
 }
 
-impl<S: ChildObjectResolver> ChildObjectResolver for &mut S {
+impl<S: RuntimeObjectResolver> RuntimeObjectResolver for &mut S {
     fn read_child_object(
         &self,
         parent: &ObjectID,
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::read_child_object(*self, parent, child, child_version_upper_bound)
+        RuntimeObjectResolver::read_child_object(*self, parent, child, child_version_upper_bound)
     }
     fn get_object_received_at_version(
         &self,
@@ -497,7 +591,7 @@ impl<S: ChildObjectResolver> ChildObjectResolver for &mut S {
         receive_object_at_version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<Object>> {
-        ChildObjectResolver::get_object_received_at_version(
+        RuntimeObjectResolver::get_object_received_at_version(
             *self,
             owner,
             receiving_object_id,
@@ -664,22 +758,14 @@ impl Display for DeleteKind {
     }
 }
 
-pub trait BackingStore:
-    BackingPackageStore + ChildObjectResolver + ObjectStore + ParentSync
-{
-    fn as_object_store(&self) -> &dyn ObjectStore;
-}
+pub trait BackingStore: RuntimeObjectResolver + ObjectStore + ParentSync {}
 
 impl<T> BackingStore for T
 where
-    T: BackingPackageStore,
-    T: ChildObjectResolver,
+    T: RuntimeObjectResolver,
     T: ObjectStore,
     T: ParentSync,
 {
-    fn as_object_store(&self) -> &dyn ObjectStore {
-        self
-    }
 }
 
 pub fn get_transaction_input_objects(
@@ -738,7 +824,57 @@ pub fn get_transaction_output_objects(
     Ok(output_objects)
 }
 
-// Returns an iterator over the ObjectKey's of objects read or written by this transaction
+impl SystemObjectVersions {
+    /// Obtains pinned system object versions from effects, queries the store for the initial shared versions.
+    pub fn from_effects(effects: &TransactionEffects, store: &dyn ObjectStore) -> Self {
+        let accumulator_version = effects
+            .accessed_consensus_objects()
+            .into_iter()
+            .find_map(|ico| match ico {
+                InputConsensusObject::Mutate((id, version, _))
+                | InputConsensusObject::ReadOnly((id, version, _))
+                    if id == SUI_ACCUMULATOR_ROOT_OBJECT_ID =>
+                {
+                    Some(version)
+                }
+                _ => None,
+            })
+            .map(|version| {
+                let initial_shared_version = store
+                    .get_object(&SUI_ACCUMULATOR_ROOT_OBJECT_ID)
+                    .and_then(|object| object.owner().start_version())
+                    // unwrap safe because if effects contain the accumulator root object, it must
+                    // exist in the store and is a shared object.
+                    .unwrap();
+                ConsensusObjectVersion {
+                    initial_shared_version,
+                    version,
+                }
+            });
+        Self::new(accumulator_version)
+    }
+
+    /// Before execution, get the latest versions of the implicitly read system objects from the store,
+    /// and use these versions as the exact version to read during execution.
+    /// This is used only in environments where there is no consensus to assign versions, e.g. simulacrum and dry-run.
+    pub fn from_latest_in_store(store: &dyn ObjectStore) -> Self {
+        let accumulator_version = store
+            .get_object(&SUI_ACCUMULATOR_ROOT_OBJECT_ID)
+            .map(|object| {
+                let initial_shared_version = object
+                    .owner()
+                    .start_version()
+                    .expect("accumulator root must be a consensus object");
+                ConsensusObjectVersion {
+                    initial_shared_version,
+                    version: object.version(),
+                }
+            });
+        Self::new(accumulator_version)
+    }
+}
+
+// Returns a set of the ObjectKey's of objects read or written by this transaction
 pub fn get_transaction_object_set(
     transaction: &TransactionData,
     effects: &TransactionEffects,
@@ -834,7 +970,7 @@ impl BackingPackageStore for TrackingBackingStore<'_> {
     }
 }
 
-impl ChildObjectResolver for TrackingBackingStore<'_> {
+impl RuntimeObjectResolver for TrackingBackingStore<'_> {
     fn read_child_object(
         &self,
         parent: &ObjectID,
@@ -873,6 +1009,15 @@ impl crate::storage::ObjectStore for TrackingBackingStore<'_> {
         self.inner
             .get_object(object_id)
             .inspect(|o| self.track_object(o))
+    }
+
+    fn load_implicitly_read_system_object(
+        &self,
+        object_id: &ObjectID,
+        version: crate::base_types::ConsensusObjectVersion,
+    ) -> Option<Object> {
+        self.inner
+            .load_implicitly_read_system_object(object_id, version)
     }
 
     fn get_object_by_key(

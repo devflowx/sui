@@ -5,7 +5,7 @@ info:
   edition: legacy
   lint: false
 ---
-warning[W10007]: issue with attribute value
+warning[WC10007]: issue with attribute value
   ┌─ tests/move_check/unit_test/test_and_test_only_annotation.move:4:7
   │
 4 │     #[test(_a=@0x1, _b=@0x2)]
@@ -14,7 +14,7 @@ warning[W10007]: issue with attribute value
   │       Arguments are no longer supported in `#[test]` attributes
   │       Ignoring these arguments
 
-warning[W10007]: issue with attribute value
+warning[WC10007]: issue with attribute value
   ┌─ tests/move_check/unit_test/test_and_test_only_annotation.move:5:7
   │
 4 │     #[test(_a=@0x1, _b=@0x2)]
@@ -24,11 +24,11 @@ warning[W10007]: issue with attribute value
   │
   = Attributes '#[test]' and '#[random_test]' implicitly specify '#[mode(test)]'
 
-warning[W10007]: issue with attribute value
+warning[WC10007]: issue with attribute value
   ┌─ tests/move_check/unit_test/test_and_test_only_annotation.move:6:5
   │
 6 │     public fun boo(_a: signer, _b: signer) { }
   │     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Invalid test function
   │
   = Test functions with arguments have been deprecated
-  = If you would like to test functions with random inputs, consider using '#[rand_test]' instead
+  = If you would like to test functions with random inputs, consider using '#[random_test]' instead

@@ -5,7 +5,7 @@ info:
   edition: 2024.alpha
   lint: false
 ---
-error[E01003]: invalid modifier
+error[EC01003]: invalid modifier
   ┌─ tests/move_2024/expansion/use_nested_self_duplicate.move:2:5
   │
 2 │     struct S {}
@@ -13,15 +13,15 @@ error[E01003]: invalid modifier
   │
   = Visibility annotations are required on struct declarations from the Move 2024 edition onwards.
 
-error[E02001]: duplicate declaration, item, or annotation
+error[EC02001]: duplicate declaration, item, or annotation
   ┌─ tests/move_2024/expansion/use_nested_self_duplicate.move:8:17
   │
 7 │     use 0x2::X;
-  │              - Alias previously defined here
+  │              - Module member or alias previously defined here
 8 │     use 0x2::X::Self;
-  │                 ^^^^ Duplicate module alias 'X'. Module aliases must be unique within a given namespace
+  │                 ^^^^ Duplicate alias 'X'. Module aliases must be unique within a given namespace
 
-error[E01003]: invalid modifier
+error[EC01003]: invalid modifier
    ┌─ tests/move_2024/expansion/use_nested_self_duplicate.move:10:5
    │
 10 │     struct S { f: X::S }

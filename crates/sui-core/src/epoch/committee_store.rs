@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use sui_types::base_types::ObjectID;
 use sui_types::committee::{Committee, EpochId};
-use sui_types::error::{SuiError, SuiResult};
-use typed_store::rocks::{default_db_options, DBMap, DBOptions, MetricConf};
+use sui_types::error::{SuiErrorKind, SuiResult};
+use typed_store::rocks::{DBMap, DBOptions, MetricConf, default_db_options};
 use typed_store::rocksdb::Options;
 
 use typed_store::DBMapUtils;
@@ -115,10 +115,24 @@ impl CommitteeStore {
         Ok(match epoch {
             Some(epoch) => self
                 .get_committee(&epoch)?
-                .ok_or(SuiError::MissingCommitteeAtEpoch(epoch))
+                .ok_or(SuiErrorKind::MissingCommitteeAtEpoch(epoch))
                 .map(|c| Committee::clone(&*c))?,
             None => self.get_latest_committee()?,
         })
+    }
+
+    /// List epoch→committee pairs starting at `start` epoch, up to `limit`.
+    pub fn list_epochs(
+        &self,
+        start: Option<EpochId>,
+        limit: usize,
+    ) -> SuiResult<Vec<(EpochId, Committee)>> {
+        self.tables
+            .committee_map
+            .safe_iter_with_bounds(start, None)
+            .take(limit)
+            .map(|r| r.map_err(Into::into))
+            .collect()
     }
 
     pub fn checkpoint_db(&self, path: &Path) -> SuiResult {

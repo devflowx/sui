@@ -7,21 +7,14 @@
 
 use crate::{
     diag,
-    diagnostics::{
-        Diagnostic, DiagnosticReporter, Diagnostics,
-        codes::{DiagnosticInfo, Severity, custom},
-        warning_filters::WarningFilters,
-    },
+    diagnostics::{Diagnostic, DiagnosticReporter, Diagnostics, filter::FilterScope},
     expansion::ast as E,
     naming::ast as N,
     parser::ast::{self as P, Ability_},
     shared::{CompilationEnv, Identifier, program_info::TypingProgramInfo},
     sui_mode::{
         SUI_ADDR_VALUE,
-        linters::{
-            FREEZE_FUN, LINT_WARNING_PREFIX, LinterDiagnosticCategory, LinterDiagnosticCode,
-            PUBLIC_FREEZE_FUN, TRANSFER_MOD_NAME,
-        },
+        linters::{FREEZE_FUN, PUBLIC_FREEZE_FUN, SuiLintCode, TRANSFER_MOD_NAME},
     },
     typing::{
         ast as T,
@@ -32,14 +25,6 @@ use move_core_types::account_address::AccountAddress;
 use move_ir_types::location::*;
 use move_symbol_pool::Symbol;
 use std::{collections::BTreeMap, sync::Arc};
-
-const FREEZE_WRAPPING_DIAG: DiagnosticInfo = custom(
-    LINT_WARNING_PREFIX,
-    Severity::Warning,
-    LinterDiagnosticCategory::Sui as u8,
-    LinterDiagnosticCode::FreezeWrapped as u8,
-    "attempting to freeze wrapped objects",
-);
 
 const FREEZE_FUNCTIONS: &[(AccountAddress, &str, &str)] = &[
     (SUI_ADDR_VALUE, TRANSFER_MOD_NAME, PUBLIC_FREEZE_FUN),
@@ -128,31 +113,31 @@ impl TypingVisitorContext for Context<'_> {
 
     fn visit_exp_custom(&mut self, exp: &T::Exp) -> bool {
         use T::UnannotatedExp_ as E;
-        if let E::ModuleCall(fun) = &exp.exp.value {
-            if FREEZE_FUNCTIONS.iter().any(|(addr, module, fname)| {
+        if let E::ModuleCall(fun) = &exp.exp.value
+            && FREEZE_FUNCTIONS.iter().any(|(addr, module, fname)| {
                 fun.module.value.is(addr, *module) && &fun.name.value().as_str() == fname
-            }) {
-                let Some(sp!(_, N::TypeName_::ModuleType(mident, sname))) =
-                    fun.type_arguments[0].value.type_name()
-                else {
-                    // struct with a given name not found
-                    return false;
-                };
-                if let Some(wrapping_field_info) = self.find_wrapping_field_loc(mident, sname) {
-                    add_diag(
-                        self,
-                        fun.arguments.exp.loc,
-                        sname.value(),
-                        wrapping_field_info,
-                    );
-                }
+            })
+        {
+            let Some(sp!(_, N::TypeName_::ModuleType(mident, sname))) =
+                fun.type_arguments[0].value.type_name()
+            else {
+                // struct with a given name not found
+                return false;
+            };
+            if let Some(wrapping_field_info) = self.find_wrapping_field_loc(mident, sname) {
+                add_diag(
+                    self,
+                    fun.arguments.exp.loc,
+                    sname.value(),
+                    wrapping_field_info,
+                );
             }
         }
         // always return false to process arguments of the call
         false
     }
 
-    fn push_warning_filter_scope(&mut self, filters: WarningFilters) {
+    fn push_warning_filter_scope(&mut self, filters: FilterScope) {
         self.reporter.push_warning_filter_scope(filters)
     }
 
@@ -168,8 +153,8 @@ impl Context<'_> {
         &mut self,
         sp!(_, ftype_): &N::Type,
     ) -> Option<(Loc, /* direct wrapping */ bool)> {
-        use N::Type_ as T;
-        match ftype_ {
+        use N::TypeInner as T;
+        match ftype_.inner() {
             T::Param(p) => {
                 if p.abilities.has_ability_(P::Ability_::Key) {
                     Some((p.user_specified_name.loc, true))
@@ -263,7 +248,7 @@ fn add_diag(
         if !direct { "indirectly contains" } else { "is" }
     );
     let mut d = diag!(
-        FREEZE_WRAPPING_DIAG,
+        SuiLintCode::FreezeWrapped.diag_info(),
         (freeze_arg_loc, msg),
         (frozen_field_tloc, uid_msg)
     );

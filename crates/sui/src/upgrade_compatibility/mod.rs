@@ -6,33 +6,37 @@ mod formatting;
 #[cfg(test)]
 mod upgrade_compatibility_tests;
 
-use formatting::{format_list, format_param, singular_or_plural, FormattedField};
+use formatting::{FormattedField, format_list, format_param, singular_or_plural};
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
+use mysten_common::ZipDebugEqIteratorExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use sui_rpc_api::Client;
 
 use move_binary_format::file_format::{
     AbilitySet, DatatypeTyParameter, EnumDefinitionIndex, FunctionDefinitionIndex,
     StructDefinitionIndex, TableIndex,
 };
 use move_binary_format::{
+    CompiledModule,
     compatibility::{Compatibility, InclusionCheck},
     compatibility_mode::CompatibilityMode,
     file_format::Visibility,
     inclusion_mode::InclusionCheckMode,
-    normalized, CompiledModule,
+    normalized,
 };
 use move_bytecode_source_map::source_map::SourceName;
 use move_command_line_common::files::FileHash;
-use move_compiler::diagnostics::codes::DiagnosticInfo;
+use move_compiler::diagnostics::codes::{DiagnosticInfo, DiagnosticOrigin};
 use move_compiler::{
     diagnostics::{
-        codes::{custom, Severity},
-        report_diagnostics_to_buffer, Diagnostic, Diagnostics,
+        Diagnostic, Diagnostics,
+        codes::{Severity, custom},
+        report_diagnostics_to_buffer,
     },
     shared::files::FileName,
 };
@@ -41,13 +45,11 @@ use move_core_types::{
     identifier::{IdentStr, Identifier},
 };
 use move_ir_types::location::{ByteIndex, Loc};
-use move_package::compilation::compiled_package::CompiledUnitWithSource;
-use sui_json_rpc_types::{SuiObjectDataOptions, SuiRawData};
+use move_package_alt_compilation::compiled_package::CompiledUnitWithSource;
 use sui_move_build::CompiledPackage;
 use sui_protocol_config::ProtocolConfig;
-use sui_sdk::apis::ReadApi;
+use sui_types::base_types::ObjectID;
 use sui_types::move_package::UpgradePolicy;
-use sui_types::{base_types::ObjectID, execution_config_utils::to_binary_config};
 
 type Enum = normalized::Enum<normalized::RcIdentifier>;
 type Field = normalized::Field<normalized::RcIdentifier>;
@@ -208,8 +210,8 @@ fn breaks_compatibility(
         | UpgradeCompatibilityModeError::FunctionNew { .. }
         | UpgradeCompatibilityModeError::FunctionChange { .. }
         | UpgradeCompatibilityModeError::FunctionMissing { .. }
-        | UpgradeCompatibilityModeError::FriendNew { .. }
-        | UpgradeCompatibilityModeError::FriendMissing { .. } => false,
+        | UpgradeCompatibilityModeError::FriendNew
+        | UpgradeCompatibilityModeError::FriendMissing => false,
     }
 }
 
@@ -250,8 +252,8 @@ fn breaks_inclusion_check(
         | UpgradeCompatibilityModeError::EnumChange { .. }
         | UpgradeCompatibilityModeError::FunctionChange { .. }
         | UpgradeCompatibilityModeError::FunctionMissing { .. }
-        | UpgradeCompatibilityModeError::FriendNew { .. }
-        | UpgradeCompatibilityModeError::FriendMissing { .. } => true,
+        | UpgradeCompatibilityModeError::FriendNew
+        | UpgradeCompatibilityModeError::FriendMissing => true,
     }
 }
 
@@ -610,7 +612,7 @@ fn table_index(compiled_module: &CompiledModule) -> IdentifierTableLookup {
     }
 }
 
-const COMPATIBILITY_PREFIX: &str = "Compatibility ";
+const COMPATIBILITY_ORIGIN: DiagnosticOrigin = DiagnosticOrigin::UpgradeCompatibility;
 /// Generates an enum Category along with individual enum for each individual category
 /// and impls into diagnostic info for each category.
 macro_rules! upgrade_codes {
@@ -641,7 +643,7 @@ macro_rules! upgrade_codes {
                         Self::ZeroPlaceholder =>
                             panic!("do not use placeholder error code"),
                         $(Self::$code => custom(
-                            COMPATIBILITY_PREFIX,
+                            COMPATIBILITY_ORIGIN,
                             Severity::NonblockingError,
                             Category::$cat as u8,
                             self as u8,
@@ -656,7 +658,7 @@ macro_rules! upgrade_codes {
 
 // Used to generate diagnostics primary labels for upgrade compatibility errors.
 // WARNING: you should add new codes to the END of each category list to avoid breaking the existing codes.
-// adding into the middle of a list will change the error code numbers "error[Compatibility EXXXXX]"
+// adding into the middle of a list will change the error code numbers "error[EUCXXXXX]"
 // similarly new categories should be added to the end of the outer list.
 upgrade_codes!(
     Declarations: [
@@ -682,33 +684,23 @@ upgrade_codes!(
 
 /// Check the upgrade compatibility of a new package with an existing on-chain package.
 pub(crate) async fn check_compatibility(
-    read_api: &ReadApi,
+    mut client: Client,
     package_id: ObjectID,
     new_package: CompiledPackage,
     package_path: PathBuf,
     upgrade_policy: u8,
     protocol_config: ProtocolConfig,
 ) -> Result<(), Error> {
-    let existing_obj_read = read_api
-        .get_object_with_options(package_id, SuiObjectDataOptions::new().with_bcs())
-        .await
-        .context("Unable to get existing package")?;
-
-    let existing_obj = existing_obj_read
-        .into_object()
-        .context("Unable to get existing package")?
-        .bcs
-        .ok_or_else(|| anyhow!("Unable to read object"))?;
-
-    let existing_package = match existing_obj {
-        SuiRawData::Package(pkg) => Ok(pkg),
-        SuiRawData::MoveObject(_) => Err(anyhow!("Object found when package expected")),
-    }?;
+    let existing_obj = client.get_object(package_id).await?;
+    let existing_package = existing_obj
+        .data
+        .try_as_package()
+        .ok_or_else(|| anyhow!("Object found when package expected"))?;
 
     let existing_modules = existing_package
-        .module_map
+        .serialized_module_map()
         .iter()
-        .map(|m| CompiledModule::deserialize_with_config(m.1, &to_binary_config(&protocol_config)))
+        .map(|m| CompiledModule::deserialize_with_config(m.1, &protocol_config.binary_config(None)))
         .collect::<Result<Vec<_>, _>>()
         .context("Unable to get existing package")?;
 
@@ -716,9 +708,7 @@ pub(crate) async fn check_compatibility(
         UpgradePolicy::try_from(upgrade_policy).map_err(|_| anyhow!("Invalid upgrade policy"))?;
 
     compare_packages(
-        *existing_package
-            .to_move_package(u64::MAX /* safe as this pkg comes from the network */)?
-            .original_package_id(),
+        *existing_package.original_package_id(),
         existing_modules,
         new_package,
         package_path,
@@ -768,11 +758,11 @@ fn compare_packages(
             Some(new_module) => {
                 let new_module_address_idx = new_module.self_handle().address;
                 let addrs = &mut new_module.address_identifiers;
-                if let Some(address_mut) = addrs.get_mut(new_module_address_idx.0 as usize) {
-                    if *address_mut == AccountAddress::ZERO {
-                        // if the new module address is zero, set it to the on-chain address
-                        *address_mut = package_id;
-                    }
+                if let Some(address_mut) = addrs.get_mut(new_module_address_idx.0 as usize)
+                    && *address_mut == AccountAddress::ZERO
+                {
+                    // if the new module address is zero, set it to the on-chain address
+                    *address_mut = package_id;
                 }
 
                 let compiled_unit_with_source = new_package
@@ -803,14 +793,21 @@ fn compare_packages(
     if diags.is_empty() {
         Ok(())
     } else {
+        // Sort diagnostics to ensure consistent error ordering across platforms
+        // Diagnostic implements Ord, so sorting will be deterministic
+        let mut sorted_vec = diags.into_vec();
+        sorted_vec.sort();
+        let sorted_diags: Diagnostics = sorted_vec.into_iter().collect();
+
         Err(anyhow!(
             "{}\nUpgrade failed, this package requires changes to be compatible with the existing package. \
-            Its upgrade policy is set to '{}'.",
+            Its upgrade policy is set to '{}'. Use --skip-verify-compatibility to bypass this check locally.",
             String::from_utf8(report_diagnostics_to_buffer(
                 &new_package.package.file_map,
-                diags,
+                sorted_diags,
                 use_colors()
-            )).context("Unable to convert buffer to string")?,
+            ))
+            .context("Unable to convert buffer to string")?,
             match policy {
                 UpgradePolicy::Compatible => "compatible",
                 UpgradePolicy::Additive => "additive",
@@ -1047,8 +1044,7 @@ fn compatibility_diag_from_error(
         } => {
             file_format_version_downgrade_diag(old_version, new_version, compiled_unit_with_source)
         }
-        UpgradeCompatibilityModeError::FriendNew { .. }
-        | UpgradeCompatibilityModeError::FriendMissing { .. } => {
+        UpgradeCompatibilityModeError::FriendNew | UpgradeCompatibilityModeError::FriendMissing => {
             friend_link_diag(compiled_unit_with_source)
         }
     }
@@ -1265,7 +1261,7 @@ fn function_signature_mismatch_diag(
             .parameters
             .iter()
             .enumerate()
-            .zip(new_function.parameters.iter())
+            .zip_debug_eq(new_function.parameters.iter())
         {
             if old_param != new_param {
                 let param_loc = func_sourcemap
@@ -1351,7 +1347,7 @@ fn function_signature_mismatch_diag(
             .type_parameters
             .iter()
             .enumerate()
-            .zip(new_function.type_parameters.iter())
+            .zip_debug_eq(new_function.type_parameters.iter())
         {
             if old_type_param != new_type_param {
                 let type_param_loc = func_sourcemap
@@ -1426,7 +1422,7 @@ fn function_signature_mismatch_diag(
             .return_
             .iter()
             .enumerate()
-            .zip(new_function.return_.iter())
+            .zip_debug_eq(new_function.return_.iter())
         {
             let return_ = func_sourcemap
                 .returns
@@ -1735,37 +1731,41 @@ fn struct_field_mismatch_diag(
                 ),
             ],
         ));
-    } else if !old_fields
-        .iter()
-        .zip(&new_fields)
-        .all(|(old_field, new_field)| old_field.equivalent(new_field))
-    {
-        for (i, (old_field, new_field)) in old_fields.iter().zip(&new_fields).enumerate() {
-            if !old_field.equivalent(new_field) {
-                let field_loc = struct_sourcemap
-                    .fields
-                    .get(i)
-                    .context("Unable to get field location")?;
+    } else {
+        let fields_mismatch = !old_fields
+            .iter()
+            .zip_debug_eq(&new_fields)
+            .all(|(old_field, new_field)| old_field.equivalent(new_field));
+        if fields_mismatch {
+            for (i, (old_field, new_field)) in
+                old_fields.iter().zip_debug_eq(&new_fields).enumerate()
+            {
+                if !old_field.equivalent(new_field) {
+                    let field_loc = struct_sourcemap
+                        .fields
+                        .get(i)
+                        .context("Unable to get field location")?;
 
-                let (code, label) = field_mismatch_message(
-                    old_field,
-                    new_field,
-                    struct_sourcemap.type_parameters.clone(),
-                )?;
+                    let (code, label) = field_mismatch_message(
+                        old_field,
+                        new_field,
+                        struct_sourcemap.type_parameters.clone(),
+                    )?;
 
-                diags.add(Diagnostic::new(
-                    code,
-                    (*field_loc, label),
-                    vec![(def_loc, "Struct definition".to_string())],
-                    vec![
-                        reason.to_string(),
-                        format!(
-                            "Restore the original struct's {} for \
+                    diags.add(Diagnostic::new(
+                        code,
+                        (*field_loc, label),
+                        vec![(def_loc, "Struct definition".to_string())],
+                        vec![
+                            reason.to_string(),
+                            format!(
+                                "Restore the original struct's {} for \
                             struct '{struct_name}' including the ordering.",
-                            singular_or_plural(old_fields.len(), "field", "fields")
-                        ),
-                    ],
-                ));
+                                singular_or_plural(old_fields.len(), "field", "fields")
+                            ),
+                        ],
+                    ));
+                }
             }
         }
     }
@@ -1922,7 +1922,7 @@ fn enum_variant_field_message(
                     .fields
                     .0
                     .values()
-                    .zip(new_variant.fields.0.values())
+                    .zip_debug_eq(new_variant.fields.0.values())
                 {
                     if !old_field.equivalent(new_field) {
                         let (code, label) =
@@ -1964,6 +1964,8 @@ fn enum_variant_mismatch_diag(
 
     let def_loc = enum_sourcemap.definition_location;
 
+    #[allow(clippy::disallowed_methods)]
+    // Intentional zip: old and new enums may have different variant counts
     for (i, (old_variant, new_variant)) in old_enum
         .variants
         .values()
@@ -1976,7 +1978,7 @@ fn enum_variant_mismatch_diag(
                 .get(i)
                 .context("Unable to get variant location")?
                 .0
-                 .1;
+                .1;
 
             let messages = enum_variant_field_message(old_variant, new_variant)?;
 
@@ -2045,7 +2047,7 @@ fn enum_new_variant_diag(
                 .get(i)
                 .context("Unable to get variant location")?
                 .0
-                 .1;
+                .1;
 
             diags.add(Diagnostic::new(
                 Enums::VariantMismatch,
@@ -2258,13 +2260,13 @@ fn enum_changed_diag(
         )?);
     }
 
-    if old_enum.variants.len() != new_enum.variants.len()
+    let variants_mismatch = old_enum.variants.len() != new_enum.variants.len()
         || !old_enum
             .variants
             .values()
-            .zip(new_enum.variants.values())
-            .all(|(old_variant, new_variant)| old_variant.equivalent(new_variant))
-    {
+            .zip_debug_eq(new_enum.variants.values())
+            .all(|(old_variant, new_variant)| old_variant.equivalent(new_variant));
+    if variants_mismatch {
         diags.extend(enum_variant_mismatch_diag(
             enum_name,
             old_enum,
@@ -2422,7 +2424,7 @@ fn type_parameter_diag(
     } else if old_type_parameters != new_type_parameters {
         for (i, (old_type_param, new_type_param)) in old_type_parameters
             .iter()
-            .zip(new_type_parameters.iter())
+            .zip_debug_eq(new_type_parameters.iter())
             .enumerate()
         {
             let type_param_loc = type_parameter_locs
@@ -2577,7 +2579,7 @@ fn use_colors() -> bool {
 
     #[cfg(not(test))]
     {
-        use std::io::{stdout, IsTerminal};
+        use std::io::{IsTerminal, stdout};
         stdout().is_terminal()
     }
 }

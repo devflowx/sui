@@ -2,38 +2,39 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use backoff::ExponentialBackoff;
 use fastcrypto::traits::ToFromBytes;
-use futures::future::join_all;
 use futures::future::AbortHandle;
+use futures::future::join_all;
 use itertools::Itertools;
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{fs, io};
-use sui_config::{genesis::Genesis, NodeConfig};
+use sui_config::{NodeConfig, genesis::Genesis};
 use sui_core::authority_client::{AuthorityAPI, NetworkAuthorityClient};
 use sui_core::execution_cache::build_execution_cache_from_env;
-use sui_data_ingestion_core::{end_of_epoch_data, setup_single_workflow, ReaderOptions};
 use sui_network::default_mysten_network_config;
 use sui_protocol_config::Chain;
-use sui_sdk::SuiClient;
-use sui_sdk::SuiClientBuilder;
+use sui_rpc_api::Client;
 use sui_storage::object_store::http::HttpDownloaderBuilder;
-use sui_storage::object_store::util::Manifest;
-use sui_storage::object_store::util::PerEpochManifest;
 use sui_storage::object_store::util::MANIFEST_FILENAME;
+use sui_storage::object_store::util::Manifest;
+use sui_storage::object_store::util::{build_object_store, end_of_epoch_data, fetch_checkpoint};
 use sui_types::committee::QUORUM_THRESHOLD;
 use sui_types::crypto::AuthorityPublicKeyBytes;
+use sui_types::digests::ChainIdentifier;
 use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::messages_grpc::LayoutGenerationOption;
 use sui_types::multiaddr::Multiaddr;
 use sui_types::{base_types::*, object::Owner};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -46,32 +47,34 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use sui_config::object_storage_config::{ObjectStoreConfig, ObjectStoreType};
-use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::authority::AuthorityStore;
+use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::checkpoints::CheckpointStore;
 use sui_core::epoch::committee_store::CommitteeStore;
 use sui_core::storage::RocksDbStore;
-use sui_snapshot::reader::StateSnapshotReaderV1;
+use sui_snapshot::reader::{StateAccumulatorSender, StateSnapshotReaderV1};
 use sui_snapshot::setup_db_state;
-use sui_storage::object_store::util::{copy_file, exists, get_path};
 use sui_storage::object_store::ObjectStoreGetExt;
-use sui_storage::verify_checkpoint_range;
+use sui_storage::object_store::util::{exists, get_path};
+use sui_types::full_checkpoint_content::CheckpointData;
 use sui_types::messages_checkpoint::{CheckpointCommitment, ECMHLiveObjectSetDigest};
 use sui_types::messages_grpc::{
     ObjectInfoRequest, ObjectInfoRequestKind, ObjectInfoResponse, TransactionInfoRequest,
     TransactionStatus,
 };
 
-use crate::formal_snapshot_util::{read_summaries_for_list_no_verify, FormalSnapshotWorker};
+use crate::formal_snapshot_util::read_summaries_for_list_no_verify;
 use sui_core::authority::authority_store_pruner::PrunerWatermarks;
 use sui_types::storage::ReadStore;
 use tracing::info;
 use typed_store::DBMetrics;
 
 pub mod commands;
-#[cfg(not(tidehunter))]
+pub mod db_shell;
 pub mod db_tool;
 mod formal_snapshot_util;
+#[cfg(all(feature = "tideconsole", not(windows)))]
+pub mod tideconsole_cmd;
 
 #[derive(
     Clone, Serialize, Deserialize, Debug, PartialEq, Copy, PartialOrd, Ord, Eq, ValueEnum, Default,
@@ -93,20 +96,21 @@ pub enum SnapshotVerifyMode {
 
 // This functions requires at least one of genesis or fullnode_rpc to be `Some`.
 async fn make_clients(
-    sui_client: &Arc<SuiClient>,
+    sui_client: &Client,
 ) -> Result<BTreeMap<AuthorityName, (Multiaddr, NetworkAuthorityClient)>> {
     let mut net_config = default_mysten_network_config();
     net_config.connect_timeout = Some(Duration::from_secs(5));
     let mut authority_clients = BTreeMap::new();
 
     let active_validators = sui_client
-        .governance_api()
-        .get_latest_sui_system_state()
+        .get_system_state_summary(None)
         .await?
         .active_validators;
 
     for validator in active_validators {
-        let net_addr = Multiaddr::try_from(validator.net_address).unwrap();
+        let net_addr = Multiaddr::try_from(validator.net_address)
+            .unwrap()
+            .rewrite_http_to_https();
         let tls_config = sui_tls::create_rustls_client_config(
             sui_types::crypto::NetworkPublicKey::from_bytes(&validator.network_pubkey_bytes)?,
             sui_tls::SUI_VALIDATOR_SERVER_NAME.to_string(),
@@ -375,7 +379,7 @@ pub async fn get_transaction_block(
     show_input_tx: bool,
     fullnode_rpc: String,
 ) -> Result<String> {
-    let sui_client = Arc::new(SuiClientBuilder::default().build(fullnode_rpc).await?);
+    let sui_client = Client::new(fullnode_rpc)?;
     let clients = make_clients(&sui_client).await?;
     let timer = Instant::now();
     let responses = join_all(clients.iter().map(|(name, (address, client))| async {
@@ -583,13 +587,11 @@ fn start_summary_sync(
     m: MultiProgress,
     genesis: Genesis,
     ingestion_url: String,
-    epoch: u64,
     num_parallel_downloads: usize,
     verify: bool,
-    all_checkpoints: bool,
+    end_of_epoch_checkpoint_seq_nums: Vec<u64>,
 ) -> JoinHandle<Result<(), anyhow::Error>> {
     tokio::spawn(async move {
-        info!("Starting summary sync");
         let store = AuthorityStore::open_no_genesis(perpetual_db, false, &Registry::default())?;
         let cache_traits = build_execution_cache_from_env(&Registry::default(), &store);
         let state_sync_store =
@@ -605,22 +607,11 @@ fn start_summary_sync(
             checkpoint_store.update_highest_synced_checkpoint(&genesis.checkpoint())?;
         }
 
-        let end_of_epoch_checkpoint_seq_nums: Vec<_> =
-            end_of_epoch_data(ingestion_url.clone(), vec![], 5)
-                .await?
-                .into_iter()
-                .take((epoch + 1) as usize)
-                .collect();
-
         let last_checkpoint = end_of_epoch_checkpoint_seq_nums
             .last()
             .expect("Expected at least one checkpoint");
 
-        let num_to_sync = if all_checkpoints {
-            *last_checkpoint
-        } else {
-            end_of_epoch_checkpoint_seq_nums.len() as u64
-        };
+        let num_to_sync = end_of_epoch_checkpoint_seq_nums.len() as u64;
         let sync_progress_bar = m.add(
             ProgressBar::new(num_to_sync).with_style(
                 ProgressStyle::with_template("[{elapsed_precise}] {wide_bar} {pos}/{len} ({msg})")
@@ -639,7 +630,7 @@ fn start_summary_sync(
             .unwrap_or(0);
         let s_start = latest_synced
             .checked_add(1)
-            .context("Checkpoint overflow")
+            .wrap_err("Checkpoint overflow")
             .map_err(|_| anyhow!("Failed to increment checkpoint"))?;
         tokio::spawn(async move {
             loop {
@@ -658,32 +649,16 @@ fn start_summary_sync(
             }
         });
 
-        if all_checkpoints {
-            let reader_options = ReaderOptions {
-                batch_size: num_parallel_downloads,
-                upper_limit: Some(last_checkpoint + 1),
-                ..Default::default()
-            };
-            let (executor, _exit_sender) = setup_single_workflow(
-                FormalSnapshotWorker(state_sync_store.clone(), sync_checkpoint_counter),
-                ingestion_url,
-                s_start,
-                1,
-                Some(reader_options),
-            )
-            .await?;
-            executor.await?;
-        } else {
-            read_summaries_for_list_no_verify(
-                ingestion_url,
-                num_parallel_downloads,
-                state_sync_store.clone(),
-                end_of_epoch_checkpoint_seq_nums.clone(),
-                sync_checkpoint_counter,
-            )
-            .await?;
-        }
+        read_summaries_for_list_no_verify(
+            ingestion_url,
+            num_parallel_downloads,
+            state_sync_store.clone(),
+            end_of_epoch_checkpoint_seq_nums.clone(),
+            sync_checkpoint_counter,
+        )
+        .await?;
         sync_progress_bar.finish_with_message("Checkpoint summary sync is complete");
+        info!("Checkpoint summary sync is complete");
 
         let checkpoint = checkpoint_store
             .get_checkpoint_by_sequence_number(*last_checkpoint)?
@@ -703,7 +678,6 @@ fn start_summary_sync(
             let v_instant = Instant::now();
 
             tokio::spawn(async move {
-                let v_start = if all_checkpoints { s_start } else { 0 };
                 loop {
                     if cloned_verify_progress_bar.is_finished() {
                         break;
@@ -711,7 +685,7 @@ fn start_summary_sync(
                     let num_summaries = cloned_verify_counter.load(Ordering::Relaxed);
                     let total_checkpoints_per_sec =
                         num_summaries as f64 / v_instant.elapsed().as_secs_f64();
-                    cloned_verify_progress_bar.set_position(v_start + num_summaries);
+                    cloned_verify_progress_bar.set_position(num_summaries);
                     cloned_verify_progress_bar.set_message(format!(
                         "checkpoints verified per sec: {}",
                         total_checkpoints_per_sec
@@ -720,44 +694,19 @@ fn start_summary_sync(
                 }
             });
 
-            if all_checkpoints {
-                // in this case we need to verify all the checkpoints in the range pairwise
-                let v_start = s_start;
-                // update highest verified to be highest synced. We will move back
-                // iff parallel verification succeeds
-                let latest_verified = checkpoint_store
-                    .get_checkpoint_by_sequence_number(latest_synced)
-                    .expect("Failed to get checkpoint")
-                    .expect("Expected checkpoint to exist after summary sync");
-                checkpoint_store
-                    .update_highest_verified_checkpoint(&latest_verified)
-                    .expect("Failed to update highest verified checkpoint");
-
-                let verify_range = v_start..last_checkpoint + 1;
-                verify_checkpoint_range(
-                    verify_range,
-                    state_sync_store,
-                    verify_checkpoint_counter,
-                    num_parallel_downloads,
-                )
-                .await;
-            } else {
-                // in this case we only need to verify the end of epoch checkpoints by checking
-                // signatures against the corresponding epoch committee.
-                for (cp_epoch, epoch_last_cp_seq_num) in
-                    end_of_epoch_checkpoint_seq_nums.iter().enumerate()
-                {
-                    let epoch_last_checkpoint = checkpoint_store
-                        .get_checkpoint_by_sequence_number(*epoch_last_cp_seq_num)?
-                        .ok_or(anyhow!("Failed to read checkpoint"))?;
-                    let committee = state_sync_store.get_committee(cp_epoch as u64).expect(
-                        "Expected committee to exist after syncing all end of epoch checkpoints",
-                    );
-                    epoch_last_checkpoint
-                        .verify_authority_signatures(&committee)
-                        .expect("Failed to verify checkpoint");
-                    verify_checkpoint_counter.fetch_add(1, Ordering::Relaxed);
-                }
+            for (cp_epoch, epoch_last_cp_seq_num) in
+                end_of_epoch_checkpoint_seq_nums.iter().enumerate()
+            {
+                let epoch_last_checkpoint = checkpoint_store
+                    .get_checkpoint_by_sequence_number(*epoch_last_cp_seq_num)?
+                    .ok_or(anyhow!("Failed to read checkpoint"))?;
+                let committee = state_sync_store.get_committee(cp_epoch as u64).expect(
+                    "Expected committee to exist after syncing all end of epoch checkpoints",
+                );
+                epoch_last_checkpoint
+                    .verify_authority_signatures(&committee)
+                    .expect("Failed to verify checkpoint");
+                verify_checkpoint_counter.fetch_add(1, Ordering::Relaxed);
             }
 
             verify_progress_bar.finish_with_message("Checkpoint summary verification is complete");
@@ -797,23 +746,39 @@ pub async fn check_completed_snapshot(
     epoch: EpochId,
 ) -> Result<(), anyhow::Error> {
     let success_marker = format!("epoch_{}/_SUCCESS", epoch);
+    let archive_success_marker = format!("archive/epoch_{}/_SUCCESS", epoch);
     let remote_object_store = if snapshot_store_config.no_sign_request {
         snapshot_store_config.make_http()?
     } else {
         snapshot_store_config.make().map(Arc::new)?
     };
-    if exists(&remote_object_store, &get_path(success_marker.as_str())).await {
+
+    // Check regular location first, then archive location
+    if exists(&remote_object_store, &get_path(success_marker.as_str())).await
+        || exists(
+            &remote_object_store,
+            &get_path(archive_success_marker.as_str()),
+        )
+        .await
+    {
         Ok(())
     } else {
         Err(anyhow!(
-            "missing success marker at {}/{}",
+            "missing success marker at {}/{} or {}/{}",
             snapshot_store_config.bucket.as_ref().unwrap_or(
                 &snapshot_store_config
                     .clone()
                     .aws_endpoint
                     .unwrap_or("unknown_bucket".to_string())
             ),
-            success_marker
+            success_marker,
+            snapshot_store_config.bucket.as_ref().unwrap_or(
+                &snapshot_store_config
+                    .clone()
+                    .aws_endpoint
+                    .unwrap_or("unknown_bucket".to_string())
+            ),
+            archive_success_marker
         ))
     }
 }
@@ -825,24 +790,28 @@ pub async fn download_formal_snapshot(
     snapshot_store_config: ObjectStoreConfig,
     ingestion_url: &str,
     num_parallel_downloads: usize,
+    num_parallel_chunks: usize,
     network: Chain,
     verify: SnapshotVerifyMode,
-    all_checkpoints: bool,
     max_retries: usize,
+    metrics_port: u16,
 ) -> Result<(), anyhow::Error> {
     let m = MultiProgress::new();
-    m.println(format!(
+    let msg = format!(
         "Beginning formal snapshot restore to end of epoch {}, network: {:?}, verification mode: {:?}",
-        epoch, network, verify,
-    ))?;
+        epoch, network, verify
+    );
+    m.println(&msg).unwrap();
+    info!("{}", msg);
+
     let path = path.join("staging").to_path_buf();
     if path.exists() {
         fs::remove_dir_all(path.clone())?;
     }
 
     // Start prometheus server so that we can serve metrics during snapshot download
-    let registry_service =
-        mysten_metrics::start_prometheus_server("127.0.0.1:9184".parse().unwrap());
+    let metrics_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), metrics_port);
+    let registry_service = mysten_metrics::start_prometheus_server(metrics_addr);
     let prometheus_registry = registry_service.default_registry();
     DBMetrics::init(registry_service.clone());
     mysten_metrics::init_metrics(&prometheus_registry);
@@ -852,8 +821,17 @@ pub async fn download_formal_snapshot(
         None,
         None,
     ));
-    let genesis = Genesis::load(genesis).unwrap();
-    let genesis_committee = genesis.committee()?;
+    let genesis = Genesis::load(genesis)?;
+    let genesis_chain = ChainIdentifier::from(*genesis.checkpoint().digest()).chain();
+    if genesis_chain != network {
+        return Err(anyhow!(
+            "Genesis file is for chain {}, but formal snapshot download is configured for --network {}. \
+            Use the matching genesis.blob or pass the correct --network flag.",
+            genesis_chain.as_str(),
+            network.as_str(),
+        ));
+    }
+    let genesis_committee = genesis.committee();
     let committee_store = Arc::new(CommitteeStore::new(
         path.join("epochs"),
         &genesis_committee,
@@ -864,6 +842,12 @@ pub async fn download_formal_snapshot(
         Arc::new(PrunerWatermarks::default()),
     );
 
+    let end_of_epoch_checkpoint_seq_nums: Vec<_> = end_of_epoch_data(ingestion_url, vec![])
+        .await?
+        .into_iter()
+        .take((epoch + 1) as usize)
+        .collect();
+
     let summaries_handle = start_summary_sync(
         perpetual_db.clone(),
         committee_store.clone(),
@@ -871,11 +855,31 @@ pub async fn download_formal_snapshot(
         m.clone(),
         genesis.clone(),
         ingestion_url.to_string(),
-        epoch,
         num_parallel_downloads,
         verify != SnapshotVerifyMode::None,
-        all_checkpoints,
+        end_of_epoch_checkpoint_seq_nums.clone(),
     );
+
+    // Start transaction backfill in parallel with summary sync
+    let backfill_handle = {
+        let perpetual_db = perpetual_db.clone();
+        let ingestion_url = ingestion_url.to_string();
+        let m = m.clone();
+        let end_of_epoch_checkpoint_seq_nums = end_of_epoch_checkpoint_seq_nums.clone();
+        tokio::spawn(async move {
+            backfill_epoch_transaction_digests(
+                perpetual_db,
+                epoch,
+                ingestion_url,
+                num_parallel_downloads,
+                max_retries,
+                m,
+                end_of_epoch_checkpoint_seq_nums,
+            )
+            .await
+        })
+    };
+
     let (_abort_handle, abort_registration) = AbortHandle::new_pair();
     let perpetual_db_clone = perpetual_db.clone();
     let snapshot_dir = path.parent().unwrap().join("snapshot");
@@ -887,6 +891,7 @@ pub async fn download_formal_snapshot(
     // TODO if verify is false, we should skip generating these and
     // not pass in a channel to the reader
     let (sender, mut receiver) = mpsc::channel(num_parallel_downloads);
+    let (accumulation_done_sender, accumulation_done_receiver) = oneshot::channel();
     let m_clone = m.clone();
 
     let snapshot_handle = tokio::spawn(async move {
@@ -903,25 +908,61 @@ pub async fn download_formal_snapshot(
             m_clone,
             false, // skip_reset_local_store
             max_retries,
+            num_parallel_chunks,
         )
         .await
-        .unwrap_or_else(|err| panic!("Failed to create reader: {}", err));
+        .context("Failed to create snapshot reader")?;
         reader
-            .read(&perpetual_db_clone, abort_registration, Some(sender))
+            .read(
+                perpetual_db_clone.clone(),
+                abort_registration,
+                Some(StateAccumulatorSender {
+                    partials: sender,
+                    completion: accumulation_done_sender,
+                }),
+            )
             .await
-            .unwrap_or_else(|err| panic!("Failed during read: {}", err));
+            .context("Failed to read snapshot")?;
+        info!("Snapshot download complete");
         Ok::<(), anyhow::Error>(())
     });
+    tokio::pin!(summaries_handle);
+    tokio::pin!(snapshot_handle);
+    tokio::pin!(backfill_handle);
+
     let mut root_global_state_hash = GlobalStateHash::default();
     let mut num_live_objects = 0;
     while let Some((partial_hash, num_objects)) = receiver.recv().await {
         num_live_objects += num_objects;
         root_global_state_hash.union(&partial_hash);
     }
-    summaries_handle
-        .await
-        .expect("Task join failed")
-        .expect("Summaries task failed");
+    if accumulation_done_receiver.await.is_err() {
+        (&mut snapshot_handle)
+            .await
+            .map_err(|error| anyhow!("Snapshot task failed: {error}"))??;
+        return Err(anyhow!("Snapshot accumulation did not complete"));
+    }
+
+    let mut summaries_done = false;
+    let mut snapshot_done = false;
+    let mut backfill_done = false;
+
+    while !summaries_done {
+        tokio::select! {
+            result = &mut summaries_handle, if !summaries_done => {
+                summaries_done = true;
+                result.map_err(|error| anyhow!("Summaries task failed: {error}"))??;
+            }
+            result = &mut backfill_handle, if !backfill_done => {
+                backfill_done = true;
+                result.map_err(|error| anyhow!("Backfill task failed: {error}"))??;
+            }
+            result = &mut snapshot_handle, if !snapshot_done => {
+                snapshot_done = true;
+                result.map_err(|error| anyhow!("Snapshot task failed: {error}"))??;
+            }
+        }
+    }
 
     let last_checkpoint = checkpoint_store
         .get_highest_verified_checkpoint()?
@@ -978,10 +1019,18 @@ pub async fn download_formal_snapshot(
         )?;
     }
 
-    snapshot_handle
-        .await
-        .expect("Task join failed")
-        .expect("Snapshot restore task failed");
+    while !snapshot_done || !backfill_done {
+        tokio::select! {
+            result = &mut backfill_handle, if !backfill_done => {
+                backfill_done = true;
+                result.map_err(|error| anyhow!("Backfill task failed: {error}"))??;
+            }
+            result = &mut snapshot_handle, if !snapshot_done => {
+                snapshot_done = true;
+                result.map_err(|error| anyhow!("Snapshot task failed: {error}"))??;
+            }
+        }
+    }
 
     // TODO we should ensure this map is being updated for all end of epoch
     // checkpoints during summary sync. This happens in `insert_{verified|certified}_checkpoint`
@@ -992,14 +1041,32 @@ pub async fn download_formal_snapshot(
         epoch,
         root_global_state_hash.clone(),
         perpetual_db.clone(),
-        checkpoint_store,
+        checkpoint_store.clone(),
         committee_store,
         network,
         verify == SnapshotVerifyMode::Strict,
         num_live_objects,
-        m,
+        m.clone(),
     )
     .await?;
+
+    // After a large backfill, rebuild the tidehunter control region to reclaim disk space
+    // and reduce startup time. No-op when compiled without tidehunter.
+    #[cfg(tidehunter)]
+    {
+        perpetual_db
+            .force_rebuild_control_region()
+            .expect("Failed to rebuild tidehunter control region after snapshot restore");
+        // The tidehunter Db spawns background threads (periodic snapshot, relocator,
+        // flusher pool, etc.) that own file handles inside the staging directory.
+        // Wait for them to exit before renaming staging -> live, otherwise a
+        // periodic timer could try to open a new file under the (now missing) path.
+        println!(
+            "Waiting for tidehunter background threads to finish before renaming staging to live"
+        );
+        perpetual_db.wait_for_tidehunter_background_threads();
+        println!("Tidehunter background threads finished, proceeding with rename");
+    }
 
     let new_path = path.parent().unwrap().join("live");
     if new_path.exists() {
@@ -1015,142 +1082,154 @@ pub async fn download_formal_snapshot(
     Ok(())
 }
 
-pub async fn download_db_snapshot(
-    path: &Path,
-    epoch: u64,
-    snapshot_store_config: ObjectStoreConfig,
-    skip_indexes: bool,
-    num_parallel_downloads: usize,
+async fn backfill_epoch_transaction_digests(
+    perpetual_db: Arc<AuthorityPerpetualTables>,
+    epoch: EpochId,
+    ingestion_url: String,
+    concurrency: usize,
     max_retries: usize,
-) -> Result<(), anyhow::Error> {
-    let remote_store = if snapshot_store_config.no_sign_request {
-        snapshot_store_config.make_http()?
+    m: MultiProgress,
+    end_of_epoch_checkpoint_seq_nums: Vec<u64>,
+) -> Result<()> {
+    if epoch == 0 {
+        return Ok(());
+    }
+
+    // Use end_of_epoch_checkpoint_seq_nums to get checkpoint ranges
+    // we're backfilling up to the last checkpoint of the previous epoch
+    // end_of_epoch_checkpoint_seq_nums[890] == end of epoch checkpoint for epoch_891
+    // if restoring from epoch_891, we want to backfill checkpoints from end of epoch_890 to end of epoch_891
+    // (when restoring from epoch_891, node will immediately start in epoch 892, so prev_epoch == epoch_891)
+    let epoch_last_cp_seq = end_of_epoch_checkpoint_seq_nums
+        .get(epoch as usize)
+        .ok_or_else(|| anyhow!("No checkpoint sequence found for epoch {}", epoch))?;
+
+    let epoch_start_cp = if epoch == 0 {
+        0
     } else {
-        snapshot_store_config.make().map(Arc::new)?
+        end_of_epoch_checkpoint_seq_nums
+            .get(epoch as usize - 1)
+            .map(|cp| cp + 1)
+            .unwrap_or(0)
     };
+    let msg = format!(
+        "Beginning transaction digest backfill for epoch: {:?}, backfilling from: {:?}..{:?}",
+        epoch, epoch_start_cp, epoch_last_cp_seq
+    );
+    m.println(&msg).ok();
+    info!("{}", msg);
 
-    // We rely on the top level MANIFEST file which contains all valid epochs
-    let manifest_contents = remote_store.get_bytes(&get_path(MANIFEST_FILENAME)).await?;
-    let root_manifest: Manifest = serde_json::from_slice(&manifest_contents)
-        .map_err(|err| anyhow!("Error parsing MANIFEST from bytes: {}", err))?;
+    let checkpoints_to_fetch: Vec<_> = (epoch_start_cp..=*epoch_last_cp_seq).collect();
+    let num_checkpoints = checkpoints_to_fetch.len();
 
-    if !root_manifest.epoch_exists(epoch) {
-        return Err(anyhow!(
-            "Epoch dir {} doesn't exist on the remote store",
-            epoch
-        ));
-    }
+    let progress_bar = m.add(
+        ProgressBar::new(num_checkpoints as u64).with_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {wide_bar} {pos}/{len} transactions backfilled ({msg})",
+            )
+            .unwrap(),
+        ),
+    );
 
-    let epoch_path = format!("epoch_{}", epoch);
-    let epoch_dir = get_path(&epoch_path);
+    let client = build_object_store(&ingestion_url, vec![], vec![]);
+    let checkpoint_counter = Arc::new(AtomicU64::new(0));
+    let tx_counter = Arc::new(AtomicU64::new(0));
+    let cloned_checkpoint_counter = checkpoint_counter.clone();
+    let cloned_progress_bar = progress_bar.clone();
+    let start_instant = Instant::now();
 
-    let manifest_file = epoch_dir.child(MANIFEST_FILENAME);
-    let epoch_manifest_contents =
-        String::from_utf8(remote_store.get_bytes(&manifest_file).await?.to_vec())
-            .map_err(|err| anyhow!("Error parsing {}/MANIFEST from bytes: {}", epoch_path, err))?;
-
-    let epoch_manifest =
-        PerEpochManifest::deserialize_from_newline_delimited(&epoch_manifest_contents);
-
-    let mut files: Vec<String> = vec![];
-    files.extend(epoch_manifest.filter_by_prefix("store/perpetual").lines);
-    files.extend(epoch_manifest.filter_by_prefix("epochs").lines);
-    files.extend(epoch_manifest.filter_by_prefix("checkpoints").lines);
-    if !skip_indexes {
-        files.extend(epoch_manifest.filter_by_prefix("indexes").lines)
-    }
-    let local_store = ObjectStoreConfig {
-        object_store: Some(ObjectStoreType::File),
-        directory: Some(path.to_path_buf()),
-        ..Default::default()
-    }
-    .make()?;
-    let m = MultiProgress::new();
-    let path = path.to_path_buf();
-    let snapshot_handle = tokio::spawn(async move {
-        let progress_bar = m.add(
-            ProgressBar::new(files.len() as u64).with_style(
-                ProgressStyle::with_template(
-                    "[{elapsed_precise}] {wide_bar} {pos} out of {len} files done ({msg})",
-                )
-                .unwrap(),
-            ),
-        );
-        let cloned_progress_bar = progress_bar.clone();
-        let file_counter = Arc::new(AtomicUsize::new(0));
-        futures::stream::iter(files.iter())
-            .map(|file| {
-                let local_store = local_store.clone();
-                let remote_store = remote_store.clone();
-                let counter_cloned = file_counter.clone();
-                async move {
-                    counter_cloned.fetch_add(1, Ordering::Relaxed);
-                    let file_path = get_path(format!("epoch_{}/{}", epoch, file).as_str());
-
-                    let mut attempts = 0;
-                    let max_attempts = max_retries + 1;
-                    loop {
-                        attempts += 1;
-                        match copy_file(&file_path, &file_path, &remote_store, &local_store).await {
-                            Ok(()) => break,
-                            Err(e) if attempts >= max_attempts => {
-                                return Err(anyhow::anyhow!(
-                                    "Failed to download {} after {} attempts: {}",
-                                    file_path,
-                                    attempts,
-                                    e
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to download {} (attempt {}/{}): {}, retrying in {}ms",
-                                    file_path,
-                                    attempts,
-                                    max_attempts,
-                                    e,
-                                    1000 * attempts
-                                );
-                                tokio::time::sleep(Duration::from_millis(1000 * attempts as u64))
-                                    .await;
-                            }
-                        }
-                    }
-
-                    Ok::<::object_store::path::Path, anyhow::Error>(file_path.clone())
-                }
-            })
-            .boxed()
-            .buffer_unordered(num_parallel_downloads)
-            .try_for_each(|path| {
-                file_counter.fetch_sub(1, Ordering::Relaxed);
-                cloned_progress_bar.inc(1);
-                cloned_progress_bar.set_message(format!(
-                    "Downloading file: {}, #downloads_in_progress: {}",
-                    path,
-                    file_counter.load(Ordering::Relaxed)
-                ));
-                futures::future::ready(Ok(()))
-            })
-            .await?;
-        progress_bar.finish_with_message("Snapshot file download is complete");
-        Ok::<(), anyhow::Error>(())
+    tokio::spawn(async move {
+        loop {
+            if cloned_progress_bar.is_finished() {
+                break;
+            }
+            let num_checkpoints_processed = cloned_checkpoint_counter.load(Ordering::Relaxed);
+            let elapsed = start_instant.elapsed().as_secs_f64();
+            let chkpts_per_sec = if elapsed > 0.0 {
+                num_checkpoints_processed as f64 / elapsed
+            } else {
+                0.0
+            };
+            cloned_progress_bar.set_position(num_checkpoints_processed);
+            cloned_progress_bar.set_message(format!("{:.1} chkpts/sec", chkpts_per_sec));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     });
 
-    let tasks: Vec<_> = vec![Box::pin(snapshot_handle)];
-    join_all(tasks)
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .for_each(|result| result.expect("Task failed"));
+    futures::stream::iter(checkpoints_to_fetch)
+        .map(|sq| {
+            let client = client.clone();
+            async move {
+                // Retry with exponential backoff. This backfill runs concurrently with the
+                // CPU-bound state accumulation; on a busy host the async runtime can be starved
+                // long enough that a single checkpoint fetch times out, and the
+                // `.try_for_each().await?` below then aborts the entire (multi-hour) snapshot
+                // restore, discarding all progress. Retry (up to `max_retries` attempts) so the
+                // fetch waits out the contention and completes instead.
+                let attempts = AtomicUsize::new(0);
+                backoff::future::retry_notify(
+                    ExponentialBackoff {
+                        max_interval: Duration::from_secs(30),
+                        max_elapsed_time: None,
+                        ..Default::default()
+                    },
+                    || async {
+                        fetch_checkpoint(&client, sq).await.map_err(|e| {
+                            if attempts.fetch_add(1, Ordering::Relaxed) + 1 >= max_retries {
+                                backoff::Error::permanent(e)
+                            } else {
+                                backoff::Error::transient(e)
+                            }
+                        })
+                    },
+                    |e, delay: Duration| {
+                        tracing::warn!(
+                            "backfill: checkpoint {} fetch failed (attempt {}/{}): {}; retrying in {:?}",
+                            sq,
+                            attempts.load(Ordering::Relaxed),
+                            max_retries,
+                            e,
+                            delay,
+                        );
+                    },
+                )
+                .await
+                .map(|c| Arc::new(CheckpointData::from(c)))
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_for_each(|checkpoint| {
+            let perpetual_db = perpetual_db.clone();
+            let tx_counter = tx_counter.clone();
+            let checkpoint_counter = checkpoint_counter.clone();
+            let checkpoint_data = checkpoint;
 
-    let store_dir = path.join("store");
-    if store_dir.exists() {
-        fs::remove_dir_all(&store_dir)?;
-    }
-    let epochs_dir = path.join("epochs");
-    if epochs_dir.exists() {
-        fs::remove_dir_all(&epochs_dir)?;
-    }
+            async move {
+                let tx_digests: Vec<_> = checkpoint_data
+                    .transactions
+                    .iter()
+                    .map(|tx_data| *tx_data.transaction.digest())
+                    .collect();
+                let num_txs = tx_digests.len();
+                perpetual_db
+                    .insert_executed_transaction_digests_batch(epoch, tx_digests.into_iter())?;
+                tx_counter.fetch_add(num_txs as u64, Ordering::Relaxed);
+                checkpoint_counter.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await?;
+
+    let tx_count = tx_counter.load(Ordering::Relaxed);
+    progress_bar.finish_with_message(format!(
+        "Backfill complete: {} transactions from {} checkpoints",
+        tx_count, num_checkpoints
+    ));
+    info!(
+        "Backfill complete: {} transactions from {} checkpoints",
+        tx_counter.load(Ordering::Relaxed),
+        checkpoint_counter.load(Ordering::Relaxed)
+    );
+
     Ok(())
 }

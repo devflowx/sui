@@ -81,11 +81,6 @@ pub struct BorrowState {
 // impls
 //**************************************************************************************************
 
-pub fn assert_single_value(mut values: Values) -> Value {
-    assert!(values.len() == 1);
-    values.pop().unwrap()
-}
-
 impl Value {
     pub fn is_ref(&self) -> bool {
         match self {
@@ -380,12 +375,25 @@ impl BorrowState {
         );
     }
 
-    fn local_borrowed_by(&self, local: &Var) -> BTreeMap<RefID, Loc> {
+    /// returns full borrows of the root and any borrows specific to the specified `local`
+    fn root_borrowed_by(&self, local: &Var) -> (BTreeMap<RefID, Loc>, BTreeMap<RefID, Loc>) {
         let (full_borrows, mut field_borrows) = self.borrows.borrowed_by(Self::LOCAL_ROOT);
-        assert!(full_borrows.is_empty());
-        field_borrows
+        let local_borrows = field_borrows
             .remove(&Self::local_label(local))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (full_borrows, local_borrows)
+    }
+
+    /// Returns specific borrows on the `local`,
+    /// Also includes any full borrows on the root that might have occurred via the "overflow"
+    /// optimization in the borrow graph
+    fn local_borrowed_by(&self, local: &Var) -> BTreeMap<RefID, Loc> {
+        let (mut full_borrows, mut field_borrows) = self.borrows.borrowed_by(Self::LOCAL_ROOT);
+        let local_borrows = field_borrows
+            .remove(&Self::local_label(local))
+            .unwrap_or_default();
+        full_borrows.extend(local_borrows);
+        full_borrows
     }
 
     // returns empty errors if borrowed_by is empty
@@ -405,11 +413,7 @@ impl BorrowState {
             &BTreeMap::new(),
             code,
             move || match display_var(local.value()) {
-                DisplayVar::Tmp => panic!(
-                    "ICE invalid use of tmp local {} with borrows {:#?}",
-                    local.value(),
-                    borrows
-                ),
+                DisplayVar::Tmp => format!("Invalid {} of temporary variable", verb),
                 DisplayVar::MatchTmp(_s) => format!("Invalid {} of temporary match variable", verb),
                 DisplayVar::Orig(s) => format!("Invalid {} of variable '{}'", verb, s),
             },
@@ -456,12 +460,12 @@ impl BorrowState {
                 Diagnostics::new()
             }
             Value::NonRef => {
-                let borrowed_by = self.local_borrowed_by(local);
+                let root_and_local_borrows = self.local_borrowed_by(local);
                 Self::check_use_borrowed_by(
                     &self.borrows,
                     loc,
                     local,
-                    &borrowed_by,
+                    &root_and_local_borrows,
                     ReferenceSafety::Dangling,
                     "assignment",
                 )
@@ -502,11 +506,11 @@ impl BorrowState {
         let mut diags = Diagnostics::new();
         for (local, stored_value) in self.locals.key_cloned_iter() {
             if let Value::NonRef = stored_value {
-                let borrowed_by = self.local_borrowed_by(&local);
+                let root_and_local_borrows = self.local_borrowed_by(&local);
                 let local_diag = Self::borrow_error(
                     &self.borrows,
                     loc,
-                    &borrowed_by,
+                    &root_and_local_borrows,
                     &BTreeMap::new(),
                     ReferenceSafety::InvalidReturn,
                     || {
@@ -569,42 +573,32 @@ impl BorrowState {
         self.locals.add(*local, Value::NonRef).unwrap();
         match old_value {
             Value::Ref(id) => (Diagnostics::new(), Value::Ref(id)),
-            Value::NonRef if last_usage_inferred => {
-                let borrowed_by = self.local_borrowed_by(local);
-
+            Value::NonRef
+                if last_usage_inferred
+                    && matches!(display_var(local.value()), DisplayVar::Orig(_)) =>
+            {
+                let root_and_local_borrows = self.local_borrowed_by(local);
                 let mut diag_opt = Self::borrow_error(
                     &self.borrows,
                     loc,
-                    &borrowed_by,
+                    &root_and_local_borrows,
                     &BTreeMap::new(),
                     ReferenceSafety::AmbiguousVariableUsage,
                     || {
                         let vstr = match display_var(local.value()) {
-                            DisplayVar::Tmp => {
-                                panic!("ICE invalid use tmp local {}", local.value())
-                            }
-                            DisplayVar::MatchTmp(s) => {
-                                panic!("ICE invalid use match tmp {}: {}", s, local.value())
-                            }
                             DisplayVar::Orig(s) => s,
+                            DisplayVar::MatchTmp(_) | DisplayVar::Tmp => unreachable!(),
                         };
                         format!("Ambiguous usage of variable '{}'", vstr)
                     },
                 );
-                diag_opt.iter_mut().for_each(|diag| {
-                    let vstr = match display_var(local.value()) {
-                        DisplayVar::Tmp => {
-                            panic!("ICE invalid use tmp local {}", local.value())
-                        }
-                        DisplayVar::MatchTmp(s) => {
-                            panic!("ICE invalid use match tmp {}: {}", s, local.value())
-                        }
+                // add a tip for user-defined variables
+                if let Some(diag) = &mut diag_opt {
+                    let v = match display_var(local.value()) {
                         DisplayVar::Orig(s) => s,
+                        DisplayVar::MatchTmp(_) | DisplayVar::Tmp => unreachable!(),
                     };
-                    let tip = format!(
-                        "Try an explicit annotation, e.g. 'move {v}' or 'copy {v}'",
-                        v = vstr
-                    );
+                    let tip = format!("Try an explicit annotation, e.g. 'move {v}' or 'copy {v}'");
                     const EXPLANATION: &str = "Ambiguous inference of 'move' or 'copy' for a \
                                                borrowed variable's last usage: A 'move' would \
                                                invalidate the borrowing reference, but a 'copy' \
@@ -612,16 +606,16 @@ impl BorrowState {
                                                this the last direct usage of the variable.";
                     diag.add_secondary_label((loc, tip));
                     diag.add_note(EXPLANATION);
-                });
+                };
                 (diag_opt.into(), Value::NonRef)
             }
             Value::NonRef => {
-                let borrowed_by = self.local_borrowed_by(local);
+                let root_and_local_borrows = self.local_borrowed_by(local);
                 let diag_opt = Self::check_use_borrowed_by(
                     &self.borrows,
                     loc,
                     local,
-                    &borrowed_by,
+                    &root_and_local_borrows,
                     ReferenceSafety::Dangling,
                     "move",
                 );
@@ -639,10 +633,11 @@ impl BorrowState {
                 (Diagnostics::new(), Value::Ref(new_id))
             }
             Value::NonRef => {
-                let borrowed_by = self.local_borrowed_by(local);
+                let (mut full_borrows, borrowed_by) = self.root_borrowed_by(local);
                 let borrows = &self.borrows;
-                // check that it is 'readable'
-                let mut_borrows = borrowed_by
+                // additional check that it is 'readable'
+                full_borrows.extend(borrowed_by);
+                let mut_borrows = full_borrows
                     .into_iter()
                     .filter(|(id, _loc)| borrows.is_mutable(*id))
                     .collect();
@@ -668,26 +663,24 @@ impl BorrowState {
         );
         let new_id = self.declare_new_ref(loc, mut_);
         // fails if there are full/epsilon borrows on the local
-        let borrowed_by = self.local_borrowed_by(local);
-        let diags = if !mut_ {
-            let borrows = &self.borrows;
+        let (mut full_borrows, borrowed_by) = self.root_borrowed_by(local);
+        let borrows = &self.borrows;
+        if !mut_ {
             // check that it is 'readable'
             let mut_borrows = borrowed_by
                 .into_iter()
-                .filter(|(id, _loc)| borrows.is_mutable(*id))
-                .collect();
-            Self::check_use_borrowed_by(
-                borrows,
-                loc,
-                local,
-                &mut_borrows,
-                ReferenceSafety::RefTrans,
-                "borrow",
-            )
-            .into()
-        } else {
-            Diagnostics::new()
+                .filter(|(id, _loc)| borrows.is_mutable(*id));
+            full_borrows.extend(mut_borrows);
         };
+        let diags = Self::check_use_borrowed_by(
+            borrows,
+            loc,
+            local,
+            &full_borrows,
+            ReferenceSafety::RefTrans,
+            "borrow",
+        )
+        .into();
         self.add_local_borrow(loc, local, new_id);
         (diags, Value::Ref(new_id))
     }

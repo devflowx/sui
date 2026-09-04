@@ -5,7 +5,7 @@ use crate::authority_aggregator::AuthorityAggregator;
 use crate::authority_client::AuthorityAPI;
 use crate::validator_client_monitor::stats::ClientObservedStats;
 use crate::validator_client_monitor::{
-    metrics::ValidatorClientMetrics, OperationFeedback, OperationType,
+    OperationFeedback, OperationType, metrics::ValidatorClientMetrics,
 };
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -15,10 +15,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use strum::IntoEnumIterator;
 use sui_config::validator_client_monitor_config::ValidatorClientMonitorConfig;
 use sui_types::committee::Committee;
-use sui_types::messages_grpc::TxType;
 use sui_types::{base_types::AuthorityName, messages_grpc::ValidatorHealthRequest};
 use tokio::{
     task::JoinSet,
@@ -42,7 +40,7 @@ pub struct ValidatorClientMonitor<A: Clone> {
     metrics: Arc<ValidatorClientMetrics>,
     client_stats: RwLock<ClientObservedStats>,
     authority_aggregator: Arc<ArcSwap<AuthorityAggregator<A>>>,
-    cached_latencies: RwLock<HashMap<TxType, HashMap<AuthorityName, Duration>>>,
+    cached_latencies: RwLock<HashMap<AuthorityName, Duration>>,
 }
 
 impl<A> ValidatorClientMonitor<A>
@@ -128,6 +126,7 @@ where
                                 authority_name: name,
                                 display_name: display_name.clone(),
                                 operation: OperationType::HealthCheck,
+                                ping_type: None,
                                 result: Ok(latency),
                             });
                         }
@@ -137,6 +136,7 @@ where
                                 authority_name: name,
                                 display_name: display_name.clone(),
                                 operation: OperationType::HealthCheck,
+                                ping_type: None,
                                 result: Err(()),
                             });
                         }
@@ -145,6 +145,7 @@ where
                                 authority_name: name,
                                 display_name,
                                 operation: OperationType::HealthCheck,
+                                ping_type: None,
                                 result: Err(()),
                             });
                         }
@@ -173,27 +174,16 @@ impl<A: Clone> ValidatorClientMonitor<A> {
         let committee = &authority_agg.committee;
         let mut cached_latencies = self.cached_latencies.write();
 
-        for tx_type in TxType::iter() {
-            let latencies_map = self
-                .client_stats
-                .read()
-                .get_all_validator_stats(committee, tx_type);
+        let latencies_map = self.client_stats.read().get_all_validator_stats(committee);
 
-            for (validator, latency) in latencies_map.iter() {
-                debug!(
-                    "Validator {}, tx type {}: latency {}",
-                    validator,
-                    tx_type.as_str(),
-                    latency.as_secs_f64()
-                );
-                let display_name = authority_agg.get_display_name(validator);
-                self.metrics
-                    .performance
-                    .with_label_values(&[&display_name, tx_type.as_str()])
-                    .set(latency.as_secs_f64());
-            }
-
-            cached_latencies.insert(tx_type, latencies_map);
+        for (validator, latency) in latencies_map.iter() {
+            debug!("Validator {}, latency {}", validator, latency.as_secs_f64());
+            let display_name = authority_agg.get_display_name(validator);
+            self.metrics
+                .performance
+                .with_label_values(&[display_name.as_str()])
+                .set(latency.as_secs_f64());
+            cached_latencies.insert(*validator, *latency);
         }
     }
 
@@ -209,31 +199,43 @@ impl<A: Clone> ValidatorClientMonitor<A> {
             OperationType::Submit => "submit",
             OperationType::Effects => "effects",
             OperationType::HealthCheck => "health_check",
-            OperationType::FastPath => "fast_path",
-            OperationType::Consensus => "consensus",
+            OperationType::SingleWriterFinality => "single_writer_finality",
+            OperationType::SharedObjectFinality => "shared_object_finality",
+        };
+        let ping_label = if feedback.ping_type.is_some() {
+            "true"
+        } else {
+            "false"
         };
 
         match feedback.result {
             Ok(latency) => {
                 self.metrics
                     .observed_latency
-                    .with_label_values(&[&feedback.display_name, operation_str])
+                    .with_label_values(&[feedback.display_name.as_str(), operation_str, ping_label])
                     .observe(latency.as_secs_f64());
                 self.metrics
                     .operation_success
-                    .with_label_values(&[&feedback.display_name, operation_str])
+                    .with_label_values(&[feedback.display_name.as_str(), operation_str, ping_label])
                     .inc();
             }
             Err(()) => {
                 self.metrics
                     .operation_failure
-                    .with_label_values(&[&feedback.display_name, operation_str])
+                    .with_label_values(&[feedback.display_name.as_str(), operation_str, ping_label])
                     .inc();
             }
         }
 
         let mut client_stats = self.client_stats.write();
         client_stats.record_interaction_result(feedback);
+    }
+
+    /// Whether any latency has been observed yet. Until then
+    /// `select_shuffled_preferred_validators` returns an arbitrary shuffle rather than a real
+    /// preference.
+    pub fn has_observed_latencies(&self) -> bool {
+        !self.cached_latencies.read().is_empty()
     }
 
     /// Select validators based on client-observed performance for the given transaction type.
@@ -252,13 +254,12 @@ impl<A: Clone> ValidatorClientMonitor<A> {
     pub fn select_shuffled_preferred_validators(
         &self,
         committee: &Committee,
-        tx_type: TxType,
         delta: f64,
     ) -> Vec<AuthorityName> {
         let mut rng = rand::thread_rng();
 
         let cached_latencies = self.cached_latencies.read();
-        let Some(cached_latencies) = cached_latencies.get(&tx_type) else {
+        if cached_latencies.is_empty() {
             let mut validators: Vec<_> = committee.names().cloned().collect();
             validators.shuffle(&mut rng);
             return validators;
@@ -293,10 +294,7 @@ impl<A: Clone> ValidatorClientMonitor<A> {
             .map(|(i, _)| i)
             .unwrap_or(validator_with_latencies.len());
         validator_with_latencies[..k].shuffle(&mut rng);
-        self.metrics
-            .shuffled_validators
-            .with_label_values(&[tx_type.as_str()])
-            .observe(k as f64);
+        self.metrics.shuffled_validators.observe(k as f64);
 
         validator_with_latencies
             .into_iter()

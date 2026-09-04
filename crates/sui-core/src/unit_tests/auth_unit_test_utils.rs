@@ -3,7 +3,7 @@
 
 use move_core_types::account_address::AccountAddress;
 use move_symbol_pool::Symbol;
-use sui_move_build::{BuildConfig, CompiledPackage};
+use sui_move_build::{BuildConfig, CompiledPackage, PublishedDependency};
 use sui_types::crypto::Signature;
 use sui_types::move_package::UpgradePolicy;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
@@ -12,6 +12,9 @@ use sui_types::utils::to_sender_signed_transaction;
 use super::authority_test_utils::*;
 use super::*;
 
+/// Compiles the package at path with the dep original addresses. It updates the compiled package
+/// dependencies' information to set the addresses of the package's dependencies to those in
+/// dep_ids -- which are the original ids for these packages.
 pub fn build_test_modules_with_dep_addr(
     path: &Path,
     dep_original_addresses: impl IntoIterator<Item = (&'static str, ObjectID)>,
@@ -35,14 +38,32 @@ pub fn build_test_modules_with_dep_addr(
         dep_id_mapping.len(),
         package.dependency_ids.unpublished.len()
     );
-    for unpublished_dep in &package.dependency_ids.unpublished {
-        let published_id = dep_id_mapping.get(unpublished_dep).unwrap();
+    let unpublished_deps = package
+        .dependency_ids
+        .unpublished
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for unpublished_dep in unpublished_deps {
+        let published_id = dep_id_mapping
+            .get(&unpublished_dep.id)
+            .or_else(|| dep_id_mapping.get(&unpublished_dep.name))
+            .unwrap();
         // Make sure we aren't overriding a package
-        assert!(package
-            .dependency_ids
-            .published
-            .insert(*unpublished_dep, *published_id)
-            .is_none())
+        assert!(
+            package
+                .dependency_ids
+                .published
+                .insert(
+                    unpublished_dep.id,
+                    PublishedDependency::new(
+                        unpublished_dep.id,
+                        unpublished_dep.name,
+                        *published_id,
+                    ),
+                )
+                .is_none()
+        )
     }
 
     // No unpublished deps
@@ -87,7 +108,7 @@ pub async fn publish_package_on_single_authority(
     );
 
     let signed = to_sender_signed_transaction(txn_data, sender_key);
-    let (_cert, effects) = send_and_confirm_transaction(state, signed).await?;
+    let (_tx, effects) = submit_and_execute(state, signed).await?;
     assert!(effects.data().status().is_ok());
     let package_id = effects
         .data()
@@ -96,7 +117,7 @@ pub async fn publish_package_on_single_authority(
         .find(|c| c.1 == Owner::Immutable)
         .unwrap()
         .0
-         .0;
+        .0;
     let cap_object = effects
         .data()
         .created()
@@ -139,7 +160,7 @@ pub async fn upgrade_package_on_single_authority(
     )
     .unwrap();
     let signed = to_sender_signed_transaction(data, sender_key);
-    let (_cert, effects) = send_and_confirm_transaction(state, signed).await?;
+    let (_tx, effects) = submit_and_execute(state, signed).await?;
     assert!(effects.data().status().is_ok());
     let package_id = effects
         .data()
@@ -148,6 +169,6 @@ pub async fn upgrade_package_on_single_authority(
         .find(|c| c.1 == Owner::Immutable)
         .unwrap()
         .0
-         .0;
+        .0;
     Ok((*effects.transaction_digest(), package_id))
 }

@@ -4,18 +4,20 @@
 //! Utility for generating programmable transactions, either by specifying a command or for
 //! migrating legacy transactions
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use indexmap::IndexMap;
 use move_core_types::{ident_str, identifier::Identifier, language_storage::TypeTag};
+use mysten_common::ZipDebugEqIteratorExt;
 use serde::Serialize;
 
 use crate::{
+    SUI_FRAMEWORK_PACKAGE_ID,
     base_types::{FullObjectID, FullObjectRef, ObjectID, ObjectRef, SuiAddress},
     move_package::PACKAGE_MODULE_NAME,
     transaction::{
         Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, ProgrammableTransaction,
+        SharedObjectMutability,
     },
-    SUI_FRAMEWORK_PACKAGE_ID,
 };
 
 #[cfg(test)]
@@ -87,12 +89,12 @@ impl ProgrammableTransactionBuilder {
                     ObjectArg::SharedObject {
                         id: id1,
                         initial_shared_version: v1,
-                        mutable: mut1,
+                        mutability: mut1,
                     },
                     ObjectArg::SharedObject {
                         id: id2,
                         initial_shared_version: v2,
-                        mutable: mut2,
+                        mutability: mut2,
                     },
                 ) if v1 == &v2 => {
                     anyhow::ensure!(
@@ -102,7 +104,13 @@ impl ProgrammableTransactionBuilder {
                     ObjectArg::SharedObject {
                         id,
                         initial_shared_version: v2,
-                        mutable: *mut1 || mut2,
+                        mutability: if mut1 == &SharedObjectMutability::Mutable
+                            || mut2 == SharedObjectMutability::Mutable
+                        {
+                            SharedObjectMutability::Mutable
+                        } else {
+                            mut2
+                        },
                     }
                 }
                 (old_obj_arg, obj_arg) => {
@@ -252,7 +260,7 @@ impl ProgrammableTransactionBuilder {
             FullObjectID::Consensus((id, initial_shared_version)) => ObjectArg::SharedObject {
                 id,
                 initial_shared_version,
-                mutable: true,
+                mutability: SharedObjectMutability::Mutable,
             },
         });
         self.commands
@@ -372,7 +380,7 @@ impl ProgrammableTransactionBuilder {
         // to minimize the number of transfers that must be performed
         let mut recipient_map: IndexMap<SuiAddress, Vec<usize>> = IndexMap::new();
         let mut amt_args = Vec::with_capacity(recipients.len());
-        for (i, (recipient, amount)) in recipients.into_iter().zip(amounts).enumerate() {
+        for (i, (recipient, amount)) in recipients.into_iter().zip_debug_eq(amounts).enumerate() {
             recipient_map.entry(recipient).or_default().push(i);
             amt_args.push(self.pure(amount)?);
         }

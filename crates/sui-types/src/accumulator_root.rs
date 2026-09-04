@@ -2,27 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    balance::Balance,
-    base_types::{ObjectID, SequenceNumber, SuiAddress},
-    digests::TransactionDigest,
-    dynamic_field::{
-        serialize_dynamic_field, BoundedDynamicFieldID, DynamicFieldKey, DynamicFieldObject, Field,
-        DYNAMIC_FIELD_FIELD_STRUCT_NAME, DYNAMIC_FIELD_MODULE_NAME,
-    },
-    error::{SuiError, SuiResult},
-    object::{MoveObject, Object, Owner},
-    storage::{ChildObjectResolver, ObjectStore},
     MoveTypeTagTrait, MoveTypeTagTraitGeneric, SUI_ACCUMULATOR_ROOT_ADDRESS,
     SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_FRAMEWORK_ADDRESS, SUI_FRAMEWORK_PACKAGE_ID,
+    accumulator_event::AccumulatorEvent,
+    balance::Balance,
+    base_types::{ObjectID, SequenceNumber, SuiAddress},
+    digests::{Digest, TransactionDigest},
+    dynamic_field::{
+        BoundedDynamicFieldID, DYNAMIC_FIELD_FIELD_STRUCT_NAME, DYNAMIC_FIELD_MODULE_NAME,
+        DynamicFieldKey, DynamicFieldObject, Field, serialize_dynamic_field,
+    },
+    error::{SuiError, SuiErrorKind, SuiResult},
+    object::{MoveObject, Object, Owner},
+    storage::{ObjectStore, RuntimeObjectResolver},
 };
 use move_core_types::{
+    account_address::AccountAddress,
     ident_str,
     identifier::IdentStr,
     language_storage::{StructTag, TypeTag},
+    u256::U256,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sui_protocol_config::ProtocolConfig;
 
 pub const ACCUMULATOR_ROOT_MODULE: &IdentStr = ident_str!("accumulator");
+pub const ACCUMULATOR_METADATA_MODULE: &IdentStr = ident_str!("accumulator_metadata");
 pub const ACCUMULATOR_SETTLEMENT_MODULE: &IdentStr = ident_str!("accumulator_settlement");
 pub const ACCUMULATOR_SETTLEMENT_EVENT_STREAM_HEAD: &IdentStr = ident_str!("EventStreamHead");
 pub const ACCUMULATOR_ROOT_CREATE_FUNC: &IdentStr = ident_str!("create");
@@ -32,6 +37,25 @@ pub const ACCUMULATOR_ROOT_SETTLEMENT_SETTLE_EVENTS_FUNC: &IdentStr = ident_str!
 
 const ACCUMULATOR_KEY_TYPE: &IdentStr = ident_str!("Key");
 const ACCUMULATOR_U128_TYPE: &IdentStr = ident_str!("U128");
+
+pub const SETTLEMENT_MAX_TYPE_INSTANTIATION_NODES: u64 = 512;
+
+pub fn is_settle_u128_call(
+    module_address: &AccountAddress,
+    module: &IdentStr,
+    function: &IdentStr,
+) -> bool {
+    *module_address == SUI_FRAMEWORK_ADDRESS
+        && module == ACCUMULATOR_SETTLEMENT_MODULE
+        && function == ACCUMULATOR_ROOT_SETTLE_U128_FUNC
+}
+
+pub fn check_accumulator_type_bounds(config: &ProtocolConfig, ty: &TypeTag) -> bool {
+    match config.max_accumulator_type_nodes_as_option() {
+        Some(max) => ty.node_count() <= max,
+        None => true,
+    }
+}
 
 pub fn get_accumulator_root_obj_initial_shared_version(
     object_store: &dyn ObjectStore,
@@ -46,8 +70,8 @@ pub fn get_accumulator_root_obj_initial_shared_version(
         }))
 }
 
-/// Rust type for the Move type AccumulatorKey used to derive the dynamic field id for the
-/// balance account object.
+/// Rust type for the Move type accumulator::Key used to derive the dynamic field id for the
+/// accumulator value.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AccumulatorKey {
     pub owner: SuiAddress,
@@ -85,7 +109,7 @@ impl MoveTypeTagTrait for U128 {
     }
 }
 
-/// New-type for ObjectIDs that are known to have been properly derived as an Balance accumulator field.
+/// New-type for ObjectIDs that are known to have been properly derived as a Balance accumulator field.
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct AccumulatorObjId(ObjectID);
 
@@ -99,12 +123,25 @@ impl AccumulatorObjId {
     }
 }
 
+impl std::fmt::Display for AccumulatorObjId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl AccumulatorValue {
+    pub fn as_u128(&self) -> Option<u128> {
+        match self {
+            AccumulatorValue::U128(value) => Some(value.value),
+        }
+    }
+
     pub fn get_field_id(owner: SuiAddress, type_: &TypeTag) -> SuiResult<AccumulatorObjId> {
         if !Balance::is_balance_type(type_) {
-            return Err(SuiError::TypeError {
+            return Err(SuiErrorKind::TypeError {
                 error: "only Balance<T> is supported".to_string(),
-            });
+            }
+            .into());
         }
 
         let key = AccumulatorKey { owner };
@@ -112,7 +149,7 @@ impl AccumulatorValue {
             DynamicFieldKey(
                 SUI_ACCUMULATOR_ROOT_OBJECT_ID,
                 key,
-                AccumulatorKey::get_type_tag(&[type_.clone()]),
+                AccumulatorKey::get_type_tag(std::slice::from_ref(type_)),
             )
             .into_unbounded_id()?
             .as_object_id(),
@@ -120,29 +157,30 @@ impl AccumulatorValue {
     }
 
     pub fn exists(
-        child_object_resolver: &dyn ChildObjectResolver,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
         version_bound: Option<SequenceNumber>,
         owner: SuiAddress,
         type_: &TypeTag,
     ) -> SuiResult<bool> {
         if !Balance::is_balance_type(type_) {
-            return Err(SuiError::TypeError {
+            return Err(SuiErrorKind::TypeError {
                 error: "only Balance<T> is supported".to_string(),
-            });
+            }
+            .into());
         }
 
         let key = AccumulatorKey { owner };
         DynamicFieldKey(
             SUI_ACCUMULATOR_ROOT_OBJECT_ID,
             key,
-            AccumulatorKey::get_type_tag(&[type_.clone()]),
+            AccumulatorKey::get_type_tag(std::slice::from_ref(type_)),
         )
         .into_id_with_bound(version_bound.unwrap_or(SequenceNumber::MAX))?
-        .exists(child_object_resolver)
+        .exists(runtime_object_resolver)
     }
 
     pub fn load_by_id<T>(
-        child_object_resolver: &dyn ChildObjectResolver,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
         version_bound: Option<SequenceNumber>,
         id: AccumulatorObjId,
     ) -> SuiResult<Option<T>>
@@ -154,29 +192,30 @@ impl AccumulatorValue {
             id.0,
             version_bound.unwrap_or(SequenceNumber::MAX),
         )
-        .load_object(child_object_resolver)?
+        .load_object(runtime_object_resolver)?
         .map(|o| o.load_value::<T>())
         .transpose()
     }
 
     pub fn load(
-        child_object_resolver: &dyn ChildObjectResolver,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
         version_bound: Option<SequenceNumber>,
         owner: SuiAddress,
         type_: &TypeTag,
     ) -> SuiResult<Option<Self>> {
         if !Balance::is_balance_type(type_) {
-            return Err(SuiError::TypeError {
+            return Err(SuiErrorKind::TypeError {
                 error: "only Balance<T> is supported".to_string(),
-            });
+            }
+            .into());
         }
 
         let key = AccumulatorKey { owner };
-        let key_type_tag = AccumulatorKey::get_type_tag(&[type_.clone()]);
+        let key_type_tag = AccumulatorKey::get_type_tag(std::slice::from_ref(type_));
 
         let Some(value) = DynamicFieldKey(SUI_ACCUMULATOR_ROOT_OBJECT_ID, key, key_type_tag)
             .into_id_with_bound(version_bound.unwrap_or(SequenceNumber::MAX))?
-            .load_object(child_object_resolver)?
+            .load_object(runtime_object_resolver)?
             .map(|o| o.load_value::<U128>())
             .transpose()?
         else {
@@ -187,20 +226,34 @@ impl AccumulatorValue {
     }
 
     pub fn load_object(
-        child_object_resolver: &dyn ChildObjectResolver,
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
         version_bound: Option<SequenceNumber>,
         owner: SuiAddress,
         type_: &TypeTag,
     ) -> SuiResult<Option<Object>> {
         let key = AccumulatorKey { owner };
-        let key_type_tag = AccumulatorKey::get_type_tag(&[type_.clone()]);
+        let key_type_tag = AccumulatorKey::get_type_tag(std::slice::from_ref(type_));
 
         Ok(
             DynamicFieldKey(SUI_ACCUMULATOR_ROOT_OBJECT_ID, key, key_type_tag)
                 .into_id_with_bound(version_bound.unwrap_or(SequenceNumber::MAX))?
-                .load_object(child_object_resolver)?
-                .map(|o| o.as_object()),
+                .load_object(runtime_object_resolver)?
+                .map(|o| o.into_object()),
         )
+    }
+
+    pub fn load_object_by_id(
+        runtime_object_resolver: &dyn RuntimeObjectResolver,
+        version_bound: Option<SequenceNumber>,
+        id: ObjectID,
+    ) -> SuiResult<Option<Object>> {
+        Ok(BoundedDynamicFieldID::<AccumulatorKey>::new(
+            SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+            id,
+            version_bound.unwrap_or(SequenceNumber::MAX),
+        )
+        .load_object(runtime_object_resolver)?
+        .map(|o| o.into_object()))
     }
 
     pub fn create_for_testing(owner: SuiAddress, type_tag: TypeTag, balance: u64) -> Object {
@@ -212,7 +265,7 @@ impl AccumulatorValue {
         let field_key = DynamicFieldKey(
             SUI_ACCUMULATOR_ROOT_OBJECT_ID,
             key,
-            AccumulatorKey::get_type_tag(&[type_tag.clone()]),
+            AccumulatorKey::get_type_tag(std::slice::from_ref(&type_tag)),
         );
         let field = field_key.into_field(value).unwrap();
         let move_object = field
@@ -227,24 +280,41 @@ impl AccumulatorValue {
     }
 }
 
+/// Extract stream id from an accumulator event if it targets sui::accumulator_settlement::EventStreamHead
+pub fn stream_id_from_accumulator_event(ev: &AccumulatorEvent) -> Option<SuiAddress> {
+    if let TypeTag::Struct(tag) = &ev.write.address.ty
+        && tag.address == SUI_FRAMEWORK_ADDRESS
+        && tag.module.as_ident_str() == ACCUMULATOR_SETTLEMENT_MODULE
+        && tag.name.as_ident_str() == ACCUMULATOR_SETTLEMENT_EVENT_STREAM_HEAD
+    {
+        return Some(ev.write.address.address);
+    }
+    None
+}
+
 impl TryFrom<&MoveObject> for AccumulatorValue {
+    type Error = SuiError;
+    fn try_from(value: &MoveObject) -> Result<Self, Self::Error> {
+        let (_key, value): (AccumulatorKey, AccumulatorValue) = value.try_into()?;
+        Ok(value)
+    }
+}
+
+impl TryFrom<&MoveObject> for (AccumulatorKey, AccumulatorValue) {
     type Error = SuiError;
     fn try_from(value: &MoveObject) -> Result<Self, Self::Error> {
         value
             .type_()
             .is_balance_accumulator_field()
-            .then(|| {
-                value
-                    .to_rust::<Field<AccumulatorKey, U128>>()
-                    .map(|f| f.value)
-            })
+            .then(|| value.to_rust::<Field<AccumulatorKey, U128>>())
             .flatten()
-            .map(Self::U128)
+            .map(|f| (f.name, AccumulatorValue::U128(f.value)))
             .ok_or_else(|| {
-                SuiError::DynamicFieldReadError(format!(
+                SuiErrorKind::DynamicFieldReadError(format!(
                     "Dynamic field {:?} is not a AccumulatorValue",
                     value.id()
                 ))
+                .into()
             })
     }
 }
@@ -274,26 +344,31 @@ pub fn update_account_balance_for_testing(account_object: &mut Object, balance_c
     move_object.set_contents_unsafe(new_field);
 }
 
-/// Check if a StructTag is Field<Key<Balance<T>>, U128>
-pub(crate) fn is_balance_accumulator_field(s: &StructTag) -> bool {
-    s.address == SUI_FRAMEWORK_ADDRESS
+pub(crate) fn accumulator_value_balance_type_maybe(s: &StructTag) -> Option<TypeTag> {
+    if s.address == SUI_FRAMEWORK_ADDRESS
         && s.module.as_ident_str() == DYNAMIC_FIELD_MODULE_NAME
         && s.name.as_ident_str() == DYNAMIC_FIELD_FIELD_STRUCT_NAME
         && s.type_params.len() == 2
-        && is_accumulator_key_balance(&s.type_params[0])
+        && let Some(key_type) = accumulator_key_type_maybe(&s.type_params[0])
         && is_accumulator_u128(&s.type_params[1])
+    {
+        Balance::maybe_get_balance_type_param(&key_type)
+    } else {
+        None
+    }
 }
 
 /// Check if a TypeTag is Key<Balance<T>>
-pub(crate) fn is_accumulator_key_balance(t: &TypeTag) -> bool {
-    if let TypeTag::Struct(s) = t {
-        s.address == SUI_FRAMEWORK_ADDRESS
-            && s.module.as_ident_str() == ACCUMULATOR_ROOT_MODULE
-            && s.name.as_ident_str() == ACCUMULATOR_KEY_TYPE
-            && s.type_params.len() == 1
-            && Balance::is_balance_type(&s.type_params[0])
+pub(crate) fn accumulator_key_type_maybe(t: &TypeTag) -> Option<TypeTag> {
+    if let TypeTag::Struct(s) = t
+        && s.address == SUI_FRAMEWORK_ADDRESS
+        && s.module.as_ident_str() == ACCUMULATOR_ROOT_MODULE
+        && s.name.as_ident_str() == ACCUMULATOR_KEY_TYPE
+        && s.type_params.len() == 1
+    {
+        Some(s.type_params[0].clone())
     } else {
-        false
+        None
     }
 }
 
@@ -309,20 +384,110 @@ pub(crate) fn is_accumulator_u128(t: &TypeTag) -> bool {
     }
 }
 
-/// Extract T from Field<Key<Balance<T>>, U128>
-pub(crate) fn extract_balance_type_from_field(s: &StructTag) -> Option<TypeTag> {
-    if s.type_params.len() != 2 {
-        return None;
-    }
+/// Rust representation of the Move EventStreamHead struct from accumulator_settlement module.
+/// This represents the state of an authenticated event stream head stored on-chain.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EventStreamHead {
+    /// The MMR (Merkle Mountain Range) digest representing the accumulated events
+    pub mmr: Vec<U256>,
+    /// The checkpoint sequence number when this stream head was last updated
+    pub checkpoint_seq: u64,
+    /// The total number of events accumulated in this stream
+    pub num_events: u64,
+}
 
-    if let TypeTag::Struct(key_struct) = &s.type_params[0] {
-        if key_struct.type_params.len() == 1 {
-            if let TypeTag::Struct(balance_struct) = &key_struct.type_params[0] {
-                if Balance::is_balance(balance_struct) && balance_struct.type_params.len() == 1 {
-                    return Some(balance_struct.type_params[0].clone());
-                }
-            }
+impl Default for EventStreamHead {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventStreamHead {
+    pub fn new() -> Self {
+        Self {
+            mmr: vec![],
+            checkpoint_seq: 0,
+            num_events: 0,
         }
     }
-    None
+
+    pub fn num_events(&self) -> u64 {
+        self.num_events
+    }
+
+    pub fn checkpoint_seq(&self) -> u64 {
+        self.checkpoint_seq
+    }
+
+    pub fn mmr(&self) -> &Vec<U256> {
+        &self.mmr
+    }
+}
+
+pub fn derive_event_stream_head_object_id(stream_id: SuiAddress) -> SuiResult<ObjectID> {
+    let key = AccumulatorKey { owner: stream_id };
+
+    let value_type_tag = TypeTag::Struct(Box::new(StructTag {
+        address: SUI_FRAMEWORK_ADDRESS,
+        module: ACCUMULATOR_SETTLEMENT_MODULE.to_owned(),
+        name: ACCUMULATOR_SETTLEMENT_EVENT_STREAM_HEAD.to_owned(),
+        type_params: vec![],
+    }));
+
+    let key_type_tag = AccumulatorKey::get_type_tag(&[value_type_tag]);
+
+    DynamicFieldKey(SUI_ACCUMULATOR_ROOT_OBJECT_ID, key, key_type_tag)
+        .into_unbounded_id()
+        .map(|id| id.as_object_id())
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct EventCommitment {
+    pub checkpoint_seq: u64,
+    pub transaction_idx: u64,
+    pub event_idx: u64,
+    pub digest: Digest,
+}
+
+impl EventCommitment {
+    pub fn new(checkpoint_seq: u64, transaction_idx: u64, event_idx: u64, digest: Digest) -> Self {
+        Self {
+            checkpoint_seq,
+            transaction_idx,
+            event_idx,
+            digest,
+        }
+    }
+}
+
+impl PartialOrd for EventCommitment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EventCommitment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.checkpoint_seq, self.transaction_idx, self.event_idx).cmp(&(
+            other.checkpoint_seq,
+            other.transaction_idx,
+            other.event_idx,
+        ))
+    }
+}
+
+pub fn build_event_merkle_root(events: &[EventCommitment]) -> Digest {
+    use fastcrypto::hash::Blake2b256;
+    use fastcrypto::merkle::MerkleTree;
+
+    debug_assert!(
+        events.windows(2).all(|w| w[0] <= w[1]),
+        "Events must be ordered by (checkpoint_seq, transaction_idx, event_idx)"
+    );
+
+    let merkle_tree = MerkleTree::<Blake2b256>::build_from_unserialized(events.to_vec())
+        .expect("failed to serialize event commitments for merkle root");
+    let root_node = merkle_tree.root();
+    let root_digest = root_node.bytes();
+    Digest::new(root_digest)
 }

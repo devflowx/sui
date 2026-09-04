@@ -7,7 +7,7 @@ import {
   useNavbarMobileSidebar,
 } from "@docusaurus/theme-common/internal";
 import NavbarItem from "@theme/NavbarItem";
-import ThemeToggle from "@site/src/components/ThemeToggle";
+import ThemeToggle from "@site/src/shared/components/ThemeToggle";
 // import SearchBar from "@theme/SearchBar";
 import NavbarMobileSidebarToggle from "@theme/Navbar/MobileSidebar/Toggle";
 import NavbarLogo from "@theme/Navbar/Logo";
@@ -32,7 +32,7 @@ function useMobileSidebarSafe() {
 
 function NavbarItems({ items }) {
   return (
-    <div className="flex flex-[8_1_0%] items-center justify-start gap-8 min-[1100px]:gap-16">
+    <div className="navbar-left-items">
       {items.map((item, i) => (
         <ErrorCauseBoundary
           key={i}
@@ -63,6 +63,13 @@ function NavbarContentLayout({ left, right }) {
 
 function SearchLauncher() {
   const [open, setOpen] = React.useState(false);
+
+  // Allow other components (e.g. getting-started search bar) to open the modal
+  React.useEffect(() => {
+    const handler = () => setOpen(true);
+    window.addEventListener("open-search-modal", handler);
+    return () => window.removeEventListener("open-search-modal", handler);
+  }, []);
 
   return (
     <>
@@ -98,20 +105,30 @@ function SearchLauncher() {
   );
 }
 
+function KapaButton() {
+  const handleClick = () => {
+    if (typeof window !== "undefined" && window.Kapa) {
+      window.Kapa.open();
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      className="kapa-trigger-btn flex items-center gap-2.5 cursor-pointer bg-white text-gray-900 font-semibold text-base px-5 py-2.5 rounded-full border border-gray-200 hover:bg-gray-50 transition-colors"
+    >
+      <img src="/img/logo.svg" alt="" width="23" height="23" />
+      <span className="hidden min-[1400px]:inline">Ask Sui AI</span>
+    </button>
+  );
+}
+
 export default function NavbarContent() {
   const mobileSidebar = useMobileSidebarSafe();
   const items = useNavbarItems();
   const [leftItems, rightItems] = splitNavbarItems(items);
   const searchBarItem = items.find((item) => item.type === "search");
-
-  React.useEffect(() => {
-    try {
-      window.initCookbook?.();
-    } catch (e) {
-      // Gracefully ignore errors if something goes wrong
-      console.error("Error initializing Ask Cookbook", e);
-    }
-  }, []);
 
   return (
     <NavbarContentLayout
@@ -123,16 +140,17 @@ export default function NavbarContent() {
         </>
       }
       right={
-        <>
+        <div className="navbar-right-controls flex items-center flex-shrink-0">
           <NavbarItems items={rightItems} />
           <ThemeToggle />
+          <KapaButton />
           {!searchBarItem && (
             <NavbarSearch>
               <SearchLauncher />
               <GetStartedLink />
             </NavbarSearch>
           )}
-        </>
+        </div>
       }
     />
   );

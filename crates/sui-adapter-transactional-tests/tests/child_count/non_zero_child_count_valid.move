@@ -23,14 +23,14 @@ module test::m {
     public entry fun mint(ctx: &mut TxContext) {
         let mut id = sui::object::new(ctx);
         let child = S { id: sui::object::new(ctx) };
-        ofield::add(&mut id, 0, child);
+        ofield::add(&mut id, 0u64, child);
         sui::transfer::public_transfer(S { id }, tx_context::sender(ctx))
     }
 
     public entry fun mint_and_share(ctx: &mut TxContext) {
         let mut id = sui::object::new(ctx);
         let child = S { id: sui::object::new(ctx) };
-        ofield::add(&mut id, 0, child);
+        ofield::add(&mut id, 0u64, child);
         sui::transfer::public_share_object(S { id })
     }
 
@@ -46,7 +46,7 @@ module test::m {
 
 //# run test::m::mint_and_share --sender A
 
-//# view-object 2,1
+//# view-object 2,0
 
 //
 // Test transfer allows non-zero child count
@@ -54,9 +54,9 @@ module test::m {
 
 //# run test::m::mint --sender A
 
-//# run test::m::transfer --sender A --args object(4,2) @B
+//# run test::m::transfer --sender A --args object(4,0) @B
 
-//# view-object 4,2
+//# view-object 4,0
 
 //
 // Test TransferObject allows non-zero child count
@@ -64,6 +64,6 @@ module test::m {
 
 //# run test::m::mint --sender A
 
-//# transfer-object 7,1 --sender A --recipient B
+//# transfer-object 7,0 --sender A --recipient B
 
-//# view-object 7,1
+//# view-object 7,0

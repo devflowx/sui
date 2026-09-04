@@ -162,6 +162,21 @@ public fun put<T>(balance: &mut Balance<T>, coin: Coin<T>) {
     balance.join(into_balance(coin));
 }
 
+// === Address Balance <-> Coin utility functions ===
+
+/// Redeem a `Withdrawal<Balance<T>>` and create a `Coin<T>` from the withdrawn Balance<T>.
+public fun redeem_funds<T>(
+    withdrawal: sui::funds_accumulator::Withdrawal<Balance<T>>,
+    ctx: &mut TxContext,
+): Coin<T> {
+    balance::redeem_funds(withdrawal).into_coin(ctx)
+}
+
+/// Send a coin to an address balance
+public fun send_funds<T>(coin: Coin<T>, recipient: address) {
+    balance::send_funds(coin.into_balance(), recipient);
+}
+
 // === Base Coin functionality ===
 
 #[allow(lint(public_entry))]
@@ -287,7 +302,7 @@ public fun migrate_regulated_currency_to_v2<T>(
 ): DenyCapV2<T> {
     let DenyCap { id } = cap;
     id.delete();
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.migrate_v1_to_v2(DENY_LIST_COIN_INDEX, ty, ctx);
     DenyCapV2 {
         id: object::new(ctx),
@@ -329,7 +344,7 @@ public fun deny_list_v2_add<T>(
     addr: address,
     ctx: &mut TxContext,
 ) {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_add(DENY_LIST_COIN_INDEX, ty, addr, ctx)
 }
 
@@ -342,7 +357,7 @@ public fun deny_list_v2_remove<T>(
     addr: address,
     ctx: &mut TxContext,
 ) {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_remove(DENY_LIST_COIN_INDEX, ty, addr, ctx)
 }
 
@@ -353,7 +368,7 @@ public fun deny_list_v2_contains_current_epoch<T>(
     addr: address,
     ctx: &TxContext,
 ): bool {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_contains_current_epoch(DENY_LIST_COIN_INDEX, ty, addr, ctx)
 }
 
@@ -361,7 +376,7 @@ public fun deny_list_v2_contains_current_epoch<T>(
 /// the next epoch will immediately be unable to use objects of this coin type as inputs. At the
 /// start of the next epoch, the address will be unable to receive objects of this coin type.
 public fun deny_list_v2_contains_next_epoch<T>(deny_list: &DenyList, addr: address): bool {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_contains_next_epoch(DENY_LIST_COIN_INDEX, ty, addr)
 }
 
@@ -375,7 +390,7 @@ public fun deny_list_v2_enable_global_pause<T>(
     ctx: &mut TxContext,
 ) {
     assert!(deny_cap.allow_global_pause, EGlobalPauseNotAllowed);
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_enable_global_pause(DENY_LIST_COIN_INDEX, ty, ctx)
 }
 
@@ -389,7 +404,7 @@ public fun deny_list_v2_disable_global_pause<T>(
     ctx: &mut TxContext,
 ) {
     assert!(deny_cap.allow_global_pause, EGlobalPauseNotAllowed);
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_disable_global_pause(DENY_LIST_COIN_INDEX, ty, ctx)
 }
 
@@ -398,13 +413,13 @@ public fun deny_list_v2_is_global_pause_enabled_current_epoch<T>(
     deny_list: &DenyList,
     ctx: &TxContext,
 ): bool {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_is_global_pause_enabled_current_epoch(DENY_LIST_COIN_INDEX, ty, ctx)
 }
 
 /// Check if the global pause is enabled for the given coin type in the next epoch.
 public fun deny_list_v2_is_global_pause_enabled_next_epoch<T>(deny_list: &DenyList): bool {
-    let ty = type_name::with_original_ids<T>().into_string().into_bytes();
+    let ty = type_name::with_defining_ids<T>().into_string().into_bytes();
     deny_list.v2_is_global_pause_enabled_next_epoch(DENY_LIST_COIN_INDEX, ty)
 }
 
@@ -514,6 +529,39 @@ public(package) fun new_treasury_cap<T>(ctx: &mut TxContext): TreasuryCap<T> {
 
 public(package) fun allow_global_pause<T>(cap: &DenyCapV2<T>): bool {
     cap.allow_global_pause
+}
+
+public(package) fun new_coin_metadata<T>(
+    decimals: u8,
+    name: string::String,
+    symbol: ascii::String,
+    description: string::String,
+    icon_url: ascii::String,
+    ctx: &mut TxContext,
+): CoinMetadata<T> {
+    CoinMetadata {
+        id: object::new(ctx),
+        decimals,
+        name,
+        symbol,
+        description,
+        icon_url: option::some(url::new_unsafe(icon_url)),
+    }
+}
+
+/// Internal function to refresh the `CoinMetadata` with new values in
+/// `CoinRegistry` borrowing.
+public(package) fun update_coin_metadata<T>(
+    metadata: &mut CoinMetadata<T>,
+    name: string::String,
+    symbol: ascii::String,
+    description: string::String,
+    icon_url: ascii::String,
+) {
+    metadata.name = name;
+    metadata.symbol = symbol;
+    metadata.description = description;
+    metadata.icon_url = option::some(url::new_unsafe(icon_url));
 }
 
 // === Test-only code ===
@@ -628,7 +676,7 @@ public fun deny_list_add<T>(
     addr: address,
     _ctx: &mut TxContext,
 ) {
-    let `type` = type_name::into_string(type_name::get_with_original_ids<T>()).into_bytes();
+    let `type` = type_name::into_string(type_name::with_defining_ids<T>()).into_bytes();
     deny_list.v1_add(DENY_LIST_COIN_INDEX, `type`, addr)
 }
 
@@ -645,7 +693,7 @@ public fun deny_list_remove<T>(
     addr: address,
     _ctx: &mut TxContext,
 ) {
-    let `type` = type_name::into_string(type_name::get_with_original_ids<T>()).into_bytes();
+    let `type` = type_name::into_string(type_name::with_defining_ids<T>()).into_bytes();
     deny_list.v1_remove(DENY_LIST_COIN_INDEX, `type`, addr)
 }
 
@@ -657,7 +705,7 @@ public fun deny_list_remove<T>(
     ),
 ]
 public fun deny_list_contains<T>(deny_list: &DenyList, addr: address): bool {
-    let name = type_name::get_with_original_ids<T>();
+    let name = type_name::with_defining_ids<T>();
     if (type_name::is_primitive(&name)) return false;
 
     let `type` = type_name::into_string(name).into_bytes();

@@ -39,7 +39,7 @@ module t2::o2 {
 
     fun new(child: Obj3, ctx: &mut TxContext): Obj2 {
         let mut id = object::new(ctx);
-        sui::dynamic_object_field::add(&mut id, 0, child);
+        sui::dynamic_object_field::add(&mut id, 0u64, child);
         Obj2 { id }
     }
 }
@@ -66,7 +66,7 @@ module t1::o1 {
 
     fun new(child: Obj2, ctx: &mut TxContext): Obj1 {
         let mut id = object::new(ctx);
-        sui::dynamic_object_field::add(&mut id, 0, child);
+        sui::dynamic_object_field::add(&mut id, 0u64, child);
         Obj1 { id }
     }
 }
@@ -77,7 +77,7 @@ module t1::o1 {
 
 //# view-object 4,0
 
-//# view-object 5,1
+//# view-object 5,0
 
 // child arguments cannot be taken directly
-//# run t1::o1::use_o2_o3 --args object(5,1) object(4,0) --sender A
+//# run t1::o1::use_o2_o3 --args object(5,0) object(4,0) --sender A

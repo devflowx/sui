@@ -4,14 +4,25 @@
 use std::path::PathBuf;
 
 use sui_indexer_alt_metrics::MetricsArgs;
-use sui_indexer_alt_reader::bigtable_reader::BigtableArgs;
 use sui_indexer_alt_reader::consistent_reader::ConsistentReaderArgs;
 use sui_indexer_alt_reader::fullnode_client::FullnodeArgs;
+use sui_indexer_alt_reader::kv_loader::KvArgs;
 use sui_indexer_alt_reader::pg_reader::db::DbArgs;
 use sui_indexer_alt_reader::system_package_task::SystemPackageTaskArgs;
+use tonic::transport::Uri;
 use url::Url;
 
 use crate::RpcArgs;
+
+/// Arguments for configuring GraphQL streaming subscriptions.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct SubscriptionArgs {
+    /// gRPC URL of a fullnode to stream checkpoints from (e.g.
+    /// `https://fullnode.testnet.sui.io:443`). When set, the instance enables GraphQL
+    /// subscriptions. When not set, subscriptions are not available.
+    #[arg(long)]
+    pub checkpoint_stream_url: Option<Uri>,
+}
 
 #[derive(clap::Parser, Debug, Clone)]
 pub struct Args {
@@ -31,11 +42,6 @@ pub enum Command {
         )]
         database_url: Url,
 
-        /// Bigtable instance ID to make KV store requests to. If this is not provided, KV store
-        /// requests will be made to the database.
-        #[clap(long)]
-        bigtable_instance: Option<String>,
-
         #[command(flatten)]
         fullnode_args: FullnodeArgs,
 
@@ -43,7 +49,7 @@ pub enum Command {
         db_args: DbArgs,
 
         #[command(flatten)]
-        bigtable_args: BigtableArgs,
+        kv_args: KvArgs,
 
         #[command(flatten)]
         consistent_reader_args: ConsistentReaderArgs,
@@ -66,6 +72,9 @@ pub enum Command {
         /// identify the pipelines that the RPC will monitor for watermark purposes.
         #[arg(long, action = clap::ArgAction::Append)]
         indexer_config: Vec<PathBuf>,
+
+        #[command(flatten)]
+        subscription_args: SubscriptionArgs,
     },
 
     /// Output the contents of the default configuration to STDOUT.

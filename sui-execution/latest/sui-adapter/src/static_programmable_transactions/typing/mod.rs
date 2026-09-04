@@ -3,21 +3,25 @@
 
 use crate::{
     execution_mode::ExecutionMode,
-    static_programmable_transactions::{env, loading::ast as L},
+    static_programmable_transactions::{
+        env,
+        loading::ast as L,
+        metering::{self, translation_meter::TranslationMeter},
+    },
 };
-use sui_types::error::ExecutionError;
-
 pub mod ast;
 pub mod invariant_checks;
 pub mod translate;
 pub mod verify;
 
 pub fn translate_and_verify<Mode: ExecutionMode>(
-    env: &env::Env,
+    meter: &mut TranslationMeter<'_, '_>,
+    env: &env::Env<Mode>,
     lt: L::Transaction,
-) -> Result<ast::Transaction, ExecutionError> {
+) -> Result<ast::Transaction, Mode::Error> {
     let mut ast = translate::transaction::<Mode>(env, lt)?;
+    metering::typing::meter::<Mode>(meter, env.protocol_config, &ast)?;
     verify::transaction::<Mode>(env, &mut ast)?;
-    invariant_checks::transaction::<Mode>(env, &ast)?;
+    invariant_checks::transaction::<Mode>(env, &ast, ast.unified_linkage.as_ref())?;
     Ok(ast)
 }

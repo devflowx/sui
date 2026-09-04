@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::types::ReplayEngineError;
 use crate::types::EPOCH_CHANGE_STRUCT_TAG;
+use crate::types::ReplayEngineError;
 use async_trait::async_trait;
 use futures::future::join_all;
 use lru::LruCache;
@@ -93,6 +93,7 @@ pub(crate) trait DataFetcher {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Fetchers {
     Remote(RemoteFetcher),
     NodeStateDump(NodeStateDumpFetcher),
@@ -523,7 +524,7 @@ impl DataFetcher for RemoteFetcher {
             u64::from_str(&w["reference_gas_price"].to_string().replace('\"', "")).unwrap()
         } else {
             return Err(ReplayEngineError::UnexpectedEventFormat {
-                event: event.clone(),
+                event: Box::new(event.clone()),
             });
         };
 
@@ -654,7 +655,9 @@ pub fn extract_epoch_and_version(ev: SuiEvent) -> Result<(u64, u64), ReplayEngin
         return Ok((epoch, version));
     }
 
-    Err(ReplayEngineError::UnexpectedEventFormat { event: ev })
+    Err(ReplayEngineError::UnexpectedEventFormat {
+        event: Box::new(ev),
+    })
 }
 
 #[derive(Clone)]
@@ -683,10 +686,10 @@ impl From<NodeStateDump> for NodeStateDumpFetcher {
                 );
 
                 // Only most recent
-                if let Some(last_seen_obj) = latest_object_version_pool.get(&current_obj.id) {
-                    if current_obj.version <= last_seen_obj.version() {
-                        return;
-                    }
+                if let Some(last_seen_obj) = latest_object_version_pool.get(&current_obj.id)
+                    && current_obj.version <= last_seen_obj.version()
+                {
+                    return;
                 };
                 latest_object_version_pool.insert(current_obj.id, current_obj.object.clone());
             });

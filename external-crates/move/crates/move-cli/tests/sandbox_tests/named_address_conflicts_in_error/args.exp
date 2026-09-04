@@ -1,7 +1,7 @@
 Command `build`:
-INCLUDING DEPENDENCY Dep
-BUILDING use_named_address
-error[E04007]: incompatible types
+INCLUDING DEPENDENCY a
+BUILDING a
+error[EC04007]: incompatible types
   ┌─ ./sources/example.move:3:9
   │
 2 │     public fun next(): b::m::Y {
@@ -9,7 +9,7 @@ error[E04007]: incompatible types
 3 │         b::m::x()
   │         ^^^^^^^^^ Invalid return expression
   │
-  ┌─ ./dep/sources/m.move:4:21
+  ┌─ dep/sources/m.move:4:21
   │
 4 │     public fun x(): X {
   │                     - Given: '(a=0x41)::m::X'

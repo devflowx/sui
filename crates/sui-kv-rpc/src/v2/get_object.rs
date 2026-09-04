@@ -1,18 +1,22 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use sui_kvstore::{BigTableClient, KeyValueStoreReader};
-use sui_rpc::merge::Merge;
 use sui_rpc::proto::sui::rpc::v2::BatchGetObjectsRequest;
 use sui_rpc::proto::sui::rpc::v2::BatchGetObjectsResponse;
-use sui_rpc::proto::sui::rpc::v2::Object;
 use sui_rpc::proto::sui::rpc::v2::{GetObjectRequest, GetObjectResponse, GetObjectResult};
 use sui_rpc_api::proto::google::rpc::bad_request::FieldViolation;
 use sui_rpc_api::{
-    grpc::v2::ledger_service::validate_get_object_requests, ErrorReason, ObjectNotFoundError,
-    RpcError,
+    ErrorReason, ObjectNotFoundError, RpcError,
+    grpc::v2::ledger_service::validate_get_object_requests,
 };
 use sui_types::storage::ObjectKey;
+
+use crate::PackageResolver;
+use crate::render::object_to_response;
+
+pub const MAX_BATCH_REQUESTS: usize = 1000;
 
 pub(crate) async fn get_object(
     mut client: BigTableClient,
@@ -22,6 +26,7 @@ pub(crate) async fn get_object(
         read_mask,
         ..
     }: GetObjectRequest,
+    resolver: &PackageResolver,
 ) -> Result<GetObjectResponse, RpcError> {
     let (requests, read_mask) =
         validate_get_object_requests(vec![(object_id, version)], read_mask)?;
@@ -37,9 +42,7 @@ pub(crate) async fn get_object(
             .await?
             .ok_or_else(|| ObjectNotFoundError::new(object_id))?,
     };
-    let mut message = Object::default();
-    // TODO: support json read mask
-    message.merge(&object, &read_mask);
+    let message = object_to_response(&object, &read_mask, resolver).await;
     Ok(GetObjectResponse::new(message))
 }
 
@@ -50,7 +53,15 @@ pub(crate) async fn batch_get_objects(
         read_mask,
         ..
     }: BatchGetObjectsRequest,
+    resolver: &PackageResolver,
 ) -> Result<BatchGetObjectsResponse, RpcError> {
+    if requests.len() > MAX_BATCH_REQUESTS {
+        return Err(RpcError::new(
+            tonic::Code::InvalidArgument,
+            format!("number of batch requests exceed limit of {MAX_BATCH_REQUESTS}"),
+        ));
+    }
+
     // only batch requests with `object_id` and `exact_version` are supported by the KV store
     if requests.iter().any(|r| r.version.is_none()) {
         return Err(FieldViolation::new("version")
@@ -72,25 +83,25 @@ pub(crate) async fn batch_get_objects(
             )
         })
         .collect();
-    let objects = client.get_objects(&object_keys).await?;
-    let mut objects_iter = objects.into_iter().peekable();
-    let objects = object_keys
+    let response: HashMap<_, _> = client
+        .get_objects(&object_keys)
+        .await?
         .into_iter()
-        .map(|object_key| {
-            if let Some(obj) = objects_iter.peek() {
-                if object_key.0 == obj.id() && object_key.1 == obj.version() {
-                    let object = objects_iter.next().expect("invariant's checked above");
-                    let mut message = Object::default();
-                    message.merge(&object, &read_mask);
-                    return GetObjectResult::new_object(message);
-                }
-            }
+        .map(|obj| ((obj.id(), obj.version()), obj))
+        .collect();
+
+    let mut objects = Vec::with_capacity(object_keys.len());
+    for object_key in object_keys {
+        if let Some(object) = response.get(&(object_key.0, object_key.1)) {
+            let message = object_to_response(object, &read_mask, resolver).await;
+            objects.push(GetObjectResult::new_object(message));
+        } else {
             let err: RpcError =
                 ObjectNotFoundError::new_with_version(object_key.0.into(), object_key.1.into())
                     .into();
-            GetObjectResult::new_error(err.into_status_proto())
-        })
-        .collect();
+            objects.push(GetObjectResult::new_error(err.into_status_proto()));
+        }
+    }
 
     Ok(BatchGetObjectsResponse::new(objects))
 }

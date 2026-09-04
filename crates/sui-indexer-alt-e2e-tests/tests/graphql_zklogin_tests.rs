@@ -3,32 +3,41 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context as _};
-use fastcrypto::encoding::{Base64, Encoding};
+use anyhow::Context as _;
+use anyhow::bail;
+use fastcrypto::encoding::Base64;
+use fastcrypto::encoding::Encoding;
 use insta::assert_debug_snapshot;
 use prometheus::Registry;
 use serde::Deserialize;
 use serde_json::json;
-use shared_crypto::intent::{Intent, IntentMessage, PersonalMessage};
-use sui_indexer_alt_e2e_tests::{OffchainCluster, OffchainClusterConfig};
+use shared_crypto::intent::Intent;
+use shared_crypto::intent::IntentMessage;
+use shared_crypto::intent::PersonalMessage;
 use sui_indexer_alt_framework::ingestion::ClientArgs;
-use sui_indexer_alt_graphql::config::{RpcConfig as GraphQlConfig, ZkLoginConfig, ZkLoginEnv};
+use sui_indexer_alt_framework::ingestion::ingestion_client::IngestionClientArgs;
+use sui_indexer_alt_graphql::config::RpcConfig as GraphQlConfig;
+use sui_indexer_alt_graphql::config::ZkLoginConfig;
+use sui_indexer_alt_graphql::config::ZkLoginEnv;
 use sui_swarm_config::genesis_config::AccountConfig;
 use sui_test_transaction_builder::TestTransactionBuilder;
-use sui_types::{
-    base_types::SuiAddress, crypto::Signature, signature::GenericSignature,
-    utils::load_test_vectors, zk_login_authenticator::ZkLoginAuthenticator,
-};
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::Signature;
+use sui_types::signature::GenericSignature;
+use sui_types::utils::load_test_vectors;
+use sui_types::zk_login_authenticator::ZkLoginAuthenticator;
 use tempfile::TempDir;
-use test_cluster::{TestCluster, TestClusterBuilder};
+use test_cluster::TestCluster;
+use test_cluster::TestClusterBuilder;
 use tokio::time::interval;
-use tokio_util::sync::CancellationToken;
+
+use sui_indexer_alt_e2e_tests::OffchainCluster;
+use sui_indexer_alt_e2e_tests::OffchainClusterConfig;
 
 const QUERY: &str = r#"
 query ($bytes: Base64!, $signature: Base64!, $scope: ZkLoginIntentScope!, $author: SuiAddress!) {
     verifyZkLoginSignature(bytes: $bytes, signature: $signature, intentScope: $scope, author: $author) {
         success
-        error
     }
 }
 "#;
@@ -47,7 +56,6 @@ struct FullCluster {
 #[derive(Deserialize, Eq, PartialEq, Debug)]
 struct ZkLoginResult {
     success: bool,
-    error: Option<String>,
 }
 
 impl FullCluster {
@@ -71,7 +79,10 @@ impl FullCluster {
 
         let offchain = OffchainCluster::new(
             ClientArgs {
-                local_ingestion_path: Some(ingestion_dir),
+                ingestion: IngestionClientArgs {
+                    local_ingestion_path: Some(ingestion_dir),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             OffchainClusterConfig {
@@ -85,14 +96,13 @@ impl FullCluster {
                 ..Default::default()
             },
             &Registry::new(),
-            CancellationToken::new(),
         )
         .await?;
 
         // Trigger an epoch change and wait until GraphQL sees Epoch 1
         onchain.trigger_reconfiguration().await;
         onchain.wait_for_authenticator_state_update().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             let mut interval = interval(Duration::from_millis(200));
             loop {
                 interval.tick().await;
@@ -158,7 +168,6 @@ impl FullCluster {
 
 #[tokio::test]
 async fn test_verify_transaction() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (kp, pk, inputs) =
@@ -192,18 +201,11 @@ async fn test_verify_transaction() {
         .await
         .unwrap();
 
-    assert_eq!(
-        result,
-        ZkLoginResult {
-            success: true,
-            error: None
-        }
-    );
+    assert_eq!(result, ZkLoginResult { success: true });
 }
 
 #[tokio::test]
 async fn test_verify_personal_message() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (kp, pk, inputs) =
@@ -235,18 +237,47 @@ async fn test_verify_personal_message() {
         .await
         .unwrap();
 
-    assert_eq!(
-        result,
-        ZkLoginResult {
-            success: true,
-            error: None
-        }
+    assert_eq!(result, ZkLoginResult { success: true });
+}
+
+#[tokio::test]
+async fn test_verify_zklogin_payload_bypasses_query_limit() {
+    let cluster = FullCluster::new().await.unwrap();
+
+    let (kp, pk, inputs) =
+        &load_test_vectors("../sui-types/src/unit_tests/zklogin_test_vectors.json")[1];
+
+    let addr = pk.into();
+    let payload_size = GraphQlConfig::default().limits.max_query_payload_size as usize;
+    let bytes = vec![0u8; payload_size + 64];
+
+    let message = IntentMessage::new(
+        Intent::personal_message(),
+        PersonalMessage {
+            message: bytes.clone(),
+        },
     );
+    let signature = GenericSignature::ZkLoginAuthenticator(ZkLoginAuthenticator::new(
+        inputs.clone(),
+        2,
+        Signature::new_secure(&message, kp),
+    ));
+
+    let result = cluster
+        .verify_zklogin(
+            bytes,
+            signature.as_ref().to_owned(),
+            "PERSONAL_MESSAGE",
+            addr,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, ZkLoginResult { success: true });
 }
 
 #[tokio::test]
 async fn test_verify_invalid_scope() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (kp, pk, inputs) =
@@ -283,7 +314,6 @@ async fn test_verify_invalid_scope() {
 
 #[tokio::test]
 async fn test_verify_invalid_transaction() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (kp, pk, inputs) =
@@ -326,7 +356,6 @@ async fn test_verify_invalid_transaction() {
 
 #[tokio::test]
 async fn test_verify_wrong_address() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (kp, pk, inputs) =
@@ -356,20 +385,13 @@ async fn test_verify_wrong_address() {
             SuiAddress::ZERO, // Wrong address
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(
-        result,
-        ZkLoginResult {
-            success: false,
-            error: Some("Invalid address".to_string())
-        }
-    );
+    assert_debug_snapshot!(result, @r###""[\"Verification failed: Invalid address\"]""###);
 }
 
 #[tokio::test]
 async fn test_verify_invalid_signature() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     let (_, pk, _) = &load_test_vectors("../sui-types/src/unit_tests/zklogin_test_vectors.json")[1];
@@ -390,7 +412,6 @@ async fn test_verify_invalid_signature() {
 
 #[tokio::test]
 async fn test_verify_not_zklogin_signature() {
-    telemetry_subscribers::init_for_testing();
     let cluster = FullCluster::new().await.unwrap();
 
     // Create a regular Ed25519 keypair

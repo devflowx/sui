@@ -1,19 +1,28 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::{path::Path, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::Context as _;
+use anyhow::anyhow;
+use anyhow::bail;
+use prometheus::Registry;
 use scoped_futures::ScopedBoxFuture;
-use sui_indexer_alt_framework::store::{self, CommitterWatermark, Store as _};
-use synchronizer::Queue;
-use tokio::task::JoinHandle;
+use sui_indexer_alt_framework::service::Service;
+use sui_indexer_alt_framework::store::CommitterWatermark;
+use sui_indexer_alt_framework::store::InitWatermark;
+use sui_indexer_alt_framework::store::SequentialConnection;
+use sui_indexer_alt_framework::store::Store as _;
+use sui_indexer_alt_framework::store::{self};
 
+use crate::db::Db;
+use crate::db::Watermark;
 use crate::db::config::DbConfig;
-use crate::db::{Db, Watermark};
-
-use self::synchronizer::Synchronizer;
+use crate::metrics::ColumnFamilyStatsCollector;
+use crate::store::synchronizer::Queue;
+use crate::store::synchronizer::Synchronizer;
 
 pub(crate) mod synchronizer;
 
@@ -36,7 +45,7 @@ pub(crate) struct Store<S>(Arc<Inner<S>>);
 pub(crate) struct Connection<'s, S> {
     pub store: &'s Store<S>,
     pub batch: rocksdb::WriteBatch,
-    watermark: Option<(&'static str, Watermark)>,
+    watermark: Option<(String, Watermark)>,
 }
 
 /// The contents of the store.
@@ -62,24 +71,32 @@ impl<S: Schema> Store<S> {
         path: impl AsRef<Path>,
         config: DbConfig,
         snapshots: u64,
+        registry: Option<&Registry>,
     ) -> anyhow::Result<Self> {
         let db_options: rocksdb::Options = config.into();
+        let cfs = S::cfs(&db_options);
+        let cf_names = cfs.iter().map(|(name, _)| name.to_string()).collect();
         let db = Arc::new(
-            Db::open(
-                path,
-                db_options.clone(),
-                snapshots as usize,
-                S::cfs(&db_options),
-            )
-            .context("Failed to open database")?,
+            Db::open(path, db_options.clone(), snapshots as usize, cfs)
+                .context("Failed to open database")?,
         );
 
         let schema = S::open(&db).context("Failed to open schema")?;
 
+        if let Some(registry) = registry {
+            registry
+                .register(Box::new(ColumnFamilyStatsCollector::new(
+                    Some("rocksdb"),
+                    db.clone(),
+                    cf_names,
+                )))
+                .context("Failed to register rocksdb column family stats collector")?;
+        }
+
         Ok(Self(Arc::new(Inner {
             db,
-            schema,
             queue: OnceLock::new(),
+            schema,
         })))
     }
 
@@ -95,13 +112,13 @@ impl<S: Schema> Store<S> {
 
     /// Run the provided synchronizer, and register its queue with the store. This will fail if the
     /// store already has a synchronizer running.
-    pub(crate) fn sync(&self, s: Synchronizer) -> anyhow::Result<JoinHandle<()>> {
-        let (handle, queue) = s.run()?;
+    pub(crate) fn sync(&self, s: Synchronizer) -> anyhow::Result<Service> {
+        let (service, queue) = s.run()?;
         self.0
             .queue
             .set(queue)
             .map_err(|_| anyhow!("Store already has synchronizer"))?;
-        Ok(handle)
+        Ok(service)
     }
 }
 
@@ -119,7 +136,9 @@ impl<S: Send + Sync + 'static> store::Store for Store<S> {
 }
 
 #[async_trait::async_trait]
-impl<S: Send + Sync + 'static> store::TransactionalStore for Store<S> {
+impl<S: Send + Sync + 'static> store::SequentialStore for Store<S> {
+    type SequentialConnection<'c> = Connection<'c, S>;
+
     async fn transaction<'a, R, F>(&self, f: F) -> anyhow::Result<R>
     where
         R: Send + 'a,
@@ -137,7 +156,7 @@ impl<S: Send + Sync + 'static> store::TransactionalStore for Store<S> {
             .queue
             .get()
             .context("Synchronizer not running for store")?
-            .get(pipeline)
+            .get(pipeline.as_str())
             .with_context(|| format!("No {pipeline:?} synchronizer queue"))?
             .send((watermark, conn.batch))
             .await
@@ -149,53 +168,52 @@ impl<S: Send + Sync + 'static> store::TransactionalStore for Store<S> {
 
 #[async_trait::async_trait]
 impl<S: Send + Sync> store::Connection for Connection<'_, S> {
+    async fn init_watermark(
+        &mut self,
+        pipeline_task: &str,
+        checkpoint_hi_inclusive: Option<u64>,
+    ) -> anyhow::Result<Option<InitWatermark>> {
+        self.delegate_to_committer_watermark(pipeline_task, checkpoint_hi_inclusive)
+            .await
+    }
+
+    /// Stores the `chain_id` for `pipeline_task` on first call, and on subsequent calls verifies
+    /// that the provided `chain_id` matches the stored value.
+    ///
+    /// This guards against pointing the indexer at a database that was previously populated with
+    /// data from a different chain.
+    async fn accepts_chain_id(
+        &mut self,
+        pipeline_task: &str,
+        chain_id: [u8; 32],
+    ) -> anyhow::Result<bool> {
+        Ok(self.store.0.db.accepts_chain_id(pipeline_task, chain_id)?)
+    }
+
     async fn committer_watermark(
         &mut self,
-        pipeline: &'static str,
+        pipeline_task: &str,
     ) -> anyhow::Result<Option<CommitterWatermark>> {
-        Ok(self.store.0.db.watermark(pipeline)?.map(Into::into))
+        Ok(self
+            .store
+            .0
+            .db
+            .commit_watermark(pipeline_task)?
+            .map(Into::into))
     }
 
     async fn set_committer_watermark(
         &mut self,
-        pipeline: &'static str,
+        pipeline_task: &str,
         watermark: CommitterWatermark,
     ) -> anyhow::Result<bool> {
-        self.watermark = Some((pipeline, watermark.into()));
+        self.watermark = Some((pipeline_task.to_string(), watermark.into()));
         Ok(true)
     }
-
-    async fn reader_watermark(
-        &mut self,
-        _pipeline: &'static str,
-    ) -> anyhow::Result<Option<store::ReaderWatermark>> {
-        Ok(None)
-    }
-
-    async fn pruner_watermark(
-        &mut self,
-        _pipeline: &'static str,
-        _delay: Duration,
-    ) -> anyhow::Result<Option<store::PrunerWatermark>> {
-        Ok(None)
-    }
-
-    async fn set_reader_watermark(
-        &mut self,
-        _pipeline: &'static str,
-        _reader_lo: u64,
-    ) -> anyhow::Result<bool> {
-        bail!("Pruning not supported by this store");
-    }
-
-    async fn set_pruner_watermark(
-        &mut self,
-        _pipeline: &'static str,
-        _pruner_hi: u64,
-    ) -> anyhow::Result<bool> {
-        bail!("Pruning not supported by this store");
-    }
 }
+
+#[async_trait::async_trait]
+impl<S: Send + Sync> store::SequentialConnection for Connection<'_, S> {}
 
 impl<S> Clone for Store<S> {
     fn clone(&self) -> Self {
@@ -206,11 +224,13 @@ impl<S> Clone for Store<S> {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::time::Duration;
 
     use scoped_futures::ScopedFutureExt;
-    use sui_indexer_alt_framework::store::{Connection as _, TransactionalStore};
-    use tokio::time::{self, error::Elapsed};
-    use tokio_util::sync::CancellationToken;
+    use sui_indexer_alt_framework::store::Connection as _;
+    use sui_indexer_alt_framework::store::SequentialStore;
+    use tokio::time::error::Elapsed;
+    use tokio::time::{self};
 
     use crate::db::map::DbMap;
 
@@ -231,6 +251,33 @@ mod tests {
                 a: DbMap::new(db.clone(), "a"),
                 b: DbMap::new(db.clone(), "b"),
             })
+        }
+    }
+
+    struct TestDb(tempfile::TempDir);
+
+    impl TestDb {
+        fn new() -> Self {
+            Self(tempfile::tempdir().unwrap())
+        }
+
+        fn store(&self) -> Store<TestSchema> {
+            Store::open(self.0.path().join("db"), DbConfig::default(), 4, None).unwrap()
+        }
+
+        fn db(&self) -> (Arc<Db>, TestSchema) {
+            let db_options: rocksdb::Options = DbConfig::default().into();
+            let db = Arc::new(
+                Db::open(
+                    self.0.path().join("db"),
+                    db_options.clone(),
+                    4,
+                    TestSchema::cfs(&db_options),
+                )
+                .unwrap(),
+            );
+            let schema = TestSchema::open(&db).unwrap();
+            (db, schema)
         }
     }
 
@@ -282,16 +329,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_open() {
-        let d = tempfile::tempdir().unwrap();
-        let _store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let _db = TestDb::new();
     }
 
     #[tokio::test]
     async fn test_no_queue() {
-        let d = tempfile::tempdir().unwrap();
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         // If the store is not associated with a synchronizer, all writes will fail.
         let err = write(&store, "test", 0, |s, b| {
@@ -308,24 +352,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_pipeline() {
-        let d = tempfile::tempdir().unwrap();
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("test").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         write(&store, "test", 0, |s, b| {
             s.a.insert("x".to_owned(), 42, b)?;
@@ -342,32 +378,21 @@ mod tests {
         let s = store.schema();
         assert_eq!(s.a.get(0, "x".to_owned()).unwrap(), Some(42));
         assert_eq!(s.b.get(0, 42).unwrap(), Some("x".to_owned()));
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_multiple_pipelines() {
-        let d = tempfile::tempdir().unwrap();
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("a").unwrap();
         sync.register_pipeline("b").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         write(&store, "a", 0, |s, b| {
             s.a.insert("x".to_owned(), 42, b)?;
@@ -396,30 +421,15 @@ mod tests {
         let s = store.schema();
         assert_eq!(s.a.get(0, "x".to_owned()).unwrap(), Some(42));
         assert_eq!(s.b.get(0, 42).unwrap(), Some("x".to_owned()));
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_single_pipeline_existing() {
-        let d = tempfile::tempdir().unwrap();
-        let snapshots = 4;
+        let test_db = TestDb::new();
 
         {
             // Initialize the database with some data for the pipeline
-            let db_options: rocksdb::Options = DbConfig::default().into();
-            let db = Arc::new(
-                Db::open(
-                    d.path().join("db"),
-                    db_options.clone(),
-                    snapshots as usize,
-                    TestSchema::cfs(&db_options),
-                )
-                .unwrap(),
-            );
-
-            let schema = TestSchema::open(&db).unwrap();
+            let (db, schema) = test_db.db();
 
             let mut batch = rocksdb::WriteBatch::default();
             schema.b.insert(42, "x".to_owned(), &mut batch).unwrap();
@@ -427,53 +437,30 @@ mod tests {
                 .unwrap();
         }
 
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), snapshots).unwrap();
+        let store = test_db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("b").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         // When there is existing data, the synchronizer will take a snapshot to make it available
         // before the store sees any writes.
         wait_until(|| async { has_range(&store, None, Some(0)) })
             .await
             .unwrap();
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_multiple_pipeline_existing() {
-        let d = tempfile::tempdir().unwrap();
-        let snapshots: u64 = 4;
+        let test_db = TestDb::new();
 
         {
             // Initialize the database with some data for both pipelines
-            let db_options: rocksdb::Options = DbConfig::default().into();
-            let db = Arc::new(
-                Db::open(
-                    d.path().join("db"),
-                    db_options.clone(),
-                    snapshots as usize,
-                    TestSchema::cfs(&db_options),
-                )
-                .unwrap(),
-            );
-
-            let schema = TestSchema::open(&db).unwrap();
+            let (db, schema) = test_db.db();
 
             let mut batch = rocksdb::WriteBatch::default();
             schema.a.insert("x".to_owned(), 42, &mut batch).unwrap();
@@ -486,54 +473,31 @@ mod tests {
                 .unwrap();
         }
 
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), snapshots).unwrap();
+        let store = test_db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("a").unwrap();
         sync.register_pipeline("b").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         // When there is existing data, the synchronizer will take a snapshot to make it available
         // before the store sees any writes.
         wait_until(|| async { has_range(&store, None, Some(0)) })
             .await
             .unwrap();
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_multiple_pipeline_catchup() {
-        let d = tempfile::tempdir().unwrap();
-        let snapshots = 4;
+        let test_db = TestDb::new();
 
         {
             // Initialize the database with some data for one of the pipelines.
-            let db_options: rocksdb::Options = DbConfig::default().into();
-            let db = Arc::new(
-                Db::open(
-                    d.path().join("db"),
-                    db_options.clone(),
-                    snapshots,
-                    TestSchema::cfs(&db_options),
-                )
-                .unwrap(),
-            );
-
-            let schema = TestSchema::open(&db).unwrap();
+            let (db, schema) = test_db.db();
 
             let mut batch = rocksdb::WriteBatch::default();
             schema.b.insert(42, "x".to_owned(), &mut batch).unwrap();
@@ -541,24 +505,16 @@ mod tests {
                 .unwrap();
         }
 
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let store = test_db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("a").unwrap();
         sync.register_pipeline("b").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         // The pipelines are not in sync to begin with, so the synchronizer is waiting for the
         // writes for the other pipeline in order to take a snapshot.
@@ -605,33 +561,21 @@ mod tests {
         let s = store.schema();
         assert_eq!(s.a.get(1, "x".to_owned()).unwrap(), Some(42));
         assert_eq!(s.b.get(1, 42).unwrap(), Some("y".to_owned()));
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_missing_pipeline() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         // Register a different pipeline, but not "test"
         sync.register_pipeline("other").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         let err = write(&store, "test", 0, |_, _| Ok(()))
             .await
@@ -641,29 +585,17 @@ mod tests {
         // If pipelines are not registered with the synchronizer before it is associated with the
         // store, writes to them will fail.
         assert!(err.contains("No \"test\" synchronizer queue"), "{err}");
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_no_pipelines() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         // Don't register any pipelines
         let err = store.sync(sync).unwrap_err().to_string();
@@ -675,25 +607,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_first_checkpoint() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = Some(100);
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("test").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         write(&store, "test", 100, |s, b| {
             s.a.insert("x".to_owned(), 42, b)?;
@@ -712,32 +635,20 @@ mod tests {
         let s = store.schema();
         assert_eq!(s.a.get(100, "x".to_owned()).unwrap(), Some(42));
         assert_eq!(s.b.get(100, 42).unwrap(), Some("x".to_owned()));
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_stride() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 3;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("test").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         // Write a run of checkpoints.
         for cp in 0..=10 {
@@ -779,32 +690,89 @@ mod tests {
 
         // Going back beyond the first checkpoint results in an empty range.
         assert_eq!(None, d.snapshot_range(1));
+    }
 
-        cancel.cancel();
-        h_sync.await.unwrap();
+    #[tokio::test]
+    async fn test_accepts_chain_id_first_call_writes_and_accepts() {
+        let db = TestDb::new();
+        let store = db.store();
+
+        let mut conn = store.connect().await.unwrap();
+        assert!(conn.accepts_chain_id("test", [1u8; 32]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_accepts_chain_id_matching_accepts() {
+        let db = TestDb::new();
+        let store = db.store();
+
+        let mut conn = store.connect().await.unwrap();
+        let chain_id = [1u8; 32];
+        assert!(conn.accepts_chain_id("test", chain_id).await.unwrap());
+        // Second call with the same chain_id should also accept.
+        assert!(conn.accepts_chain_id("test", chain_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_accepts_chain_id_mismatching_rejects() {
+        let db = TestDb::new();
+        let store = db.store();
+
+        let mut conn = store.connect().await.unwrap();
+        let chain_id_a = [1u8; 32];
+        let chain_id_b = [2u8; 32];
+        assert!(conn.accepts_chain_id("test", chain_id_a).await.unwrap());
+        assert!(!conn.accepts_chain_id("test", chain_id_b).await.unwrap());
+
+        // The originally stored chain_id is still accepted.
+        assert!(conn.accepts_chain_id("test", chain_id_a).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_accepts_chain_id_distinct_pipelines() {
+        let db = TestDb::new();
+        let store = db.store();
+
+        let mut conn = store.connect().await.unwrap();
+        let chain_id_a = [1u8; 32];
+        let chain_id_b = [2u8; 32];
+        // Different pipelines are tracked independently.
+        assert!(conn.accepts_chain_id("a", chain_id_a).await.unwrap());
+        assert!(conn.accepts_chain_id("b", chain_id_b).await.unwrap());
+        assert!(conn.accepts_chain_id("a", chain_id_a).await.unwrap());
+        assert!(conn.accepts_chain_id("b", chain_id_b).await.unwrap());
+        assert!(!conn.accepts_chain_id("a", chain_id_b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_accepts_chain_id_persists_across_reopen() {
+        let db = TestDb::new();
+        let chain_id = [7u8; 32];
+
+        {
+            let store = db.store();
+            let mut conn = store.connect().await.unwrap();
+            assert!(conn.accepts_chain_id("test", chain_id).await.unwrap());
+        }
+
+        let store = db.store();
+        let mut conn = store.connect().await.unwrap();
+        assert!(conn.accepts_chain_id("test", chain_id).await.unwrap());
+        assert!(!conn.accepts_chain_id("test", [0u8; 32]).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_no_watermark() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = Some(100);
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("test").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let _svc = store.sync(sync).unwrap();
 
         let err = store
             .transaction(|c| {
@@ -823,32 +791,20 @@ mod tests {
             .to_string();
 
         assert!(err.contains("No watermark set during transaction"), "{err}");
-
-        cancel.cancel();
-        h_sync.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_out_of_order_batch() {
-        let d = tempfile::tempdir().unwrap();
-
-        let store: Store<TestSchema> =
-            Store::open(d.path().join("db"), DbConfig::default(), 4).unwrap();
+        let db = TestDb::new();
+        let store = db.store();
 
         let stride = 1;
         let buffer_size = 10;
         let first_checkpoint = None;
-        let cancel = CancellationToken::new();
-        let mut sync = Synchronizer::new(
-            store.db().clone(),
-            stride,
-            buffer_size,
-            first_checkpoint,
-            cancel.clone(),
-        );
+        let mut sync = Synchronizer::new(store.db().clone(), stride, buffer_size, first_checkpoint);
 
         sync.register_pipeline("test").unwrap();
-        let h_sync = store.sync(sync).unwrap();
+        let mut svc = store.sync(sync).unwrap();
 
         write(&store, "test", 0, |s, b| {
             s.a.insert("x".to_owned(), 42, b)?;
@@ -865,11 +821,11 @@ mod tests {
         .unwrap();
 
         // The out of order batch will appear to succeed, but the synchronizer will detect the
-        // situation and stop gracefully.
-        time::timeout(Duration::from_millis(500), h_sync)
+        // situation and stop gracefully, with an error.
+        time::timeout(Duration::from_millis(500), svc.join())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap_err();
 
         // The first write made it through, but the second one did not.
         let s = store.schema();

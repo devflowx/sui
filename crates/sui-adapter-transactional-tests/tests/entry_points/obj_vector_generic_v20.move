@@ -3,7 +3,7 @@
 
 // tests vector of objects where operations involve generics (type parameters)
 
-//# init --addresses Test=0x0 --accounts A --protocol-version 20
+//# init --addresses Test=0x0 --accounts A --protocol-version 20 --file-format 6
 
 //# publish
 module Test::M {
@@ -42,7 +42,7 @@ module Test::M {
     public entry fun mint_child_any<Any>(v: u64, parent: &mut ObjAny<Any>, ctx: &mut TxContext) {
         sui::dynamic_object_field::add(
             &mut parent.id,
-            0,
+            0u64,
             ObjAny<Any> {
                 id: object::new(ctx),
                 value: v,

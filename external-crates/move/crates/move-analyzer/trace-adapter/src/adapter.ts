@@ -1,10 +1,12 @@
 import {
     Breakpoint,
+    Event,
     Handles,
     Logger,
     logger,
     LoggingDebugSession,
     InitializedEvent,
+    OutputEvent,
     TerminatedEvent,
     StoppedEvent,
     Thread,
@@ -22,7 +24,9 @@ import {
     CompoundType,
     IRuntimeRefValue,
     ExecutionResult,
+    ExecutionResultKind,
     IMoveCallStack,
+    moveStackFrameDisplayLine,
 } from './runtime';
 import { EXT_SUMMARY_FRAME_ID, EXT_EVENT_FRAME_ID } from './trace_utils';
 import snakeCase from 'lodash.snakecase';
@@ -37,6 +41,11 @@ const SUMMARY_FRAME_SRC_REF = 42;
  * The source reference for the external event frame.
  */
 const EXT_EVENT_FRAME_SRC_REF = 7;
+
+/**
+ * Custom DAP event for warnings that should also surface in VS Code UI.
+ */
+const MOVE_WARNING_EVENT = 'moveWarning';
 
 
 const enum LogLevel {
@@ -130,6 +139,12 @@ export class MoveDebugSession extends LoggingDebugSession {
         });
         this.runtime.on(RuntimeEvents.end, () => {
             this.sendEvent(new TerminatedEvent());
+        });
+        this.runtime.on(RuntimeEvents.warning, (warning) => {
+            // Always log warnings to the Debug Console for later inspection.
+            this.sendEvent(new OutputEvent(warning.message + '\n', 'stderr'));
+            // Also notify the extension so it can show a de-duplicated UI warning.
+            this.sendEvent(new Event(MOVE_WARNING_EVENT, warning));
         });
 
     }
@@ -293,9 +308,7 @@ export class MoveDebugSession extends LoggingDebugSession {
                         const frameSource = frame.disassemblyModeTriggered
                             ? new Source(fileName, frame.bcodeFilePath!)
                             : new Source(fileName, frame.srcFilePath);
-                        const currentLine = frame.disassemblyModeTriggered
-                            ? frame.bcodeLine!
-                            : frame.srcLine;
+                        const currentLine = moveStackFrameDisplayLine(frame);
                         return new StackFrame(frame.id, frame.name, frameSource, currentLine);
                     }));
                     if (stack_height > 0) {
@@ -711,7 +724,7 @@ export class MoveDebugSession extends LoggingDebugSession {
         let terminate = false;
         try {
             const executionResult = this.runtime.step(/* next */ true, /* stopAtCloseFrame */ false);
-            terminate = executionResult === ExecutionResult.TraceEnd;
+            terminate = executionResult.kind === ExecutionResultKind.TraceEnd;
         } catch (err) {
             response.success = false;
             response.message = err instanceof Error ? err.message : String(err);
@@ -734,7 +747,7 @@ export class MoveDebugSession extends LoggingDebugSession {
         let terminate = false;
         try {
             const executionResult = this.runtime.step(/* next */ false, /* stopAtCloseFrame */ false);
-            terminate = executionResult === ExecutionResult.TraceEnd;
+            terminate = executionResult.kind === ExecutionResultKind.TraceEnd;
         } catch (err) {
             response.success = false;
             response.message = err instanceof Error ? err.message : String(err);
@@ -757,7 +770,7 @@ export class MoveDebugSession extends LoggingDebugSession {
         let terminate = false;
         try {
             const executionResult = this.runtime.stepOut(/* next */ false);
-            terminate = executionResult === ExecutionResult.TraceEnd;
+            terminate = executionResult.kind === ExecutionResultKind.TraceEnd;
         } catch (err) {
             response.success = false;
             response.message = err instanceof Error ? err.message : String(err);
@@ -780,7 +793,7 @@ export class MoveDebugSession extends LoggingDebugSession {
         let terminate = false;
         try {
             const executionResult = this.runtime.continue();
-            terminate = executionResult === ExecutionResult.TraceEnd;
+            terminate = executionResult.kind === ExecutionResultKind.TraceEnd;
         } catch (err) {
             response.success = false;
             response.message = err instanceof Error ? err.message : String(err);

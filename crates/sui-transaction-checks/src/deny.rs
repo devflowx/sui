@@ -7,8 +7,8 @@ use sui_config::{
     transaction_deny_config::TransactionDenyConfig,
 };
 use sui_types::{
-    base_types::ObjectRef,
-    error::{SuiError, SuiResult, UserInputError},
+    base_types::{ObjectRef, SuiAddress},
+    error::{SuiError, SuiErrorKind, SuiResult, UserInputError},
     signature::GenericSignature,
     storage::BackingPackageStore,
     transaction::{Command, InputObjectKind, TransactionData, TransactionDataAPI},
@@ -17,11 +17,11 @@ use tracing::{error, warn};
 macro_rules! deny_if_true {
     ($cond:expr, $msg:expr) => {
         if ($cond) {
-            return Err(SuiError::UserInputError {
+            return Err(SuiError(Box::new(SuiErrorKind::UserInputError {
                 error: UserInputError::TransactionDenied {
                     error: $msg.to_string(),
                 },
-            });
+            })));
         }
     };
 }
@@ -38,7 +38,7 @@ pub fn check_transaction_for_signing(
 ) -> SuiResult {
     check_disabled_features(filter_config, tx_data, tx_signatures)?;
 
-    check_signers(filter_config, tx_data)?;
+    check_signers(filter_config, tx_data, tx_signatures)?;
 
     check_input_objects(filter_config, input_object_kinds)?;
 
@@ -82,11 +82,12 @@ fn dynamic_transaction_checks(
                 "Dynamic transaction predicate rejected transaction: {:?}",
                 tx_data.digest()
             );
-            Err(SuiError::UserInputError {
+            Err(SuiErrorKind::UserInputError {
                 error: UserInputError::TransactionDenied {
                     error: "Dynamic transaction predicate failed".to_string(),
                 },
-            })
+            }
+            .into())
         }
         // Non-predicate failure, so be conservative and deny the transaction.
         Err(e) => {
@@ -96,11 +97,12 @@ fn dynamic_transaction_checks(
                 e,
                 tx_data.digest()
             );
-            Err(SuiError::UserInputError {
+            Err(SuiErrorKind::UserInputError {
                 error: UserInputError::TransactionDenied {
                     error: e.to_string(),
                 },
-            })
+            }
+            .into())
         }
     }
 }
@@ -132,6 +134,11 @@ fn check_disabled_features(
         "Transaction signing is temporarily disabled"
     );
 
+    deny_if_true!(
+        filter_config.gasless_disabled() && tx_data.is_gasless_transaction(),
+        "Gasless transactions are temporarily disabled"
+    );
+
     tx_signatures.iter().try_for_each(|s| {
         if let GenericSignature::ZkLoginAuthenticator(z) = s {
             deny_if_true!(
@@ -141,7 +148,7 @@ fn check_disabled_features(
             deny_if_true!(
                 filter_config.zklogin_disabled_providers().contains(
                     &OIDCProvider::from_iss(z.get_iss())
-                        .map_err(|_| SuiError::UnexpectedMessage(z.get_iss().to_string()))?
+                        .map_err(|_| SuiErrorKind::UnexpectedMessage(z.get_iss().to_string()))?
                         .to_string()
                 ),
                 "zkLogin OAuth provider is temporarily disabled"
@@ -167,12 +174,17 @@ fn check_disabled_features(
     Ok(())
 }
 
-fn check_signers(filter_config: &TransactionDenyConfig, tx_data: &TransactionData) -> SuiResult {
+fn check_signers(
+    filter_config: &TransactionDenyConfig,
+    tx_data: &TransactionData,
+    tx_signatures: &[GenericSignature],
+) -> SuiResult {
     let deny_map = filter_config.get_address_deny_set();
     if deny_map.is_empty() {
         return Ok(());
     }
-    for signer in tx_data.signers() {
+    // Check declared sender and sponsor addresses.
+    for signer in tx_data.required_signers() {
         deny_if_true!(
             deny_map.contains(&signer),
             format!(
@@ -180,6 +192,19 @@ fn check_signers(filter_config: &TransactionDenyConfig, tx_data: &TransactionDat
                 signer
             )
         );
+    }
+    // Also check the actual signing addresses derived from the transaction signatures.
+    // With address aliases, the actual signer may differ from the declared sender/sponsor.
+    for sig in tx_signatures {
+        if let Ok(addr) = SuiAddress::try_from(sig) {
+            deny_if_true!(
+                deny_map.contains(&addr),
+                format!(
+                    "Access to account address {:?} is temporarily disabled",
+                    addr
+                )
+            );
+        }
     }
     Ok(())
 }
@@ -234,7 +259,7 @@ fn check_package_dependencies(
             }
             Command::MoveCall(call) => {
                 let package = package_store.get_package_object(&call.package)?.ok_or(
-                    SuiError::UserInputError {
+                    SuiErrorKind::UserInputError {
                         error: UserInputError::ObjectNotFound {
                             object_id: call.package,
                             version: None,

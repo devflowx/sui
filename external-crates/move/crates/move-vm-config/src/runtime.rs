@@ -8,6 +8,7 @@ use move_binary_format::file_format_common::VERSION_MAX;
 pub const DEFAULT_MAX_VALUE_NEST_DEPTH: u64 = 128;
 
 /// Dynamic config options for the Move VM.
+#[derive(Clone, Debug)]
 pub struct VMConfig {
     pub verifier: VerifierConfig,
     pub max_binary_format_version: u32,
@@ -30,21 +31,46 @@ pub struct VMConfig {
     pub max_type_to_layout_nodes: Option<u64>,
     /// Count variants as nodes.
     pub variant_nodes: bool,
+    /// Check for deprecated global storage operations during deserialization.
+    pub deprecate_global_storage_ops_during_deserialization: bool,
+    /// Normalize all formula to have a consistent structure.
+    pub normalize_depth_formula: bool,
 }
 
-impl Default for VMConfig {
-    fn default() -> Self {
+impl VMConfig {
+    /// Create a config for test execution:
+    /// - `allow_unpublishable_code_execution` allows loading unpublishable modules
+    /// - `package_arena_size` overrides the arena package size
+    pub fn new_for_test(
+        allow_unpublishable_code_execution: bool,
+        package_arena_size: Option<u64>,
+    ) -> Self {
+        let binary_config = if allow_unpublishable_code_execution {
+            BinaryConfig::new_unpublishable()
+        } else {
+            BinaryConfig::legacy_with_flags(
+                /* check_no_extraneous_bytes */ true,
+                /* deprecate_global_storage_ops */ false,
+            )
+        };
         Self {
             verifier: VerifierConfig::default(),
             max_binary_format_version: VERSION_MAX,
-            runtime_limits_config: VMRuntimeLimitsConfig::default(),
+            runtime_limits_config: VMRuntimeLimitsConfig {
+                vector_len_max: DEFAULT_MAX_CONSTANT_VECTOR_LEN,
+                max_value_nest_depth: Some(DEFAULT_MAX_VALUE_NEST_DEPTH),
+                hardened_otw_check: true,
+                package_arena_size,
+            },
             enable_invariant_violation_check_in_swap_loc: true,
             check_no_extraneous_bytes_during_deserialization: true,
             error_execution_state: true,
-            binary_config: BinaryConfig::with_extraneous_bytes_check(true),
+            binary_config,
             rethrow_serialization_type_layout_errors: false,
             max_type_to_layout_nodes: Some(512),
             variant_nodes: true,
+            deprecate_global_storage_ops_during_deserialization: false,
+            normalize_depth_formula: true,
         }
     }
 }
@@ -57,14 +83,7 @@ pub struct VMRuntimeLimitsConfig {
     pub max_value_nest_depth: Option<u64>,
     // include hardened OTW checks
     pub hardened_otw_check: bool,
-}
-
-impl Default for VMRuntimeLimitsConfig {
-    fn default() -> Self {
-        Self {
-            vector_len_max: DEFAULT_MAX_CONSTANT_VECTOR_LEN,
-            max_value_nest_depth: Some(DEFAULT_MAX_VALUE_NEST_DEPTH),
-            hardened_otw_check: true,
-        }
-    }
+    /// Maximum size (in bytes) for an individual package's arena size.
+    /// NOTE: YOU SHOULD PROBABLY NOT BE SETTING THIS FLAG FOR ANY REASON.
+    pub package_arena_size: Option<u64>,
 }

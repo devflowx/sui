@@ -14,7 +14,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Add;
 use std::sync::Arc;
-use sui_types::error::SuiError;
+use sui_types::error::{SuiError, SuiErrorKind};
 
 use self::metrics::TrafficControllerMetrics;
 use crate::traffic_controller::nodefw_client::{BlockAddress, BlockAddresses, NodeFWClient};
@@ -30,7 +30,7 @@ use sui_types::traffic_control::{
     PolicyConfig, PolicyType, RemoteFirewallConfig, TrafficControlReconfigParams, Weight,
 };
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 pub const METRICS_INTERVAL_SECS: u64 = 2;
@@ -207,16 +207,16 @@ impl TrafficController {
             dry_run: None,
         };
 
-        if let Some(error_policy) = self.error_policy.as_ref() {
-            if let TrafficControlPolicy::FreqThreshold(ref policy) = *error_policy.lock().await {
-                result.error_threshold = Some(policy.client_threshold);
-            }
+        if let Some(error_policy) = self.error_policy.as_ref()
+            && let TrafficControlPolicy::FreqThreshold(ref policy) = *error_policy.lock().await
+        {
+            result.error_threshold = Some(policy.client_threshold);
         }
 
-        if let Some(spam_policy) = self.spam_policy.as_ref() {
-            if let TrafficControlPolicy::FreqThreshold(ref policy) = *spam_policy.lock().await {
-                result.spam_threshold = Some(policy.client_threshold);
-            }
+        if let Some(spam_policy) = self.spam_policy.as_ref()
+            && let TrafficControlPolicy::FreqThreshold(ref policy) = *spam_policy.lock().await
+        {
+            result.spam_threshold = Some(policy.client_threshold);
         }
 
         result.dry_run = Some(self.policy_config.read().await.dry_run);
@@ -282,9 +282,10 @@ impl TrafficController {
                 }
                 Ok(())
             }
-            _ => Err(SuiError::InvalidAdminRequest(
+            _ => Err(SuiErrorKind::InvalidAdminRequest(
                 "Unsupported prior policy type during traffic control reconfiguration".to_string(),
-            )),
+            )
+            .into()),
         }
     }
 
@@ -342,37 +343,54 @@ impl TrafficController {
     /// Handle check with dry-run mode considered
     pub async fn check(&self, client: &Option<IpAddr>, proxied_client: &Option<IpAddr>) -> bool {
         let policy_config = { self.policy_config.read().await.clone() };
-        let check_with_dry_run_maybe = |allowed| -> bool {
-            match (allowed, policy_config.dry_run) {
-                // request allowed
-                (true, _) => true,
-                // request blocked while in dry-run mode
-                (false, true) => {
-                    debug!("Dry run mode: Blocked request from client {:?}", client);
-                    self.metrics.num_dry_run_blocked_requests.inc();
-                    true
-                }
-                // request blocked
-                (false, false) => {
-                    debug!("Blocked request from client {:?}", client);
-                    self.metrics.requests_blocked_at_protocol.inc();
-                    false
-                }
+
+        let allowed = match &self.acl {
+            Acl::Allowlist(allowlist) => client.is_none() || allowlist.contains(&client.unwrap()),
+            Acl::Blocklists(blocklists) => {
+                self.check_blocklists(blocklists, client, proxied_client)
+                    .await
             }
         };
 
-        match &self.acl {
-            Acl::Allowlist(allowlist) => {
-                let allowed = client.is_none() || allowlist.contains(&client.unwrap());
-                check_with_dry_run_maybe(allowed)
+        match (allowed, policy_config.dry_run) {
+            // request allowed
+            (true, _) => true,
+            // request blocked while in dry-run mode
+            (false, true) => {
+                debug!("Dry run mode: Blocked request from client {:?}", client);
+                self.record_blocked_request(client, true);
+                true
             }
-            Acl::Blocklists(blocklists) => {
-                let allowed = self
-                    .check_blocklists(blocklists, client, proxied_client)
-                    .await;
-                check_with_dry_run_maybe(allowed)
+            // request blocked
+            (false, false) => {
+                debug!("Blocked request from client {:?}", client);
+                self.record_blocked_request(client, false);
+                false
             }
         }
+    }
+
+    fn record_blocked_request(&self, client: &Option<IpAddr>, dry_run: bool) {
+        let dry_run_str = if dry_run { "true" } else { "false" };
+
+        // Hash IP to bucket to limit cardinality (100 buckets: bucket_0 through bucket_99)
+        let ip_label = if let Some(ip) = client {
+            let bucket = ip
+                .to_string()
+                .bytes()
+                .fold(0u8, |acc, b| acc.wrapping_add(b))
+                % 100;
+            let bucket_label = format!("bucket_{}", bucket);
+            trace!("IP {} maps to {}", ip, bucket_label);
+            bucket_label
+        } else {
+            "unknown".to_string()
+        };
+
+        self.metrics
+            .requests_blocked_at_protocol
+            .with_label_values(&[dry_run_str, &ip_label])
+            .inc();
     }
 
     /// Returns true if the connection is in blocklist, false otherwise
@@ -472,9 +490,14 @@ async fn run_tally_loop(
     loop {
         tokio::select! {
             received = receiver.recv() => {
-                metrics.tallies.inc();
                 match received {
                     Some(tally) => {
+                        // Track tallies by method
+                        let method = tally.method.as_deref().unwrap_or("unknown");
+                        metrics.tallies
+                            .with_label_values(&[method])
+                            .inc();
+
                         // TODO: spawn a task to handle tallying concurrently
                         if let Err(err) = handle_spam_tally(
                             spam_policy.clone(),
@@ -593,8 +616,7 @@ async fn handle_error_tally(
     }
     trace!(
         "Handling error_type {:?} from client {:?}",
-        error_type,
-        tally.direct,
+        error_type, tally.direct,
     );
     metrics
         .tally_error_types
@@ -602,20 +624,21 @@ async fn handle_error_tally(
         .inc();
     let resp = policy.lock().await.handle_tally(tally);
     metrics.error_tally_handled.inc();
-    if let Some(fw_config) = fw_config {
-        if fw_config.delegate_error_blocking && !mem_drainfile_present {
-            let client = nodefw_client
-                .as_ref()
-                .expect("Expected NodeFWClient for blocklist delegation");
-            return delegate_policy_response(
-                resp,
-                policy_config,
-                client,
-                fw_config.destination_port,
-                metrics.clone(),
-            )
-            .await;
-        }
+    if let Some(fw_config) = fw_config
+        && fw_config.delegate_error_blocking
+        && !mem_drainfile_present
+    {
+        let client = nodefw_client
+            .as_ref()
+            .expect("Expected NodeFWClient for blocklist delegation");
+        return delegate_policy_response(
+            resp,
+            policy_config,
+            client,
+            fw_config.destination_port,
+            metrics.clone(),
+        )
+        .await;
     }
     handle_policy_response(resp, policy_config, blocklists, metrics).await;
     Ok(())
@@ -636,20 +659,21 @@ async fn handle_spam_tally(
     }
     let resp = policy.lock().await.handle_tally(tally.clone());
     metrics.tally_handled.inc();
-    if let Some(fw_config) = fw_config {
-        if fw_config.delegate_spam_blocking && !mem_drainfile_present {
-            let client = nodefw_client
-                .as_ref()
-                .expect("Expected NodeFWClient for blocklist delegation");
-            return delegate_policy_response(
-                resp,
-                policy_config,
-                client,
-                fw_config.destination_port,
-                metrics.clone(),
-            )
-            .await;
-        }
+    if let Some(fw_config) = fw_config
+        && fw_config.delegate_spam_blocking
+        && !mem_drainfile_present
+    {
+        let client = nodefw_client
+            .as_ref()
+            .expect("Expected NodeFWClient for blocklist delegation");
+        return delegate_policy_response(
+            resp,
+            policy_config,
+            client,
+            fw_config.destination_port,
+            metrics.clone(),
+        )
+        .await;
     }
     handle_policy_response(resp, policy_config, blocklists, metrics).await;
     Ok(())
@@ -670,33 +694,31 @@ async fn handle_policy_response(
         proxy_blocklist_ttl_sec,
         ..
     } = policy_config;
-    if let Some(client) = block_client {
-        if blocklists
+    if let Some(client) = block_client
+        && blocklists
             .clients
             .insert(
                 client,
                 SystemTime::now() + Duration::from_secs(*connection_blocklist_ttl_sec),
             )
             .is_none()
-        {
-            // Only increment the metric if the client was not already blocked
-            debug!("Adding client {:?} to blocklist", client);
-            metrics.connection_ip_blocklist_len.inc();
-        }
+    {
+        // Only increment the metric if the client was not already blocked
+        debug!("Adding client {:?} to blocklist", client);
+        metrics.connection_ip_blocklist_len.inc();
     }
-    if let Some(client) = block_proxied_client {
-        if blocklists
+    if let Some(client) = block_proxied_client
+        && blocklists
             .proxied_clients
             .insert(
                 client,
                 SystemTime::now() + Duration::from_secs(*proxy_blocklist_ttl_sec),
             )
             .is_none()
-        {
-            // Only increment the metric if the client was not already blocked
-            debug!("Adding proxied client {:?} to blocklist", client);
-            metrics.proxy_ip_blocklist_len.inc();
-        }
+    {
+        // Only increment the metric if the client was not already blocked
+        debug!("Adding proxied client {:?} to blocklist", client);
+        metrics.proxy_ip_blocklist_len.inc();
     }
 }
 
@@ -861,15 +883,14 @@ impl TrafficSim {
         let metrics = futures::future::join_all(tasks).await.into_iter().fold(
             TrafficSimMetrics::default(),
             |acc, run_client_ret| {
-                if run_client_ret.is_err() {
+                if let Ok(metrics) = run_client_ret {
+                    acc + metrics
+                } else {
                     error!(
                         "Error running traffic sim client: {:?}",
                         run_client_ret.err()
                     );
                     acc
-                } else {
-                    let metrics = run_client_ret.unwrap();
-                    acc + metrics
                 }
             },
         );
@@ -981,11 +1002,9 @@ impl TrafficSim {
             metrics.abs_time_to_first_block
         );
         // Useful for ensuring that TTL is respected
-        let avg_time_blocked = if metrics.num_blocklist_adds > 0 {
-            metrics.total_time_blocked.as_millis() as u64 / metrics.num_blocklist_adds
-        } else {
-            0
-        };
+        let avg_time_blocked = (metrics.total_time_blocked.as_millis() as u64)
+            .checked_div(metrics.num_blocklist_adds)
+            .unwrap_or(0);
         println!(
             "Average time blocked (ttl): {:?}",
             Duration::from_millis(avg_time_blocked)

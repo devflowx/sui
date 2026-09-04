@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    diagnostics::warning_filters::{WarningFilters, WarningFiltersTable},
+    diagnostics::filter::FilterScope,
     expansion::ast::{
         AbilitySet, Attributes, DottedUsage, Fields, Friend, ImplicitUseFunCandidate, ModuleIdent,
         Mutability, Value, Value_, Visibility, ability_constraints_ast_debug,
@@ -20,11 +20,10 @@ use crate::{
 };
 use move_ir_types::location::*;
 use move_symbol_pool::Symbol;
-use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 //**************************************************************************************************
@@ -34,8 +33,6 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Program {
     pub info: NamingProgramInfo,
-    /// Safety: This table should not be dropped as long as any `WarningFilters` are alive
-    pub warning_filters_table: Arc<WarningFiltersTable>,
     pub inner: Program_,
 }
 
@@ -152,7 +149,7 @@ pub struct StdlibDefinitions {
 pub struct ModuleDefinition {
     pub doc: DocComment,
     pub loc: Loc,
-    pub warning_filter: WarningFilters,
+    pub warning_filter: FilterScope,
     // package name metadata from compiler arguments, not used for any language rules
     pub package_name: Option<Symbol>,
     /// The named address map used by this module during `expansion`.
@@ -182,7 +179,7 @@ pub struct DatatypeTypeParameter {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StructDefinition {
     pub doc: DocComment,
-    pub warning_filter: WarningFilters,
+    pub warning_filter: FilterScope,
     // index in the original order as defined in the source file
     pub index: usize,
     pub loc: Loc,
@@ -201,7 +198,7 @@ pub enum StructFields {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDefinition {
     pub doc: DocComment,
-    pub warning_filter: WarningFilters,
+    pub warning_filter: FilterScope,
     // index in the original order as defined in the source file
     pub index: usize,
     pub loc: Loc,
@@ -248,7 +245,7 @@ pub type FunctionBody = Spanned<FunctionBody_>;
 pub struct Function {
     pub doc: DocComment,
     pub loc: Loc,
-    pub warning_filter: WarningFilters,
+    pub warning_filter: FilterScope,
     // index in the original order as defined in the source file
     pub index: usize,
     pub attributes: Attributes,
@@ -266,11 +263,12 @@ pub struct Function {
 #[derive(PartialEq, Debug, Clone)]
 pub struct Constant {
     pub doc: DocComment,
-    pub warning_filter: WarningFilters,
+    pub warning_filter: FilterScope,
     // index in the original order as defined in the source file
     pub index: usize,
     pub attributes: Attributes,
     pub loc: Loc,
+    pub visibility: Visibility,
     pub signature: Type,
     pub value: Exp,
 }
@@ -304,14 +302,14 @@ pub enum BuiltinTypeName_ {
 }
 pub type BuiltinTypeName = Spanned<BuiltinTypeName_>;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-#[allow(clippy::large_enum_variant)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TypeName_ {
     // exp-list/tuple type
     Multiple(usize),
     Builtin(BuiltinTypeName),
-    ModuleType(ModuleIdent, DatatypeName),
+    ModuleType(Arc<ModuleIdent>, DatatypeName),
 }
+// TODO: This should also be an Arc, so that TypeName can be cheaply cloned
 pub type TypeName = Spanned<TypeName_>;
 
 #[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Copy, Clone)]
@@ -328,18 +326,21 @@ pub struct TParam {
 pub struct TVar(pub u64);
 
 #[derive(Debug, Eq, PartialEq, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum Type_ {
+pub enum TypeInner {
     Unit,
-    Ref(bool, Box<Type>),
+    Ref(bool, Type),
     Param(TParam),
     Apply(Option<AbilitySet>, TypeName, Vec<Type>),
-    Fun(Vec<Type>, Box<Type>),
+    Fun(Vec<Type>, Type),
     Var(TVar),
     Anything,
     Void,
     UnresolvedError,
 }
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Type_(pub Arc<TypeInner>);
+
 pub type Type = Spanned<Type_>;
 
 //**************************************************************************************************
@@ -504,7 +505,9 @@ pub enum Exp_ {
 pub type Exp = Spanned<Exp_>;
 
 pub type Sequence = (UseFuns, VecDeque<SequenceItem>);
+
 #[derive(Debug, PartialEq, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SequenceItem_ {
     Seq(Box<Exp>),
     Declare(LValueList, Option<Type>),
@@ -625,7 +628,7 @@ impl SyntaxMethodEntry {
     }
 }
 
-static BUILTIN_TYPE_ALL_NAMES: Lazy<BTreeSet<Symbol>> = Lazy::new(|| {
+static BUILTIN_TYPE_ALL_NAMES: LazyLock<BTreeSet<Symbol>> = LazyLock::new(|| {
     [
         BuiltinTypeName_::ADDRESS,
         BuiltinTypeName_::SIGNER,
@@ -643,7 +646,7 @@ static BUILTIN_TYPE_ALL_NAMES: Lazy<BTreeSet<Symbol>> = Lazy::new(|| {
     .collect()
 });
 
-static BUILTIN_TYPE_NUMERIC: Lazy<BTreeSet<BuiltinTypeName_>> = Lazy::new(|| {
+static BUILTIN_TYPE_NUMERIC: LazyLock<BTreeSet<BuiltinTypeName_>> = LazyLock::new(|| {
     [
         BuiltinTypeName_::U8,
         BuiltinTypeName_::U16,
@@ -656,11 +659,11 @@ static BUILTIN_TYPE_NUMERIC: Lazy<BTreeSet<BuiltinTypeName_>> = Lazy::new(|| {
     .collect()
 });
 
-static BUILTIN_TYPE_BITS: Lazy<BTreeSet<BuiltinTypeName_>> =
-    Lazy::new(|| BUILTIN_TYPE_NUMERIC.clone());
+static BUILTIN_TYPE_BITS: LazyLock<BTreeSet<BuiltinTypeName_>> =
+    LazyLock::new(|| BUILTIN_TYPE_NUMERIC.clone());
 
-static BUILTIN_TYPE_ORDERED: Lazy<BTreeSet<BuiltinTypeName_>> =
-    Lazy::new(|| BUILTIN_TYPE_BITS.clone());
+static BUILTIN_TYPE_ORDERED: LazyLock<BTreeSet<BuiltinTypeName_>> =
+    LazyLock::new(|| BUILTIN_TYPE_BITS.clone());
 
 impl BuiltinTypeName_ {
     pub const ADDRESS: &'static str = "address";
@@ -747,7 +750,7 @@ impl TParamID {
     }
 }
 
-static BUILTIN_FUNCTION_ALL_NAMES: Lazy<BTreeSet<Symbol>> = Lazy::new(|| {
+static BUILTIN_FUNCTION_ALL_NAMES: LazyLock<BTreeSet<Symbol>> = LazyLock::new(|| {
     [BuiltinFunction_::FREEZE, BuiltinFunction_::ASSERT_MACRO]
         .into_iter()
         .map(Symbol::from)
@@ -811,17 +814,23 @@ impl TypeName_ {
     pub fn single_type(&self) -> Option<TypeName_> {
         match self {
             TypeName_::Multiple(_) => None,
-            TypeName_::Builtin(_) | TypeName_::ModuleType(_, _) => Some(*self),
+            TypeName_::Builtin(_) | TypeName_::ModuleType(_, _) => Some(self.clone()),
         }
     }
 
     pub fn datatype_name(&self) -> Option<(ModuleIdent, DatatypeName)> {
         match self {
             TypeName_::Builtin(_) | TypeName_::Multiple(_) => None,
-            TypeName_::ModuleType(mident, n) => Some((*mident, *n)),
+            TypeName_::ModuleType(mident, n) => Some((*mident.as_ref(), *n)),
         }
     }
 }
+
+pub static UNIT_TYPE: LazyLock<Type_> = LazyLock::new(|| TypeInner::Unit.into());
+pub static ANYTHING_TYPE: LazyLock<Type_> = LazyLock::new(|| TypeInner::Anything.into());
+pub static VOID_TYPE: LazyLock<Type_> = LazyLock::new(|| TypeInner::Void.into());
+pub static UNRESOLVED_ERROR_TYPE: LazyLock<Type_> =
+    LazyLock::new(|| TypeInner::UnresolvedError.into());
 
 impl Type_ {
     pub fn builtin_(b: BuiltinTypeName, ty_args: Vec<Type>) -> Type_ {
@@ -834,7 +843,7 @@ impl Type_ {
             B::Vector => None,
         };
         let n = sp(b.loc, TypeName_::Builtin(b));
-        Type_::Apply(abilities, n, ty_args)
+        TypeInner::Apply(abilities, n, ty_args).into()
     }
 
     pub fn builtin(loc: Loc, b: BuiltinTypeName, ty_args: Vec<Type>) -> Type {
@@ -882,7 +891,7 @@ impl Type_ {
     }
 
     pub fn bytearray(loc: Loc) -> Type {
-        Type_::vector(loc, Type_::u8(loc))
+        Self::vector(loc, Self::u8(loc))
     }
 
     pub fn multiple(loc: Loc, tys: Vec<Type>) -> Type {
@@ -891,46 +900,46 @@ impl Type_ {
 
     pub fn multiple_(loc: Loc, mut tys: Vec<Type>) -> Type_ {
         match tys.len() {
-            0 => Type_::Unit,
+            0 => UNIT_TYPE.clone(),
             1 => tys.pop().unwrap().value,
-            n => Type_::Apply(None, sp(loc, TypeName_::Multiple(n)), tys),
+            n => TypeInner::Apply(None, sp(loc, TypeName_::Multiple(n)), tys).into(),
         }
     }
 
     pub fn builtin_name(&self) -> Option<&BuiltinTypeName> {
-        match self {
-            Type_::Apply(_, sp!(_, TypeName_::Builtin(b)), _) => Some(b),
+        match &*self.0 {
+            TypeInner::Apply(_, sp!(_, TypeName_::Builtin(b)), _) => Some(b),
             _ => None,
         }
     }
 
     pub fn type_name(&self) -> Option<&TypeName> {
-        match self {
-            Type_::Apply(_, tn, _) => Some(tn),
+        match &*self.0 {
+            TypeInner::Apply(_, tn, _) => Some(tn),
             _ => None,
         }
     }
 
     pub fn unfold_to_builtin_type_name(&self) -> Option<&BuiltinTypeName> {
-        match self {
-            Type_::Apply(_, sp!(_, TypeName_::Builtin(b)), _) => Some(b),
-            Type_::Ref(_, inner) => inner.value.unfold_to_builtin_type_name(),
+        match &*self.0 {
+            TypeInner::Apply(_, sp!(_, TypeName_::Builtin(b)), _) => Some(b),
+            TypeInner::Ref(_, inner) => inner.value.unfold_to_builtin_type_name(),
             _ => None,
         }
     }
 
     pub fn unfold_to_type_name(&self) -> Option<&TypeName> {
-        match self {
-            Type_::Apply(_, tn, _) => Some(tn),
-            Type_::Ref(_, inner) => inner.value.unfold_to_type_name(),
+        match &*self.0 {
+            TypeInner::Apply(_, tn, _) => Some(tn),
+            TypeInner::Ref(_, inner) => inner.value.unfold_to_type_name(),
             _ => None,
         }
     }
 
     pub fn type_arguments(&self) -> Option<&Vec<Type>> {
-        match self {
-            Type_::Apply(_, _, tyargs) => Some(tyargs),
-            Type_::Ref(_, inner) => inner.value.type_arguments(),
+        match &*self.0 {
+            TypeInner::Apply(_, _, tyargs) => Some(tyargs),
+            TypeInner::Ref(_, inner) => inner.value.type_arguments(),
             _ => None,
         }
     }
@@ -944,15 +953,15 @@ impl Type_ {
     }
 
     pub fn is_builtin(&self, builtin: &BuiltinTypeName_) -> bool {
-        match &self {
-            Type_::Apply(_, sp!(_, TypeName_::Builtin(sp!(_, bt))), _) => bt == builtin,
+        match &*self.0 {
+            TypeInner::Apply(_, sp!(_, TypeName_::Builtin(sp!(_, bt))), _) => bt == builtin,
             _ => false,
         }
     }
 
     pub fn abilities(&self, loc: Loc) -> Option<AbilitySet> {
-        use Type_ as T;
-        match self {
+        use TypeInner as T;
+        match &*self.0 {
             T::Apply(abilities, _, _) => abilities.clone(),
             T::Param(tp) => Some(tp.abilities.clone()),
             T::Unit => Some(AbilitySet::collection(loc)),
@@ -964,8 +973,8 @@ impl Type_ {
     }
 
     pub fn has_ability_(&self, ability: Ability_) -> Option<bool> {
-        use Type_ as T;
-        match self {
+        use TypeInner as T;
+        match &*self.0 {
             T::Apply(abilities, _, _) => abilities.as_ref().map(|s| s.has_ability_(ability)),
             T::Param(tp) => Some(tp.abilities.has_ability_(ability)),
             T::Unit => Some(AbilitySet::COLLECTION.contains(&ability)),
@@ -980,32 +989,59 @@ impl Type_ {
     // Also return None for `Anything`, `Var`, or other values that might be compatible wifh `Ref`
     // types.
     pub fn is_ref(&self) -> Option<bool> {
-        match self {
-            Type_::Ref(mut_, _) => Some(*mut_),
-            Type_::Unit
-            | Type_::Param(_)
-            | Type_::Apply(_, _, _)
-            | Type_::Fun(_, _)
-            | Type_::Var(_)
-            | Type_::Anything
-            | Type_::Void
-            | Type_::UnresolvedError => None,
+        match &*self.0 {
+            TypeInner::Ref(mut_, _) => Some(*mut_),
+            TypeInner::Unit
+            | TypeInner::Param(_)
+            | TypeInner::Apply(_, _, _)
+            | TypeInner::Fun(_, _)
+            | TypeInner::Var(_)
+            | TypeInner::Anything
+            | TypeInner::Void
+            | TypeInner::UnresolvedError => None,
         }
     }
 
     // Unwraps refs
     pub fn base_type_(&self) -> Self {
-        match self {
-            Type_::Ref(_, inner) => inner.value.clone(),
-            Type_::Unit
-            | Type_::Param(_)
-            | Type_::Apply(_, _, _)
-            | Type_::Fun(_, _)
-            | Type_::Var(_)
-            | Type_::Anything
-            | Type_::Void
-            | Type_::UnresolvedError => self.clone(),
+        match &*self.0 {
+            TypeInner::Ref(_, inner) => inner.value.clone(),
+            TypeInner::Unit
+            | TypeInner::Param(_)
+            | TypeInner::Apply(_, _, _)
+            | TypeInner::Fun(_, _)
+            | TypeInner::Var(_)
+            | TypeInner::Anything
+            | TypeInner::Void
+            | TypeInner::UnresolvedError => self.clone(),
         }
+    }
+
+    pub fn is_var(&self) -> bool {
+        matches!(&*self.0, TypeInner::Var(_))
+    }
+
+    pub fn inner(&self) -> &TypeInner {
+        &self.0
+    }
+
+    pub fn contains_error(&self) -> bool {
+        use TypeInner as T;
+        match &*self.0 {
+            T::UnresolvedError => true,
+            T::Ref(_, inner) => inner.value.contains_error(),
+            T::Apply(_, _, tyargs) => tyargs.iter().any(|t| t.value.contains_error()),
+            T::Fun(params, ret) => {
+                params.iter().any(|t| t.value.contains_error()) || ret.value.contains_error()
+            }
+            T::Unit | T::Param(_) | T::Var(_) | T::Anything | T::Void => false,
+        }
+    }
+}
+
+impl From<TypeInner> for Type_ {
+    fn from(ti: TypeInner) -> Self {
+        Type_(Arc::new(ti))
     }
 }
 
@@ -1045,6 +1081,27 @@ impl Value_ {
             Bool(_) => Type_::bool(loc),
             Bytearray(_) => Type_::vector(loc, Type_::u8(loc)),
         })
+    }
+}
+
+//**************************************************************************************************
+// Clone
+//**************************************************************************************************
+
+impl Clone for Type_ {
+    fn clone(&self) -> Self {
+        Type_(Arc::clone(&self.0))
+    }
+}
+
+impl Clone for TypeName_ {
+    fn clone(&self) -> Self {
+        use TypeName_::*;
+        match self {
+            Multiple(n) => Multiple(*n),
+            Builtin(b) => Builtin(*b),
+            ModuleType(m, n) => ModuleType(Arc::clone(m), *n),
+        }
     }
 }
 
@@ -1538,6 +1595,7 @@ impl AstDebug for (ConstantName, &Constant) {
                 index,
                 attributes,
                 loc: _loc,
+                visibility,
                 signature,
                 value,
             },
@@ -1545,6 +1603,7 @@ impl AstDebug for (ConstantName, &Constant) {
         doc.ast_debug(w);
         warning_filter.ast_debug(w);
         attributes.ast_debug(w);
+        visibility.ast_debug(w);
         w.write(format!("const#{index} {name}:"));
         signature.ast_debug(w);
         w.write(" = ");
@@ -1591,19 +1650,19 @@ impl AstDebug for DatatypeTypeParameter {
     }
 }
 
-impl AstDebug for Type_ {
+impl AstDebug for TypeInner {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
-            Type_::Unit => w.write("()"),
-            Type_::Ref(mut_, s) => {
+            TypeInner::Unit => w.write("()"),
+            TypeInner::Ref(mut_, s) => {
                 w.write("&");
                 if *mut_ {
                     w.write("mut ");
                 }
                 s.ast_debug(w)
             }
-            Type_::Param(tp) => tp.ast_debug(w),
-            Type_::Apply(abilities_opt, sp!(_, TypeName_::Multiple(_)), ss) => {
+            TypeInner::Param(tp) => tp.ast_debug(w),
+            TypeInner::Apply(abilities_opt, sp!(_, TypeName_::Multiple(_)), ss) => {
                 let w_ty = move |w: &mut AstWriter| {
                     w.write("(");
                     ss.ast_debug(w);
@@ -1619,7 +1678,7 @@ impl AstDebug for Type_ {
                     }),
                 }
             }
-            Type_::Apply(abilities_opt, m, ss) => {
+            TypeInner::Apply(abilities_opt, m, ss) => {
                 let w_ty = move |w: &mut AstWriter| {
                     m.ast_debug(w);
                     if !ss.is_empty() {
@@ -1638,17 +1697,23 @@ impl AstDebug for Type_ {
                     }),
                 }
             }
-            Type_::Fun(args, result) => {
+            TypeInner::Fun(args, result) => {
                 w.write("|");
                 w.comma(args, |w, ty| ty.ast_debug(w));
                 w.write("|");
                 result.ast_debug(w);
             }
-            Type_::Var(tv) => w.write(format!("#{}", tv.0)),
-            Type_::Anything => w.write("_"),
-            Type_::Void => w.write("_"),
-            Type_::UnresolvedError => w.write("_|_"),
+            TypeInner::Var(tv) => w.write(format!("#{}", tv.0)),
+            TypeInner::Anything => w.write("_"),
+            TypeInner::Void => w.write("_"),
+            TypeInner::UnresolvedError => w.write("_|_"),
         }
+    }
+}
+
+impl AstDebug for Type_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        self.0.ast_debug(w)
     }
 }
 
@@ -2147,4 +2212,20 @@ impl AstDebug for LambdaLValues_ {
         });
         w.write("| ");
     }
+}
+
+// *************************************************************************************************
+// Size Tests
+// *************************************************************************************************
+
+#[test]
+fn naming_ast_sizes() {
+    assert_eq!(std::mem::size_of::<TypeName>(), 56, "TypeName size changed");
+    assert_eq!(
+        std::mem::size_of::<TypeInner>(),
+        112,
+        "TypeInner size changed"
+    );
+    assert_eq!(std::mem::size_of::<Type_>(), 8, "Type_ size changed");
+    assert_eq!(std::mem::size_of::<Type>(), 24, "Type size changed");
 }

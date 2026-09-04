@@ -5,21 +5,24 @@ use prost_types::FieldMask;
 use std::path::PathBuf;
 use sui_macros::sim_test;
 use sui_move_build::BuildConfig;
-use sui_rpc::client::v2::Client;
+use sui_rpc::Client;
 use sui_rpc::field::FieldMaskUtil;
 use sui_rpc::proto::sui::rpc::v2::changed_object::{IdOperation, OutputObjectState};
 use sui_rpc::proto::sui::rpc::v2::{
     GetCoinInfoRequest, GetCoinInfoResponse, ListOwnedObjectsRequest,
 };
 use sui_sdk_types::TypeTag;
+use sui_types::Identifier;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::{CallArg, ObjectArg, TransactionData, TransactionKind};
-use sui_types::Identifier;
 use test_cluster::TestClusterBuilder;
 
 #[sim_test]
 async fn test_indexing_with_tto() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut client = Client::new(cluster.rpc_url().to_owned()).unwrap();
     let address = cluster.get_address_0();
@@ -46,7 +49,10 @@ async fn test_indexing_with_tto() {
 
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["tests", "rpc", "data", "tto"]);
-    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let compiled_package = BuildConfig::new_for_testing()
+        .build_async(&path)
+        .await
+        .unwrap();
     let compiled_modules_bytes =
         compiled_package.get_package_bytes(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
@@ -178,18 +184,20 @@ async fn test_indexing_with_tto() {
     );
 
     // 0x0 starts with 0 coins
-    assert!(client
-        .state_client()
-        .list_owned_objects({
-            let mut message = ListOwnedObjectsRequest::default();
-            message.owner = Some("0x0".to_owned());
-            message
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .objects
-        .is_empty());
+    assert!(
+        client
+            .state_client()
+            .list_owned_objects({
+                let mut message = ListOwnedObjectsRequest::default();
+                message.owner = Some("0x0".to_owned());
+                message
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .objects
+            .is_empty()
+    );
 
     //
     // Run the `receive` function to receive the coin from TTO and send it to 0x0
@@ -237,18 +245,20 @@ async fn test_indexing_with_tto() {
     super::super::execute_transaction(&mut client, &txn).await;
 
     // Parent ends with 0 coins
-    assert!(client
-        .state_client()
-        .list_owned_objects({
-            let mut message = ListOwnedObjectsRequest::default();
-            message.owner = Some(parent.0.clone());
-            message
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .objects
-        .is_empty());
+    assert!(
+        client
+            .state_client()
+            .list_owned_objects({
+                let mut message = ListOwnedObjectsRequest::default();
+                message.owner = Some(parent.0.clone());
+                message
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .objects
+            .is_empty()
+    );
 
     // 0x0 ends with 1 coin
     assert_eq!(
@@ -270,7 +280,10 @@ async fn test_indexing_with_tto() {
 
 #[sim_test]
 async fn test_filter_by_type() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let sui = "0x2::coin::Coin<0x2::sui::SUI>"
         .parse::<TypeTag>()
@@ -304,7 +317,10 @@ async fn test_filter_by_type() {
 
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["tests", "rpc", "data", "trusted_coin"]);
-    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let compiled_package = BuildConfig::new_for_testing()
+        .build_async(&path)
+        .await
+        .unwrap();
     let compiled_modules_bytes =
         compiled_package.get_package_bytes(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
@@ -519,7 +535,10 @@ async fn test_filter_by_type() {
 
 #[sim_test]
 async fn test_reverse_sorted_coins_by_balance() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut client = Client::new(cluster.rpc_url().to_owned()).unwrap();
 

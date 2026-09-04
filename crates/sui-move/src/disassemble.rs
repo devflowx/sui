@@ -7,11 +7,12 @@ use move_bytecode_source_map::utils::serialize_to_json_string;
 use move_cli::base;
 use move_disassembler::disassembler::Disassembler;
 use move_ir_types::location::Spanned;
-use move_package::BuildConfig;
+use move_package_alt_compilation::build_config::BuildConfig;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::path::PathBuf;
+use sui_package_alt::SuiFlavor;
 
 #[derive(Parser)]
 #[group(id = "sui-move-disassemmble")]
@@ -33,10 +34,11 @@ pub struct Disassemble {
 }
 
 impl Disassemble {
-    pub fn execute(
+    pub async fn execute(
         self,
         package_path: Option<&Path>,
         build_config: BuildConfig,
+        flavor: SuiFlavor,
     ) -> anyhow::Result<()> {
         if base::reroot_path(Some(&self.module_path)).is_ok() {
             // disassembling bytecode inside the source package that produced it--use the source info
@@ -54,7 +56,8 @@ impl Disassemble {
                 debug: self.debug,
                 bytecode_map: self.bytecode_map,
             }
-            .execute(package_path, build_config)?;
+            .execute(package_path, build_config, flavor)
+            .await?;
             return Ok(());
         }
 

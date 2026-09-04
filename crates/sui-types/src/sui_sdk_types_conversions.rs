@@ -9,10 +9,30 @@
 //! directly to avoid going through the BCS machinery.
 
 use fastcrypto::traits::ToFromBytes;
-use sui_sdk_types::*;
+use nonempty::NonEmpty;
+use sui_sdk_types::{
+    self, AccumulatorWrite, ActiveJwk, Address, Argument, AuthenticatorStateExpire, Bitmap,
+    Bls12381PublicKey, Bls12381Signature, CanceledTransaction, CanceledTransactionV2, ChangeEpoch,
+    CheckpointCommitment, CheckpointContents, CheckpointData, CheckpointSummary, Command,
+    CommandArgumentError, ConsensusDeterminedVersionAssignments, Digest, Ed25519PublicKey,
+    Ed25519Signature, EndOfEpochTransactionKind, Event, ExecutionError, ExecutionStatus,
+    ExecutionTimeObservationKey, ExecutionTimeObservations, FundsWithdrawal, IdOperation,
+    Identifier, Input, Jwk, JwkId, MakeMoveVector, MergeCoins, MoveCall, MoveLocation, MovePackage,
+    MultisigMemberPublicKey, MultisigMemberSignature, Mutability, Object, ObjectIn, ObjectOut,
+    ObjectReference, Owner, PackageUpgradeError, PasskeyAuthenticator, PasskeyPublicKey, Publish,
+    Secp256k1PublicKey, Secp256k1Signature, Secp256r1PublicKey, Secp256r1Signature, SharedInput,
+    SignatureScheme, SignedCheckpointSummary, SignedTransaction, SimpleSignature, SplitCoins,
+    StructTag, SystemPackage, Transaction, TransactionEffects, TransactionEffectsV1,
+    TransactionEffectsV2, TransactionEvents, TransactionExpiration, TransactionKind,
+    TransferObjects, TypeArgumentError, TypeParseError, TypeTag, UnchangedConsensusKind, Upgrade,
+    UserSignature, ValidatorAggregatedSignature, ValidatorCommittee, ValidatorCommitteeMember,
+    ValidatorExecutionTimeObservation, VersionAssignment, VersionAssignmentV2,
+    ZkLoginAuthenticator, ZkLoginPublicIdentifier,
+};
 use tap::Pipe;
 
 use crate::crypto::SuiSignature as _;
+use crate::execution_status::ExecutionFailure;
 
 #[derive(Debug)]
 pub struct SdkTypeConversionError(String);
@@ -112,6 +132,7 @@ bcs_convert_impl!(
     crate::passkey_authenticator::PasskeyAuthenticator,
     PasskeyAuthenticator
 );
+bcs_convert_impl!(crate::event::Event, Event);
 bcs_convert_impl!(crate::effects::TransactionEvents, TransactionEvents);
 bcs_convert_impl!(crate::transaction::TransactionKind, TransactionKind);
 bcs_convert_impl!(crate::move_package::MovePackage, MovePackage);
@@ -169,6 +190,8 @@ impl From<crate::object::Owner> for Owner {
                 start_version: start_version.value(),
                 owner: owner.into(),
             },
+            // TODO(Party WIP)
+            crate::object::Owner::Party { .. } => todo!("Party WIP"),
         }
     }
 }
@@ -314,13 +337,7 @@ pub fn struct_tag_core_to_sdk(
         .into_iter()
         .map(type_tag_core_to_sdk)
         .collect::<Result<_, _>>()?;
-    StructTag {
-        address,
-        module,
-        name,
-        type_params,
-    }
-    .pipe(Ok)
+    StructTag::new(address, module, name, type_params).pipe(Ok)
 }
 
 pub fn type_tag_sdk_to_core(
@@ -349,18 +366,17 @@ pub fn type_tag_sdk_to_core(
 pub fn struct_tag_sdk_to_core(
     value: StructTag,
 ) -> Result<move_core_types::language_storage::StructTag, SdkTypeConversionError> {
-    let StructTag {
-        address,
-        module,
-        name,
-        type_params,
-    } = value;
+    let address = value.address();
+    let module = value.module();
+    let name = value.name();
+    let type_params = value.type_params();
 
     let address = move_core_types::account_address::AccountAddress::new(address.into_inner());
     let module = move_core_types::identifier::Identifier::new(module.as_str())?;
     let name = move_core_types::identifier::Identifier::new(name.as_str())?;
     let type_params = type_params
-        .into_iter()
+        .iter()
+        .cloned()
         .map(type_tag_sdk_to_core)
         .collect::<Result<_, _>>()?;
     move_core_types::language_storage::StructTag {
@@ -401,16 +417,16 @@ impl TryFrom<crate::type_input::StructInput> for StructTag {
     type Error = SdkTypeConversionError;
 
     fn try_from(value: crate::type_input::StructInput) -> Result<Self, Self::Error> {
-        Self {
-            address: Address::new(value.address.into_bytes()),
-            module: Identifier::new(value.module)?,
-            name: Identifier::new(value.name)?,
-            type_params: value
+        Self::new(
+            Address::new(value.address.into_bytes()),
+            Identifier::new(value.module)?,
+            Identifier::new(value.name)?,
+            value
                 .type_params
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
-        }
+        )
         .pipe(Ok)
     }
 }
@@ -437,11 +453,16 @@ impl From<StructTag> for crate::type_input::StructInput {
     fn from(value: StructTag) -> Self {
         Self {
             address: move_core_types::account_address::AccountAddress::new(
-                value.address.into_inner(),
+                value.address().into_inner(),
             ),
-            module: value.module.as_str().into(),
-            name: value.name.as_str().into(),
-            type_params: value.type_params.into_iter().map(Into::into).collect(),
+            module: value.module().as_str().into(),
+            name: value.name().as_str().into(),
+            type_params: value
+                .type_params()
+                .iter()
+                .cloned()
+                .map(crate::type_input::TypeInput::from)
+                .collect(),
         }
     }
 }
@@ -562,7 +583,6 @@ impl From<UnchangedConsensusKind> for crate::effects::UnchangedConsensusKind {
             }
             UnchangedConsensusKind::Canceled { version } => Self::Cancelled(version.into()),
             UnchangedConsensusKind::PerEpochConfig => Self::PerEpochConfig,
-            UnchangedConsensusKind::PerEpochConfigWithSequenceNumber { .. } => todo!(),
             _ => unreachable!("sdk shouldn't have a variant that the mono repo doesn't"),
         }
     }
@@ -621,9 +641,44 @@ impl From<crate::effects::ObjectOut> for ObjectOut {
                 digest: digest.into(),
             },
 
-            // TODO implement accumulator in sdk. This feature is not live yet on any network
-            crate::effects::ObjectOut::AccumulatorWriteV1(_) => todo!(),
+            crate::effects::ObjectOut::AccumulatorWriteV1(accumulator_write) => {
+                Self::AccumulatorWrite(accumulator_write.into())
+            }
         }
+    }
+}
+
+impl From<crate::effects::AccumulatorWriteV1> for AccumulatorWrite {
+    fn from(value: crate::effects::AccumulatorWriteV1) -> Self {
+        let operation = match value.operation {
+            crate::effects::AccumulatorOperation::Merge => {
+                sui_sdk_types::AccumulatorOperation::Merge
+            }
+            crate::effects::AccumulatorOperation::Split => {
+                sui_sdk_types::AccumulatorOperation::Split
+            }
+        };
+        Self::new(
+            value.address.address.into(),
+            type_tag_core_to_sdk(value.address.ty).unwrap(),
+            operation,
+            match value.value {
+                crate::effects::AccumulatorValue::Integer(value) => {
+                    sui_sdk_types::AccumulatorValue::Integer(value)
+                }
+                crate::effects::AccumulatorValue::IntegerTuple(a, b) => {
+                    sui_sdk_types::AccumulatorValue::IntegerTuple(a, b)
+                }
+                crate::effects::AccumulatorValue::EventDigest(digests) => {
+                    sui_sdk_types::AccumulatorValue::EventDigest(
+                        digests
+                            .into_iter()
+                            .map(|(idx, digest)| (idx, digest.into()))
+                            .collect(),
+                    )
+                }
+            },
+        )
     }
 }
 
@@ -642,6 +697,43 @@ impl From<crate::transaction::TransactionExpiration> for TransactionExpiration {
         match value {
             crate::transaction::TransactionExpiration::None => Self::None,
             crate::transaction::TransactionExpiration::Epoch(epoch) => Self::Epoch(epoch),
+            crate::transaction::TransactionExpiration::ValidDuring {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain,
+                nonce,
+            } => Self::ValidDuring {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain: Digest::new(*chain.as_bytes()),
+                nonce,
+            },
+            crate::transaction::TransactionExpiration::Validity {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain,
+                nonce,
+                allowed_proposers,
+            } => Self::Validity {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain: Digest::new(*chain.as_bytes()),
+                nonce,
+                allowed_proposers: allowed_proposers.map(|allowed| {
+                    sui_sdk_types::AllowedProposers {
+                        epoch: allowed.epoch,
+                        proposers: allowed.proposers.into(),
+                    }
+                }),
+            },
         }
     }
 }
@@ -651,6 +743,45 @@ impl From<TransactionExpiration> for crate::transaction::TransactionExpiration {
         match value {
             TransactionExpiration::None => Self::None,
             TransactionExpiration::Epoch(epoch) => Self::Epoch(epoch),
+            TransactionExpiration::ValidDuring {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain,
+                nonce,
+            } => Self::ValidDuring {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain: crate::digests::CheckpointDigest::from(chain).into(),
+                nonce,
+            },
+            TransactionExpiration::Validity {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain,
+                nonce,
+                allowed_proposers,
+            } => Self::Validity {
+                min_epoch,
+                max_epoch,
+                min_timestamp,
+                max_timestamp,
+                chain: crate::digests::CheckpointDigest::from(chain).into(),
+                nonce,
+                // An empty set is rejected by the sdk's deserializer, so it can only appear on a
+                // value built in memory; drop the restriction rather than fabricating one.
+                allowed_proposers: allowed_proposers.and_then(|allowed| {
+                    Some(crate::transaction::AllowedProposers {
+                        epoch: allowed.epoch,
+                        proposers: NonEmpty::from_vec(allowed.proposers)?,
+                    })
+                }),
+            },
             _ => unreachable!("sdk shouldn't have a variant that the mono repo doesn't"),
         }
     }
@@ -758,15 +889,19 @@ impl From<crate::execution_status::CommandArgumentError> for CommandArgumentErro
             crate::execution_status::CommandArgumentError::InvalidObjectByMutRef => Self::InvalidObjectByMutRef,
             crate::execution_status::CommandArgumentError::SharedObjectOperationNotAllowed => Self::ConsensusObjectOperationNotAllowed,
             crate::execution_status::CommandArgumentError::InvalidArgumentArity => Self::InvalidArgumentArity,
-            crate::execution_status::CommandArgumentError::InvalidTransferObject |
-            crate::execution_status::CommandArgumentError::InvalidMakeMoveVecNonObjectArgument |
-            crate::execution_status::CommandArgumentError::ArgumentWithoutValue |
-            crate::execution_status::CommandArgumentError::CannotMoveBorrowedValue |
-            crate::execution_status::CommandArgumentError::CannotWriteToExtendedReference |
-            crate::execution_status::CommandArgumentError::InvalidReferenceArgument => {
-                    todo!("New errors need to be added to SDK once stabilized")
-            }
-
+            crate::execution_status::CommandArgumentError::InvalidTransferObject  => Self::InvalidTransferObject,
+            crate::execution_status::CommandArgumentError::InvalidMakeMoveVecNonObjectArgument =>
+                Self::InvalidMakeMoveVecNonObjectArgument,
+            crate::execution_status::CommandArgumentError::ArgumentWithoutValue  =>
+                Self::ArgumentWithoutValue,
+            crate::execution_status::CommandArgumentError::CannotMoveBorrowedValue =>
+                Self::CannotMoveBorrowedValue,
+            crate::execution_status::CommandArgumentError::CannotWriteToExtendedReference =>
+                Self::CannotWriteToExtendedReference,
+            crate::execution_status::CommandArgumentError::InvalidReferenceArgument =>
+                Self::InvalidReferenceArgument,
+            crate::execution_status::CommandArgumentError::InvalidTxContext =>
+                Self::InvalidTxContext,
         }
     }
 }
@@ -800,62 +935,75 @@ impl From<CommandArgumentError> for crate::execution_status::CommandArgumentErro
                 Self::SharedObjectOperationNotAllowed
             }
             CommandArgumentError::InvalidArgumentArity => Self::InvalidArgumentArity,
+            CommandArgumentError::InvalidTransferObject => Self::InvalidTransferObject,
+            CommandArgumentError::InvalidMakeMoveVecNonObjectArgument => {
+                Self::InvalidMakeMoveVecNonObjectArgument
+            }
+            CommandArgumentError::ArgumentWithoutValue => Self::ArgumentWithoutValue,
+            CommandArgumentError::CannotMoveBorrowedValue => Self::CannotMoveBorrowedValue,
+            CommandArgumentError::CannotWriteToExtendedReference => {
+                Self::CannotWriteToExtendedReference
+            }
+            CommandArgumentError::InvalidReferenceArgument => Self::InvalidReferenceArgument,
             _ => unreachable!("sdk shouldn't have a variant that the mono repo doesn't"),
         }
     }
 }
 
-impl From<crate::execution_status::ExecutionFailureStatus> for ExecutionError {
-    fn from(value: crate::execution_status::ExecutionFailureStatus) -> Self {
+impl From<crate::execution_status::ExecutionErrorKind> for ExecutionError {
+    fn from(value: crate::execution_status::ExecutionErrorKind) -> Self {
         match value {
-            crate::execution_status::ExecutionFailureStatus::InsufficientGas => Self::InsufficientGas,
-            crate::execution_status::ExecutionFailureStatus::InvalidGasObject => Self::InvalidGasObject,
-            crate::execution_status::ExecutionFailureStatus::InvariantViolation => Self::InvariantViolation,
-            crate::execution_status::ExecutionFailureStatus::FeatureNotYetSupported => Self::FeatureNotYetSupported,
-            crate::execution_status::ExecutionFailureStatus::MoveObjectTooBig { object_size, max_object_size } => Self::ObjectTooBig { object_size, max_object_size },
-            crate::execution_status::ExecutionFailureStatus::MovePackageTooBig { object_size, max_object_size } => Self::PackageTooBig { object_size, max_object_size },
-            crate::execution_status::ExecutionFailureStatus::CircularObjectOwnership { object } => Self::CircularObjectOwnership { object: object.into() },
-            crate::execution_status::ExecutionFailureStatus::InsufficientCoinBalance => Self::InsufficientCoinBalance,
-            crate::execution_status::ExecutionFailureStatus::CoinBalanceOverflow => Self::CoinBalanceOverflow,
-            crate::execution_status::ExecutionFailureStatus::PublishErrorNonZeroAddress => Self::PublishErrorNonZeroAddress,
-            crate::execution_status::ExecutionFailureStatus::SuiMoveVerificationError => Self::SuiMoveVerificationError,
-            crate::execution_status::ExecutionFailureStatus::MovePrimitiveRuntimeError(move_location_opt) => Self::MovePrimitiveRuntimeError { location: move_location_opt.0.map(Into::into) },
-            crate::execution_status::ExecutionFailureStatus::MoveAbort(move_location, code) => Self::MoveAbort { location: move_location.into(), code },
-            crate::execution_status::ExecutionFailureStatus::VMVerificationOrDeserializationError => Self::VmVerificationOrDeserializationError,
-            crate::execution_status::ExecutionFailureStatus::VMInvariantViolation => Self::VmInvariantViolation,
-            crate::execution_status::ExecutionFailureStatus::FunctionNotFound => Self::FunctionNotFound,
-            crate::execution_status::ExecutionFailureStatus::ArityMismatch => Self::ArityMismatch,
-            crate::execution_status::ExecutionFailureStatus::TypeArityMismatch => Self::TypeArityMismatch,
-            crate::execution_status::ExecutionFailureStatus::NonEntryFunctionInvoked => Self::NonEntryFunctionInvoked,
-            crate::execution_status::ExecutionFailureStatus::CommandArgumentError { arg_idx, kind } => Self::CommandArgumentError { argument: arg_idx, kind: kind.into() },
-            crate::execution_status::ExecutionFailureStatus::TypeArgumentError { argument_idx, kind } => Self::TypeArgumentError { type_argument: argument_idx, kind: kind.into() },
-            crate::execution_status::ExecutionFailureStatus::UnusedValueWithoutDrop { result_idx, secondary_idx } => Self::UnusedValueWithoutDrop { result: result_idx, subresult: secondary_idx },
-            crate::execution_status::ExecutionFailureStatus::InvalidPublicFunctionReturnType { idx } => Self::InvalidPublicFunctionReturnType { index: idx },
-            crate::execution_status::ExecutionFailureStatus::InvalidTransferObject => Self::InvalidTransferObject,
-            crate::execution_status::ExecutionFailureStatus::EffectsTooLarge { current_size, max_size } => Self::EffectsTooLarge { current_size, max_size },
-            crate::execution_status::ExecutionFailureStatus::PublishUpgradeMissingDependency => Self::PublishUpgradeMissingDependency,
-            crate::execution_status::ExecutionFailureStatus::PublishUpgradeDependencyDowngrade => Self::PublishUpgradeDependencyDowngrade,
-            crate::execution_status::ExecutionFailureStatus::PackageUpgradeError { upgrade_error } => Self::PackageUpgradeError { kind: upgrade_error.into() },
-            crate::execution_status::ExecutionFailureStatus::WrittenObjectsTooLarge { current_size, max_size } => Self::WrittenObjectsTooLarge { object_size: current_size, max_object_size:max_size },
-            crate::execution_status::ExecutionFailureStatus::CertificateDenied => Self::CertificateDenied,
-            crate::execution_status::ExecutionFailureStatus::SuiMoveVerificationTimedout => Self::SuiMoveVerificationTimedout,
-            crate::execution_status::ExecutionFailureStatus::SharedObjectOperationNotAllowed => Self::ConsensusObjectOperationNotAllowed,
-            crate::execution_status::ExecutionFailureStatus::InputObjectDeleted => Self::InputObjectDeleted,
-            crate::execution_status::ExecutionFailureStatus::ExecutionCancelledDueToSharedObjectCongestion { congested_objects } => Self::ExecutionCanceledDueToConsensusObjectCongestion { congested_objects: congested_objects.0.into_iter().map(Into::into).collect() },
-            crate::execution_status::ExecutionFailureStatus::AddressDeniedForCoin { address, coin_type } => Self::AddressDeniedForCoin { address: address.into(), coin_type },
-            crate::execution_status::ExecutionFailureStatus::CoinTypeGlobalPause { coin_type } => Self::CoinTypeGlobalPause { coin_type },
-            crate::execution_status::ExecutionFailureStatus::ExecutionCancelledDueToRandomnessUnavailable => Self::ExecutionCanceledDueToRandomnessUnavailable,
-            crate::execution_status::ExecutionFailureStatus::MoveVectorElemTooBig { value_size, max_scaled_size } => Self::MoveVectorElemTooBig { value_size, max_scaled_size },
-            crate::execution_status::ExecutionFailureStatus::MoveRawValueTooBig { value_size, max_scaled_size } => Self::MoveRawValueTooBig { value_size, max_scaled_size },
-            crate::execution_status::ExecutionFailureStatus::InvalidLinkage => Self::InvalidLinkage,
-            crate::execution_status::ExecutionFailureStatus::InsufficientBalanceForWithdraw => {
-                todo!("Add InsufficientBalanceForWithdraw to sdk")
+            crate::execution_status::ExecutionErrorKind::InsufficientGas => Self::InsufficientGas,
+            crate::execution_status::ExecutionErrorKind::InvalidGasObject => Self::InvalidGasObject,
+            crate::execution_status::ExecutionErrorKind::InvariantViolation => Self::InvariantViolation,
+            crate::execution_status::ExecutionErrorKind::FeatureNotYetSupported => Self::FeatureNotYetSupported,
+            crate::execution_status::ExecutionErrorKind::MoveObjectTooBig { object_size, max_object_size } => Self::ObjectTooBig { object_size, max_object_size },
+            crate::execution_status::ExecutionErrorKind::MovePackageTooBig { object_size, max_object_size } => Self::PackageTooBig { object_size, max_object_size },
+            crate::execution_status::ExecutionErrorKind::CircularObjectOwnership { object } => Self::CircularObjectOwnership { object: object.into() },
+            crate::execution_status::ExecutionErrorKind::InsufficientCoinBalance => Self::InsufficientCoinBalance,
+            crate::execution_status::ExecutionErrorKind::CoinBalanceOverflow => Self::CoinBalanceOverflow,
+            crate::execution_status::ExecutionErrorKind::PublishErrorNonZeroAddress => Self::PublishErrorNonZeroAddress,
+            crate::execution_status::ExecutionErrorKind::SuiMoveVerificationError => Self::SuiMoveVerificationError,
+            crate::execution_status::ExecutionErrorKind::MovePrimitiveRuntimeError(move_location_opt) => Self::MovePrimitiveRuntimeError { location: move_location_opt.0.map(Into::into) },
+            crate::execution_status::ExecutionErrorKind::MoveAbort(move_location, code) => Self::MoveAbort { location: move_location.into(), code },
+            crate::execution_status::ExecutionErrorKind::VMVerificationOrDeserializationError => Self::VmVerificationOrDeserializationError,
+            crate::execution_status::ExecutionErrorKind::VMInvariantViolation => Self::VmInvariantViolation,
+            crate::execution_status::ExecutionErrorKind::FunctionNotFound => Self::FunctionNotFound,
+            crate::execution_status::ExecutionErrorKind::ArityMismatch => Self::ArityMismatch,
+            crate::execution_status::ExecutionErrorKind::TypeArityMismatch => Self::TypeArityMismatch,
+            crate::execution_status::ExecutionErrorKind::NonEntryFunctionInvoked => Self::NonEntryFunctionInvoked,
+            crate::execution_status::ExecutionErrorKind::CommandArgumentError { arg_idx, kind } => Self::CommandArgumentError { argument: arg_idx, kind: kind.into() },
+            crate::execution_status::ExecutionErrorKind::TypeArgumentError { argument_idx, kind } => Self::TypeArgumentError { type_argument: argument_idx, kind: kind.into() },
+            crate::execution_status::ExecutionErrorKind::UnusedValueWithoutDrop { result_idx, secondary_idx } => Self::UnusedValueWithoutDrop { result: result_idx, subresult: secondary_idx },
+            crate::execution_status::ExecutionErrorKind::InvalidPublicFunctionReturnType { idx } => Self::InvalidPublicFunctionReturnType { index: idx },
+            crate::execution_status::ExecutionErrorKind::InvalidTransferObject => Self::InvalidTransferObject,
+            crate::execution_status::ExecutionErrorKind::EffectsTooLarge { current_size, max_size } => Self::EffectsTooLarge { current_size, max_size },
+            crate::execution_status::ExecutionErrorKind::PublishUpgradeMissingDependency => Self::PublishUpgradeMissingDependency,
+            crate::execution_status::ExecutionErrorKind::PublishUpgradeDependencyDowngrade => Self::PublishUpgradeDependencyDowngrade,
+            crate::execution_status::ExecutionErrorKind::PackageUpgradeError { upgrade_error } => Self::PackageUpgradeError { kind: upgrade_error.into() },
+            crate::execution_status::ExecutionErrorKind::WrittenObjectsTooLarge { current_size, max_size } => Self::WrittenObjectsTooLarge { object_size: current_size, max_object_size:max_size },
+            crate::execution_status::ExecutionErrorKind::CertificateDenied => Self::CertificateDenied,
+            crate::execution_status::ExecutionErrorKind::SuiMoveVerificationTimedout => Self::SuiMoveVerificationTimedout,
+            crate::execution_status::ExecutionErrorKind::SharedObjectOperationNotAllowed => Self::ConsensusObjectOperationNotAllowed,
+            crate::execution_status::ExecutionErrorKind::InputObjectDeleted => Self::InputObjectDeleted,
+            crate::execution_status::ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { congested_objects } => Self::ExecutionCanceledDueToConsensusObjectCongestion { congested_objects: congested_objects.0.into_iter().map(Into::into).collect() },
+            crate::execution_status::ExecutionErrorKind::AddressDeniedForCoin { address, coin_type } => Self::AddressDeniedForCoin { address: address.into(), coin_type },
+            crate::execution_status::ExecutionErrorKind::CoinTypeGlobalPause { coin_type } => Self::CoinTypeGlobalPause { coin_type },
+            crate::execution_status::ExecutionErrorKind::ExecutionCancelledDueToRandomnessUnavailable => Self::ExecutionCanceledDueToRandomnessUnavailable,
+            crate::execution_status::ExecutionErrorKind::MoveVectorElemTooBig { value_size, max_scaled_size } => Self::MoveVectorElemTooBig { value_size, max_scaled_size },
+            crate::execution_status::ExecutionErrorKind::MoveRawValueTooBig { value_size, max_scaled_size } => Self::MoveRawValueTooBig { value_size, max_scaled_size },
+            crate::execution_status::ExecutionErrorKind::InvalidLinkage => Self::InvalidLinkage,
+            crate::execution_status::ExecutionErrorKind::InsufficientFundsForWithdraw => {
+                Self::InsufficientFundsForWithdraw
+            }
+            crate::execution_status::ExecutionErrorKind::NonExclusiveWriteInputObjectModified { id } => {
+                Self::NonExclusiveWriteInputObjectModified { object: id.into() }
             }
         }
     }
 }
 
-impl From<ExecutionError> for crate::execution_status::ExecutionFailureStatus {
+impl From<ExecutionError> for crate::execution_status::ExecutionErrorKind {
     fn from(value: ExecutionError) -> Self {
         match value {
             ExecutionError::InsufficientGas => Self::InsufficientGas,
@@ -1018,7 +1166,10 @@ impl From<crate::execution_status::ExecutionStatus> for ExecutionStatus {
     fn from(value: crate::execution_status::ExecutionStatus) -> Self {
         match value {
             crate::execution_status::ExecutionStatus::Success => Self::Success,
-            crate::execution_status::ExecutionStatus::Failure { error, command } => Self::Failure {
+            crate::execution_status::ExecutionStatus::Failure(ExecutionFailure {
+                error,
+                command,
+            }) => Self::Failure {
                 error: error.into(),
                 command: command.map(|c| c as u64),
             },
@@ -1138,10 +1289,22 @@ impl From<crate::crypto::SignatureScheme> for SignatureScheme {
     }
 }
 
+impl From<crate::transaction::SharedObjectMutability> for Mutability {
+    fn from(value: crate::transaction::SharedObjectMutability) -> Self {
+        match value {
+            crate::transaction::SharedObjectMutability::Immutable => Self::Immutable,
+            crate::transaction::SharedObjectMutability::Mutable => Self::Mutable,
+            crate::transaction::SharedObjectMutability::NonExclusiveWrite => {
+                Self::NonExclusiveWrite
+            }
+        }
+    }
+}
+
 impl From<crate::transaction::CallArg> for Input {
     fn from(value: crate::transaction::CallArg) -> Self {
         match value {
-            crate::transaction::CallArg::Pure(vec) => Self::Pure { value: vec },
+            crate::transaction::CallArg::Pure(value) => Self::Pure(value),
             crate::transaction::CallArg::Object(object_arg) => match object_arg {
                 crate::transaction::ObjectArg::ImmOrOwnedObject((id, version, digest)) => {
                     Self::ImmutableOrOwned(ObjectReference::new(
@@ -1153,19 +1316,37 @@ impl From<crate::transaction::CallArg> for Input {
                 crate::transaction::ObjectArg::SharedObject {
                     id,
                     initial_shared_version,
-                    mutable,
-                } => Self::Shared {
-                    object_id: id.into(),
-                    initial_shared_version: initial_shared_version.value(),
-                    mutable,
-                },
+                    mutability,
+                } => Self::Shared(SharedInput::new(
+                    id.into(),
+                    initial_shared_version.value(),
+                    mutability,
+                )),
                 crate::transaction::ObjectArg::Receiving((id, version, digest)) => Self::Receiving(
                     ObjectReference::new(id.into(), version.value(), digest.into()),
                 ),
             },
-            crate::transaction::CallArg::FundsWithdrawal(_) => {
-                // TODO(address-balances): Add support for balance withdraws.
-                todo!("Convert balance withdraw reservation to sdk Input")
+            crate::transaction::CallArg::FundsWithdrawal(withdrawal) => {
+                let crate::transaction::Reservation::MaxAmountU64(amount) = withdrawal.reservation;
+                let crate::transaction::WithdrawalTypeArg::Balance(coin_type) = withdrawal.type_arg;
+                let source = match withdrawal.withdraw_from {
+                    crate::transaction::WithdrawFrom::Sender => sui_sdk_types::WithdrawFrom::Sender,
+                    crate::transaction::WithdrawFrom::Sponsor => {
+                        sui_sdk_types::WithdrawFrom::Sponsor
+                    }
+                    crate::transaction::WithdrawFrom::SenderAllowance { funder, allowance } => {
+                        sui_sdk_types::WithdrawFrom::SenderAllowance {
+                            funder: funder.into(),
+                            allowance: allowance.into(),
+                        }
+                    }
+                };
+
+                Self::FundsWithdrawal(FundsWithdrawal::new(
+                    amount,
+                    type_tag_core_to_sdk(coin_type).unwrap(),
+                    source,
+                ))
             }
         }
     }
@@ -1176,7 +1357,7 @@ impl From<Input> for crate::transaction::CallArg {
         use crate::transaction::ObjectArg;
 
         match value {
-            Input::Pure { value } => Self::Pure(value),
+            Input::Pure(value) => Self::Pure(value),
             Input::ImmutableOrOwned(object_reference) => {
                 let (id, version, digest) = object_reference.into_parts();
                 Self::Object(ObjectArg::ImmOrOwnedObject((
@@ -1185,14 +1366,16 @@ impl From<Input> for crate::transaction::CallArg {
                     digest.into(),
                 )))
             }
-            Input::Shared {
-                object_id,
-                initial_shared_version,
-                mutable,
-            } => Self::Object(ObjectArg::SharedObject {
-                id: object_id.into(),
-                initial_shared_version: initial_shared_version.into(),
-                mutable,
+            Input::Shared(shared_input) => Self::Object(ObjectArg::SharedObject {
+                id: shared_input.object_id().into(),
+                initial_shared_version: shared_input.version().into(),
+                mutability: match shared_input.mutability() {
+                    Mutability::Immutable => crate::transaction::SharedObjectMutability::Immutable,
+                    Mutability::Mutable => crate::transaction::SharedObjectMutability::Mutable,
+                    Mutability::NonExclusiveWrite => {
+                        crate::transaction::SharedObjectMutability::NonExclusiveWrite
+                    }
+                },
             }),
             Input::Receiving(object_reference) => {
                 let (id, version, digest) = object_reference.into_parts();
@@ -1201,6 +1384,34 @@ impl From<Input> for crate::transaction::CallArg {
                     version.into(),
                     digest.into(),
                 )))
+            }
+            Input::FundsWithdrawal(withdrawal) => {
+                Self::FundsWithdrawal(crate::transaction::FundsWithdrawalArg {
+                    reservation: withdrawal
+                        .amount()
+                        .map(crate::transaction::Reservation::MaxAmountU64)
+                        .unwrap(),
+                    type_arg: crate::transaction::WithdrawalTypeArg::Balance(
+                        type_tag_sdk_to_core(withdrawal.coin_type().to_owned()).unwrap(),
+                    ),
+                    withdraw_from: match withdrawal.source() {
+                        sui_sdk_types::WithdrawFrom::Sender => {
+                            crate::transaction::WithdrawFrom::Sender
+                        }
+                        sui_sdk_types::WithdrawFrom::Sponsor => {
+                            crate::transaction::WithdrawFrom::Sponsor
+                        }
+                        sui_sdk_types::WithdrawFrom::SenderAllowance { funder, allowance } => {
+                            crate::transaction::WithdrawFrom::SenderAllowance {
+                                funder: funder.into(),
+                                allowance: allowance.into(),
+                            }
+                        }
+                        _ => {
+                            unreachable!("sdk shouldn't have a variant that the mono repo doesn't")
+                        }
+                    },
+                })
             }
             _ => unreachable!("sdk shouldn't have a variant that the mono repo doesn't"),
         }
@@ -1462,10 +1673,24 @@ impl From<crate::transaction::EndOfEpochTransactionKind> for EndOfEpochTransacti
                 stored_execution_time_observations,
             ) => Self::StoreExecutionTimeObservations(stored_execution_time_observations.into()),
             crate::transaction::EndOfEpochTransactionKind::AccumulatorRootCreate => {
-                todo!("AccumulatorRootCreate needs to be added to sdk")
+                Self::AccumulatorRootCreate
             }
             crate::transaction::EndOfEpochTransactionKind::CoinRegistryCreate => {
                 Self::CoinRegistryCreate
+            }
+            crate::transaction::EndOfEpochTransactionKind::DisplayRegistryCreate => {
+                Self::DisplayRegistryCreate
+            }
+            crate::transaction::EndOfEpochTransactionKind::AddressAliasStateCreate => {
+                Self::AddressAliasStateCreate
+            }
+            crate::transaction::EndOfEpochTransactionKind::WriteAccumulatorStorageCost(
+                storage_cost,
+            ) => Self::WriteAccumulatorStorageCost {
+                storage_cost: storage_cost.storage_cost,
+            },
+            crate::transaction::EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => {
+                Self::ForwardingAddressRegistryCreate
             }
         }
     }

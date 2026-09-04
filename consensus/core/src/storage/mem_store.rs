@@ -3,11 +3,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    ops::Bound::Included,
+    ops::Bound::{Excluded, Included},
 };
 
 use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockDigest, BlockRef, Round, TransactionIndex};
+use mysten_common::ZipDebugEqIteratorExt;
 use parking_lot::RwLock;
 
 use super::{Store, WriteBatch};
@@ -122,17 +123,30 @@ impl Store for MemStore {
         author: AuthorityIndex,
         start_round: Round,
     ) -> ConsensusResult<Vec<VerifiedBlock>> {
+        self.scan_blocks_by_author_in_range(author, start_round, Round::MAX, usize::MAX)
+    }
+
+    fn scan_blocks_by_author_in_range(
+        &self,
+        author: AuthorityIndex,
+        start_round: Round,
+        end_round: Round,
+        limit: usize,
+    ) -> ConsensusResult<Vec<VerifiedBlock>> {
         let inner = self.inner.read();
         let mut refs = vec![];
         for &(author, round, digest) in inner.digests_by_authorities.range((
             Included((author, start_round, BlockDigest::MIN)),
-            Included((author, Round::MAX, BlockDigest::MAX)),
+            Excluded((author, end_round, BlockDigest::MIN)),
         )) {
             refs.push(BlockRef::new(round, author, digest));
+            if refs.len() >= limit {
+                break;
+            }
         }
         let results = self.read_blocks(refs.as_slice())?;
         let mut blocks = vec![];
-        for (r, block) in refs.into_iter().zip(results.into_iter()) {
+        for (r, block) in refs.into_iter().zip_debug_eq(results) {
             if let Some(block) = block {
                 blocks.push(block);
             } else {
@@ -163,9 +177,10 @@ impl Store for MemStore {
         {
             refs.push_front(BlockRef::new(round, author, digest));
         }
-        let results = self.read_blocks(refs.as_slices().0)?;
+        let refs_slice = refs.make_contiguous();
+        let results = self.read_blocks(refs_slice)?;
         let mut blocks = vec![];
-        for (r, block) in refs.into_iter().zip(results.into_iter()) {
+        for (r, block) in refs.into_iter().zip_debug_eq(results) {
             blocks.push(
                 block.unwrap_or_else(|| panic!("Storage inconsistency: block {:?} not found!", r)),
             );
@@ -222,21 +237,14 @@ impl Store for MemStore {
             .map(|(k, _)| CommitRef::new(k.0, k.1)))
     }
 
-    fn scan_finalized_commits(
+    fn read_rejected_transactions(
         &self,
-        range: CommitRange,
-    ) -> ConsensusResult<Vec<(CommitRef, BTreeMap<BlockRef, Vec<TransactionIndex>>)>> {
+        commit_ref: CommitRef,
+    ) -> ConsensusResult<Option<BTreeMap<BlockRef, Vec<TransactionIndex>>>> {
         let inner = self.inner.read();
-        let mut finalized_commits = vec![];
-        for (commit, rejected_transactions) in inner.finalized_commits.range((
-            Included((range.start(), CommitDigest::MIN)),
-            Included((range.end(), CommitDigest::MAX)),
-        )) {
-            finalized_commits.push((
-                CommitRef::new(commit.0, commit.1),
-                rejected_transactions.clone(),
-            ));
-        }
-        Ok(finalized_commits)
+        Ok(inner
+            .finalized_commits
+            .get(&(commit_ref.index, commit_ref.digest))
+            .cloned())
     }
 }

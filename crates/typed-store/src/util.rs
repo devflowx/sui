@@ -1,9 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::StorageType;
 use bincode::Options;
 use serde::Serialize;
 use std::ops::{Bound, RangeBounds};
+use std::path::Path;
 
 #[inline]
 pub fn be_fix_int_ser<S>(t: &S) -> Vec<u8>
@@ -15,6 +17,22 @@ where
         .with_fixint_encoding()
         .serialize(t)
         .expect("failed to serialize via be_fix_int_ser method")
+}
+
+/// Serialize `t` in big-endian fixed-int encoding directly into `buf`,
+/// returning the number of bytes written.
+#[inline]
+pub fn be_fix_int_ser_into<S>(buf: &mut Vec<u8>, t: &S) -> usize
+where
+    S: ?Sized + serde::Serialize,
+{
+    let before = buf.len();
+    bincode::DefaultOptions::new()
+        .with_big_endian()
+        .with_fixint_encoding()
+        .serialize_into(&mut *buf, t)
+        .expect("failed to serialize via be_fix_int_ser_into method");
+    buf.len() - before
 }
 
 pub(crate) fn iterator_bounds<K>(
@@ -45,10 +63,17 @@ where
         Bound::Excluded(lower_bound) => {
             let mut key_buf = be_fix_int_ser(&lower_bound);
 
-            // Since we want exclusive, we need to increment the key to exclude the previous
-            big_endian_saturating_add_one(&mut key_buf);
+            if is_max(&key_buf) {
+                // No representable key strictly greater than the maximum at this byte
+                // length. Append a zero byte so the lower bound is lexicographically
+                // greater than any same-length key, ensuring the iterator yields nothing
+                // -- matching the user's intent of excluding the max key.
+                key_buf.push(0);
+            } else {
+                // Since we want exclusive, we need to increment the key to exclude the previous
+                big_endian_saturating_add_one(&mut key_buf);
+            }
             Some(key_buf)
-            // readopts.set_iterate_lower_bound(key_buf);
         }
         Bound::Unbounded => None,
     };
@@ -56,13 +81,17 @@ where
         Bound::Included(upper_bound) => {
             let mut key_buf = be_fix_int_ser(&upper_bound);
 
-            // If the key is already at the limit, there's nowhere else to go, so no upper bound
-            if !is_max(&key_buf) {
-                // Since we want exclusive, we need to increment the key to get the upper bound
+            if is_max(&key_buf) {
+                // The key is already at the limit, so the inclusive upper bound covers
+                // everything; leaving the rocksdb upper bound unset is the only way to
+                // include the max key (rocksdb upper bound is exclusive).
+                None
+            } else {
+                // Since rocksdb upper bound is exclusive, increment the key by one so the
+                // user-supplied inclusive bound is included.
                 big_endian_saturating_add_one(&mut key_buf);
-                // readopts.set_iterate_upper_bound(key_buf);
+                Some(key_buf)
             }
-            Some(key_buf)
         }
         Bound::Excluded(upper_bound) => {
             // Rocksdb upper bound is inclusive by default so nothing to do
@@ -96,7 +125,42 @@ fn is_max(v: &[u8]) -> bool {
     v.iter().all(|&x| x == u8::MAX)
 }
 
-#[allow(clippy::assign_op_pattern)]
+pub(crate) fn ensure_database_type<P: AsRef<Path>>(
+    path: P,
+    storage_type: StorageType,
+) -> std::io::Result<()> {
+    if !path.as_ref().exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let filepath = entry?.path();
+        if filepath.extension().is_some_and(|ext| ext == "sst")
+            && storage_type != StorageType::Rocks
+        {
+            panic!(
+                "DB type mismatch: expected {:?}, found RocksDB",
+                storage_type
+            );
+        }
+        if filepath
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("wal_"))
+            && storage_type != StorageType::TideHunter
+        {
+            panic!(
+                "DB type mismatch: expected {:?}, found TideHunter",
+                storage_type
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::assign_op_pattern,
+    clippy::manual_div_ceil,
+    clippy::disallowed_methods
+)] // Intentional zip: external construct_uint! macro uses .zip() internally
 #[test]
 fn test_helpers() {
     let v = vec![];

@@ -19,10 +19,19 @@ fn vec_sig(len: usize) -> SignatureToken {
 
 #[test]
 fn test_vec_pack() {
+    test_vec_pack_with_sig(0, StatusCode::VALUE_STACK_PUSH_OVERFLOW);
+}
+
+#[test]
+fn test_vec_pack_larger_sig() {
+    test_vec_pack_with_sig(255, StatusCode::TOO_MANY_TYPE_NODES);
+}
+
+fn test_vec_pack_with_sig(len: usize, expected_status: StatusCode) {
     let mut m = empty_module();
 
     let sig = SignatureIndex(m.signatures.len() as u16);
-    m.signatures.push(Signature(vec![vec_sig(255)]));
+    m.signatures.push(Signature(vec![vec_sig(len)]));
 
     m.function_defs.push(FunctionDefinition {
         function: FunctionHandleIndex(0),
@@ -50,12 +59,10 @@ fn test_vec_pack() {
 
     m.function_defs[0].code.as_mut().unwrap().code =
         std::iter::once(&[Bytecode::VecPack(sig, 0)][..])
-            .chain(
-                std::iter::repeat(
-                    &[Bytecode::VecUnpack(sig, 1024), Bytecode::VecPack(sig, 1024)][..],
-                )
-                .take(COUNT),
-            )
+            .chain(std::iter::repeat_n(
+                &[Bytecode::VecUnpack(sig, 1024), Bytecode::VecPack(sig, 1024)][..],
+                COUNT,
+            ))
             .chain(std::iter::once(&[Bytecode::Pop, Bytecode::Ret][..]))
             .flatten()
             .cloned()
@@ -68,5 +75,5 @@ fn test_vec_pack() {
         &mut DummyMeter,
     )
     .unwrap_err();
-    assert_eq!(res.major_status(), StatusCode::VALUE_STACK_PUSH_OVERFLOW);
+    assert_eq!(res.major_status(), expected_status)
 }

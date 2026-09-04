@@ -1,9 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::error::Result;
 use super::ObjectStore;
-use crate::balance_change::{derive_balance_changes, BalanceChange};
+use super::error::Result;
+use crate::balance_change::{BalanceChange, derive_balance_changes};
 use crate::base_types::{EpochId, ObjectID, ObjectType, SequenceNumber, SuiAddress};
 use crate::committee::Committee;
 use crate::digests::{
@@ -13,7 +13,8 @@ use crate::dynamic_field::DynamicFieldType;
 use crate::effects::{TransactionEffects, TransactionEvents};
 use crate::full_checkpoint_content::{Checkpoint, ExecutedTransaction, ObjectSet};
 use crate::messages_checkpoint::{
-    CheckpointContents, CheckpointSequenceNumber, FullCheckpointContents, VerifiedCheckpoint,
+    CheckpointContents, CheckpointSequenceNumber, VerifiedCheckpoint,
+    VersionedFullCheckpointContents,
 };
 use crate::object::Object;
 use crate::storage::ObjectKey;
@@ -21,6 +22,7 @@ use crate::transaction::{TransactionData, VerifiedTransaction};
 use move_core_types::annotated_value::MoveTypeLayout;
 use move_core_types::language_storage::StructTag;
 use move_core_types::language_storage::TypeTag;
+use mysten_common::ZipDebugEqIteratorExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
@@ -88,6 +90,16 @@ pub trait ReadStore: ObjectStore {
         sequence_number: CheckpointSequenceNumber,
     ) -> Option<VerifiedCheckpoint>;
 
+    fn multi_get_checkpoint_by_sequence_number(
+        &self,
+        sequence_numbers: &[CheckpointSequenceNumber],
+    ) -> Vec<Option<VerifiedCheckpoint>> {
+        sequence_numbers
+            .iter()
+            .map(|sequence_number| self.get_checkpoint_by_sequence_number(*sequence_number))
+            .collect()
+    }
+
     fn get_checkpoint_contents_by_digest(
         &self,
         digest: &CheckpointContentsDigest,
@@ -143,6 +155,21 @@ pub trait ReadStore: ObjectStore {
         digest: &TransactionDigest,
     ) -> Option<Vec<ObjectKey>>;
 
+    fn multi_get_unchanged_loaded_runtime_objects(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> Vec<Option<Vec<ObjectKey>>> {
+        digests
+            .iter()
+            .map(|digest| self.get_unchanged_loaded_runtime_objects(digest))
+            .collect()
+    }
+
+    fn get_transaction_checkpoint(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber>;
+
     //
     // Extra Checkpoint fetching apis
     //
@@ -155,16 +182,16 @@ pub trait ReadStore: ObjectStore {
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents>;
+    ) -> Option<VersionedFullCheckpointContents>;
 
     // Fetch all checkpoint data
-    // TODO fix return type to not be anyhow
     fn get_checkpoint_data(
         &self,
         checkpoint: VerifiedCheckpoint,
         checkpoint_contents: CheckpointContents,
-    ) -> anyhow::Result<Checkpoint> {
+    ) -> Result<Checkpoint> {
         use crate::effects::TransactionEffectsAPI;
+        use crate::storage::error::Error;
         use std::collections::HashMap;
 
         let transaction_digests = checkpoint_contents
@@ -175,15 +202,15 @@ pub trait ReadStore: ObjectStore {
             .multi_get_transactions(&transaction_digests)
             .into_iter()
             .map(|maybe_transaction| {
-                maybe_transaction.ok_or_else(|| anyhow::anyhow!("missing transaction"))
+                maybe_transaction.ok_or_else(|| Error::missing("missing transaction"))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         let effects = self
             .multi_get_transaction_effects(&transaction_digests)
             .into_iter()
-            .map(|maybe_effects| maybe_effects.ok_or_else(|| anyhow::anyhow!("missing effects")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .map(|maybe_effects| maybe_effects.ok_or_else(|| Error::missing("missing effects")))
+            .collect::<Result<Vec<_>>>()?;
 
         let event_tx_digests = effects
             .iter()
@@ -193,16 +220,16 @@ pub trait ReadStore: ObjectStore {
         let mut events = self
             .multi_get_events(&event_tx_digests)
             .into_iter()
-            .zip(event_tx_digests)
+            .zip_debug_eq(event_tx_digests)
             .map(|(maybe_event, tx_digest)| {
                 maybe_event
-                    .ok_or_else(|| anyhow::anyhow!("missing event for tx {tx_digest}"))
+                    .ok_or_else(|| Error::missing(format!("missing event for tx {tx_digest}")))
                     .map(|event| (tx_digest, event))
             })
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+            .collect::<Result<HashMap<_, _>>>()?;
 
         let mut transactions = Vec::with_capacity(txns.len());
-        for (tx, fx) in txns.into_iter().zip(effects) {
+        for (tx, fx) in txns.into_iter().zip_debug_eq(effects) {
             let events = fx.events_digest().map(|_event_digest| {
                 events
                     .remove(fx.transaction_digest())
@@ -241,10 +268,7 @@ pub trait ReadStore: ObjectStore {
             let mut object_set = ObjectSet::default();
             for (idx, object) in objects.into_iter().enumerate() {
                 object_set.insert(object.ok_or_else(|| {
-                    crate::storage::error::Error::custom(format!(
-                        "unabled to load object {:?}",
-                        refs[idx]
-                    ))
+                    Error::missing(format!("unable to load object {:?}", refs[idx]))
                 })?);
             }
             object_set
@@ -301,6 +325,13 @@ impl<T: ReadStore + ?Sized> ReadStore for &T {
         (*self).get_checkpoint_by_sequence_number(sequence_number)
     }
 
+    fn multi_get_checkpoint_by_sequence_number(
+        &self,
+        sequence_numbers: &[CheckpointSequenceNumber],
+    ) -> Vec<Option<VerifiedCheckpoint>> {
+        (*self).multi_get_checkpoint_by_sequence_number(sequence_numbers)
+    }
+
     fn get_checkpoint_contents_by_digest(
         &self,
         digest: &CheckpointContentsDigest,
@@ -355,11 +386,25 @@ impl<T: ReadStore + ?Sized> ReadStore for &T {
         (*self).get_unchanged_loaded_runtime_objects(digest)
     }
 
+    fn multi_get_unchanged_loaded_runtime_objects(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> Vec<Option<Vec<ObjectKey>>> {
+        (*self).multi_get_unchanged_loaded_runtime_objects(digests)
+    }
+
+    fn get_transaction_checkpoint(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber> {
+        (*self).get_transaction_checkpoint(digest)
+    }
+
     fn get_full_checkpoint_contents(
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
         (*self).get_full_checkpoint_contents(sequence_number, digest)
     }
 
@@ -367,7 +412,7 @@ impl<T: ReadStore + ?Sized> ReadStore for &T {
         &self,
         checkpoint: VerifiedCheckpoint,
         checkpoint_contents: CheckpointContents,
-    ) -> anyhow::Result<Checkpoint> {
+    ) -> Result<Checkpoint> {
         (*self).get_checkpoint_data(checkpoint, checkpoint_contents)
     }
 }
@@ -412,6 +457,13 @@ impl<T: ReadStore + ?Sized> ReadStore for Box<T> {
         (**self).get_checkpoint_by_sequence_number(sequence_number)
     }
 
+    fn multi_get_checkpoint_by_sequence_number(
+        &self,
+        sequence_numbers: &[CheckpointSequenceNumber],
+    ) -> Vec<Option<VerifiedCheckpoint>> {
+        (**self).multi_get_checkpoint_by_sequence_number(sequence_numbers)
+    }
+
     fn get_checkpoint_contents_by_digest(
         &self,
         digest: &CheckpointContentsDigest,
@@ -466,11 +518,25 @@ impl<T: ReadStore + ?Sized> ReadStore for Box<T> {
         (**self).get_unchanged_loaded_runtime_objects(digest)
     }
 
+    fn multi_get_unchanged_loaded_runtime_objects(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> Vec<Option<Vec<ObjectKey>>> {
+        (**self).multi_get_unchanged_loaded_runtime_objects(digests)
+    }
+
+    fn get_transaction_checkpoint(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber> {
+        (**self).get_transaction_checkpoint(digest)
+    }
+
     fn get_full_checkpoint_contents(
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
         (**self).get_full_checkpoint_contents(sequence_number, digest)
     }
 
@@ -478,7 +544,7 @@ impl<T: ReadStore + ?Sized> ReadStore for Box<T> {
         &self,
         checkpoint: VerifiedCheckpoint,
         checkpoint_contents: CheckpointContents,
-    ) -> anyhow::Result<Checkpoint> {
+    ) -> Result<Checkpoint> {
         (**self).get_checkpoint_data(checkpoint, checkpoint_contents)
     }
 }
@@ -523,6 +589,13 @@ impl<T: ReadStore + ?Sized> ReadStore for Arc<T> {
         (**self).get_checkpoint_by_sequence_number(sequence_number)
     }
 
+    fn multi_get_checkpoint_by_sequence_number(
+        &self,
+        sequence_numbers: &[CheckpointSequenceNumber],
+    ) -> Vec<Option<VerifiedCheckpoint>> {
+        (**self).multi_get_checkpoint_by_sequence_number(sequence_numbers)
+    }
+
     fn get_checkpoint_contents_by_digest(
         &self,
         digest: &CheckpointContentsDigest,
@@ -577,11 +650,25 @@ impl<T: ReadStore + ?Sized> ReadStore for Arc<T> {
         (**self).get_unchanged_loaded_runtime_objects(digest)
     }
 
+    fn multi_get_unchanged_loaded_runtime_objects(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> Vec<Option<Vec<ObjectKey>>> {
+        (**self).multi_get_unchanged_loaded_runtime_objects(digests)
+    }
+
+    fn get_transaction_checkpoint(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber> {
+        (**self).get_transaction_checkpoint(digest)
+    }
+
     fn get_full_checkpoint_contents(
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
         (**self).get_full_checkpoint_contents(sequence_number, digest)
     }
 
@@ -589,16 +676,16 @@ impl<T: ReadStore + ?Sized> ReadStore for Arc<T> {
         &self,
         checkpoint: VerifiedCheckpoint,
         checkpoint_contents: CheckpointContents,
-    ) -> anyhow::Result<Checkpoint> {
+    ) -> Result<Checkpoint> {
         (**self).get_checkpoint_data(checkpoint, checkpoint_contents)
     }
 }
 
 /// Trait used to provide functionality to the REST API service.
 ///
-/// It extends both ObjectStore and ReadStore by adding functionality that may require more
+/// It extends ReadStore and RuntimeObjectResolver by adding functionality that may require more
 /// detailed underlying databases or indexes to support.
-pub trait RpcStateReader: ObjectStore + ReadStore + Send + Sync {
+pub trait RpcStateReader: ReadStore + super::RuntimeObjectResolver + Send + Sync {
     /// Lowest available checkpoint for which object data can be requested.
     ///
     /// Specifically this is the lowest checkpoint for which input/output object data will be
@@ -609,6 +696,20 @@ pub trait RpcStateReader: ObjectStore + ReadStore + Send + Sync {
 
     // Get a handle to an instance of the RpcIndexes
     fn indexes(&self) -> Option<&dyn RpcIndexes>;
+
+    /// The sequence number of the highest executed checkpoint, independent of
+    /// how far any embedded index has caught up.
+    ///
+    /// [`ReadStore::get_latest_checkpoint`] may bound the reported tip to the
+    /// live-object index frontier, so clients never observe a checkpoint whose
+    /// indexed state is not yet readable. The health check, by contrast, needs
+    /// the true executed tip to measure that index lag against, so it reads
+    /// this instead. Defaults to
+    /// [`ReadStore::get_latest_checkpoint_sequence_number`] for backends that
+    /// do not bound their reported tip.
+    fn get_highest_executed_checkpoint_seq_number(&self) -> Result<CheckpointSequenceNumber> {
+        self.get_latest_checkpoint_sequence_number()
+    }
 
     fn get_type_layout(&self, type_tag: &TypeTag) -> Result<Option<MoveTypeLayout>> {
         match type_tag {
@@ -627,14 +728,51 @@ pub trait RpcStateReader: ObjectStore + ReadStore + Send + Sync {
             TypeTag::U256 => Ok(Some(MoveTypeLayout::U256)),
         }
     }
-    fn get_struct_layout(&self, type_tag: &StructTag) -> Result<Option<MoveTypeLayout>>;
+
+    fn get_struct_layout(&self, struct_tag: &StructTag) -> Result<Option<MoveTypeLayout>> {
+        self.get_struct_layout_with_overlay(struct_tag, &ObjectSet::default())
+    }
+
+    fn get_struct_layout_with_overlay(
+        &self,
+        struct_tag: &StructTag,
+        overlay: &ObjectSet,
+    ) -> Result<Option<MoveTypeLayout>>;
 }
 
 pub type DynamicFieldIteratorItem = Result<DynamicFieldKey, TypedStoreError>;
+pub type LedgerTxSeqDigestIterator<'a> =
+    Box<dyn Iterator<Item = Result<LedgerTxSeqDigest, TypedStoreError>> + 'a>;
+/// Iterator over ledger bitmap buckets that can skip directly to a bucket.
+pub trait LedgerBitmapBucketIter:
+    Iterator<Item = Result<LedgerBitmapBucket, TypedStoreError>>
+{
+    /// Reposition so the next row is the first bucket at or past `bucket_id`
+    /// in the iterator's direction. Implementations never move backward.
+    fn seek_bucket(&mut self, bucket_id: u64);
+}
+
+/// Boxed seekable iterator over ledger bitmap buckets.
+pub type LedgerBitmapBucketIterator<'a> = Box<dyn LedgerBitmapBucketIter + 'a>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedgerTxSeqDigest {
+    pub tx_sequence_number: u64,
+    pub digest: TransactionDigest,
+    pub event_count: u32,
+    /// Zero-based position of this transaction within its checkpoint.
+    pub tx_offset: u32,
+    pub checkpoint_number: CheckpointSequenceNumber,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerBitmapBucket {
+    pub bucket_id: u64,
+    pub bitmap: roaring::RoaringBitmap,
+}
+
 pub trait RpcIndexes: Send + Sync {
     fn get_epoch_info(&self, epoch: EpochId) -> Result<Option<EpochInfo>>;
-
-    fn get_transaction_info(&self, digest: &TransactionDigest) -> Result<Option<TransactionInfo>>;
 
     fn owned_objects_iter(
         &self,
@@ -643,16 +781,22 @@ pub trait RpcIndexes: Send + Sync {
         cursor: Option<OwnedObjectInfo>,
     ) -> Result<Box<dyn Iterator<Item = Result<OwnedObjectInfo, TypedStoreError>> + '_>>;
 
+    /// Iterate the dynamic fields owned by `parent`. Dynamic-field objects live
+    /// in the same owned-object index as address-owned objects (under the
+    /// object-owner key, sorted by `(type, object id)`), so the [`DynamicFieldKey`]
+    /// cursor carries the field's type alongside its id -- the full sort
+    /// position -- letting the scan seek straight to it, as in
+    /// [`owned_objects_iter`](Self::owned_objects_iter).
     fn dynamic_field_iter(
         &self,
         parent: ObjectID,
-        cursor: Option<ObjectID>,
+        cursor: Option<DynamicFieldKey>,
     ) -> Result<Box<dyn Iterator<Item = DynamicFieldIteratorItem> + '_>>;
 
     fn get_coin_info(&self, coin_type: &StructTag) -> Result<Option<CoinInfo>>;
 
     fn get_balance(&self, owner: &SuiAddress, coin_type: &StructTag)
-        -> Result<Option<BalanceInfo>>;
+    -> Result<Option<BalanceInfo>>;
 
     fn balance_iter(
         &self,
@@ -665,6 +809,63 @@ pub trait RpcIndexes: Send + Sync {
         original_id: ObjectID,
         cursor: Option<u64>,
     ) -> Result<PackageVersionsIterator<'_>>;
+
+    fn get_highest_indexed_checkpoint_seq_number(&self)
+    -> Result<Option<CheckpointSequenceNumber>>;
+
+    /// The highest checkpoint the live-object cohort -- the indexes derivable
+    /// from the live object set (owned objects, types, and balances) -- has
+    /// committed, or `None` if it has not committed any checkpoint yet.
+    ///
+    /// This is the frontier the health check measures against. The live-object
+    /// indexes are restored to the tip and follow it, whereas the
+    /// ledger-history cohort backfills independently after a restore; gating
+    /// health on the latter would report a node unhealthy for the whole
+    /// backfill even though its live-object reads are already caught up.
+    ///
+    /// Defaults to [`Self::get_highest_indexed_checkpoint_seq_number`] for
+    /// backends without a live/history cohort split, where every index tracks
+    /// the tip together.
+    fn get_highest_live_indexed_checkpoint_seq_number(
+        &self,
+    ) -> Result<Option<CheckpointSequenceNumber>> {
+        self.get_highest_indexed_checkpoint_seq_number()
+    }
+
+    fn ledger_tx_seq_digest(&self, tx_seq: u64) -> Result<Option<LedgerTxSeqDigest>>;
+
+    fn ledger_tx_seq_digest_multi_get(
+        &self,
+        tx_seqs: &[u64],
+    ) -> Result<Vec<Option<LedgerTxSeqDigest>>> {
+        tx_seqs
+            .iter()
+            .map(|tx_seq| self.ledger_tx_seq_digest(*tx_seq))
+            .collect()
+    }
+
+    fn ledger_tx_seq_digest_iter(
+        &self,
+        start: u64,
+        end_exclusive: u64,
+        descending: bool,
+    ) -> Result<LedgerTxSeqDigestIterator<'_>>;
+
+    fn transaction_bitmap_bucket_iter(
+        &self,
+        dimension_key: Vec<u8>,
+        start_bucket: u64,
+        end_bucket_exclusive: u64,
+        descending: bool,
+    ) -> Result<LedgerBitmapBucketIterator<'_>>;
+
+    fn event_bitmap_bucket_iter(
+        &self,
+        dimension_key: Vec<u8>,
+        start_bucket: u64,
+        end_bucket_exclusive: u64,
+        descending: bool,
+    ) -> Result<LedgerBitmapBucketIterator<'_>>;
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -676,17 +877,22 @@ pub struct OwnedObjectInfo {
     pub version: SequenceNumber,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct DynamicFieldKey {
     pub parent: ObjectID,
     pub field_id: ObjectID,
+    /// The dynamic field object's Move type. The owned-object index sorts by
+    /// `(type, object id)`, so this is needed -- together with `field_id` -- to
+    /// resume a paginated scan at this entry.
+    pub object_type: StructTag,
 }
 
 impl DynamicFieldKey {
-    pub fn new<P: Into<ObjectID>>(parent: P, field_id: ObjectID) -> Self {
+    pub fn new<P: Into<ObjectID>>(parent: P, field_id: ObjectID, object_type: StructTag) -> Self {
         Self {
             parent: parent.into(),
             field_id,
+            object_type,
         }
     }
 }
@@ -713,7 +919,8 @@ pub struct CoinInfo {
 
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BalanceInfo {
-    pub balance: u64,
+    pub coin_balance: u64,
+    pub address_balance: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]

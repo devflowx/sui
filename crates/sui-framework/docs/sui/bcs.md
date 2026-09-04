@@ -19,18 +19,18 @@ Usage example:
 /// This function reads u8 and u64 value from the input
 /// and returns the rest of the bytes.
 fun deserialize(bytes: vector<u8>): (u8, u64, vector<u8>) {
-use sui::bcs::{Self, BCS};
+    use sui::bcs::{Self, BCS};
 
-let prepared: BCS = bcs::new(bytes);
-let (u8_value, u64_value) = (
-prepared.peel_u8(),
-prepared.peel_u64()
-);
+    let prepared: BCS = bcs::new(bytes);
+    let (u8_value, u64_value) = (
+        prepared.peel_u8(),
+        prepared.peel_u64()
+    );
 
-// unpack bcs struct
-let leftovers = prepared.into_remainder_bytes();
+    // unpack bcs struct
+    let leftovers = prepared.into_remainder_bytes();
 
-(u8_value, u64_value, leftovers)
+    (u8_value, u64_value, leftovers)
 }
 ```
 
@@ -488,7 +488,7 @@ See more here: https://en.wikipedia.org/wiki/LEB128
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/bcs.md#sui_bcs_peel_vec_length">peel_vec_length</a>(<a href="../sui/bcs.md#sui_bcs">bcs</a>: &<b>mut</b> <a href="../sui/bcs.md#sui_bcs_BCS">BCS</a>): u64 {
-    <b>let</b> (<b>mut</b> total, <b>mut</b> shift, <b>mut</b> len) = (0u64, 0, 0);
+    <b>let</b> (<b>mut</b> total, <b>mut</b> shift, <b>mut</b> len) = (0u64, 0u8, 0u64);
     <b>loop</b> {
         <b>assert</b>!(len &lt;= 4, <a href="../sui/bcs.md#sui_bcs_ELenOutOfRange">ELenOutOfRange</a>);
         <b>let</b> byte = <a href="../sui/bcs.md#sui_bcs">bcs</a>.bytes.pop_back() <b>as</b> u64;
@@ -768,11 +768,11 @@ however the tag can be any <code>u32</code> value.
 Example:
 ```rust
 let my_enum = match (bcs.peel_enum_tag()) {
-0 => Enum::Empty,
-1 => Enum::U8(bcs.peel_u8()),
-2 => Enum::U16(bcs.peel_u16()),
-3 => Enum::Struct { a: bcs.peel_address(), b: bcs.peel_u8() },
-_ => abort,
+   0 => Enum::Empty,
+   1 => Enum::U8(bcs.peel_u8()),
+   2 => Enum::U16(bcs.peel_u16()),
+   3 => Enum::Struct { a: bcs.peel_address(), b: bcs.peel_u8() },
+   _ => abort,
 };
 ```
 

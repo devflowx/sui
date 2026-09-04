@@ -5,26 +5,27 @@ use crate::Result;
 use crate::RpcError;
 use crate::RpcService;
 use bytes::Bytes;
+use move_core_types::language_storage::StructTag;
 use prost::Message;
 use prost_types::FieldMask;
 use sui_rpc::field::FieldMaskTree;
 use sui_rpc::field::FieldMaskUtil;
-use sui_rpc::merge::Merge;
 use sui_rpc::proto::google::rpc::bad_request::FieldViolation;
-use sui_rpc::proto::sui::rpc::v2::dynamic_field::DynamicFieldKind;
 use sui_rpc::proto::sui::rpc::v2::Bcs;
 use sui_rpc::proto::sui::rpc::v2::DynamicField;
 use sui_rpc::proto::sui::rpc::v2::ErrorReason;
 use sui_rpc::proto::sui::rpc::v2::ListDynamicFieldsRequest;
 use sui_rpc::proto::sui::rpc::v2::ListDynamicFieldsResponse;
-use sui_rpc::proto::sui::rpc::v2::Object;
+use sui_rpc::proto::sui::rpc::v2::dynamic_field::DynamicFieldKind;
 use sui_sdk_types::Address;
 use sui_types::base_types::ObjectID;
+use sui_types::full_checkpoint_content::ObjectSet;
+use sui_types::storage::DynamicFieldKey;
 
 const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE_BYTES: usize = 512 * 1024; // 512KiB
-const READ_MASK_DEFAULT: &str = "parent,field_id";
+const READ_MASK_DEFAULT: &str = crate::read_mask_defaults::DYNAMIC_FIELD;
 
 #[tracing::instrument(skip(service))]
 pub fn list_dynamic_fields(
@@ -60,13 +61,13 @@ pub fn list_dynamic_fields(
         .map(|token| decode_page_token(&token))
         .transpose()?;
 
-    if let Some(token) = &page_token {
-        if token.parent != parent {
-            return Err(FieldViolation::new("page_token")
-                .with_description("invalid page_token")
-                .with_reason(ErrorReason::FieldInvalid)
-                .into());
-        }
+    if let Some(token) = &page_token
+        && token.parent != parent
+    {
+        return Err(FieldViolation::new("page_token")
+            .with_description("invalid page_token")
+            .with_reason(ErrorReason::FieldInvalid)
+            .into());
     }
 
     let read_mask = {
@@ -81,8 +82,14 @@ pub fn list_dynamic_fields(
         FieldMaskTree::from(read_mask)
     };
 
-    let mut iter =
-        indexes.dynamic_field_iter(parent.into(), page_token.map(|t| t.field_id.into()))?;
+    let mut iter = indexes.dynamic_field_iter(
+        parent.into(),
+        page_token.map(|t| DynamicFieldKey {
+            parent: parent.into(),
+            field_id: t.field_id.into(),
+            object_type: t.object_type,
+        }),
+    )?;
     let mut dynamic_fields = Vec::with_capacity(page_size);
     let mut size_bytes = 0;
     while let Some(key) = iter
@@ -112,6 +119,7 @@ pub fn list_dynamic_fields(
             encode_page_token(PageToken {
                 parent,
                 field_id: cursor.field_id.into(),
+                object_type: cursor.object_type,
             })
         });
 
@@ -138,6 +146,7 @@ fn encode_page_token(page_token: PageToken) -> Bytes {
 struct PageToken {
     parent: Address,
     field_id: Address,
+    object_type: StructTag,
 }
 
 fn get_dynamic_field(
@@ -156,11 +165,11 @@ fn get_dynamic_field(
         message.field_id = Some(field_id.to_canonical_string(true));
     }
 
-    if should_load_field(read_mask) {
-        if let Err(e) = load_dynamic_field(service, field_id, read_mask, &mut message) {
-            tracing::warn!("error loading dynamic object: {e}");
-            return None;
-        }
+    if should_load_field(read_mask)
+        && let Err(e) = load_dynamic_field(service, field_id, read_mask, &mut message)
+    {
+        tracing::warn!("error loading dynamic object: {e}");
+        return None;
     }
 
     Some(message)
@@ -185,8 +194,8 @@ fn load_dynamic_field(
     read_mask: &FieldMaskTree,
     message: &mut DynamicField,
 ) -> Result<(), anyhow::Error> {
-    use sui_types::dynamic_field::visitor as DFV;
     use sui_types::dynamic_field::DynamicFieldType;
+    use sui_types::dynamic_field::visitor as DFV;
 
     let Some(field_object) = service.reader.inner().get_object(field_id) else {
         return Ok(());
@@ -218,7 +227,7 @@ fn load_dynamic_field(
             return Err(anyhow::anyhow!(
                 "unable to load layout for type `{:?}`",
                 move_object.type_()
-            ))
+            ));
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -255,7 +264,11 @@ fn load_dynamic_field(
     }
 
     if let Some(submask) = read_mask.subtree(DynamicField::FIELD_OBJECT_FIELD) {
-        message.field_object = Some(Object::merge_from(&field_object, &submask));
+        message.set_field_object(service.render_object_to_proto(
+            &field_object,
+            &submask,
+            &ObjectSet::default(),
+        ));
     }
 
     match field.value_metadata()? {
@@ -286,7 +299,11 @@ fn load_dynamic_field(
                 }
 
                 if let Some(submask) = read_mask.subtree(DynamicField::CHILD_OBJECT_FIELD) {
-                    message.child_object = Some(Object::merge_from(&object, &submask));
+                    message.set_child_object(service.render_object_to_proto(
+                        &object,
+                        &submask,
+                        &ObjectSet::default(),
+                    ));
                 }
             }
         }

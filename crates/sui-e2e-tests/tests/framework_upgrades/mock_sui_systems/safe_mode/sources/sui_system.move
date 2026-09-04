@@ -70,11 +70,18 @@ module sui_system::sui_system {
     }
 
     public fun active_validator_addresses(wrapper: &mut SuiSystemState): vector<address> {
-        vector::empty()
+        vector[]
     }
 
     fun load_system_state_mut(self: &mut SuiSystemState): &mut SuiSystemStateInner {
         let version = self.version;
         dynamic_field::borrow_mut(&mut self.id, version)
+    }
+
+    fun write_accumulator_storage_cost(
+        _wrapper: &mut SuiSystemState,
+        _storage_cost: u64,
+        _ctx: &TxContext,
+    ) {
     }
 }

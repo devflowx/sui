@@ -5,7 +5,7 @@ info:
   edition: 2024.alpha
   lint: false
 ---
-error[E01003]: invalid modifier
+error[EC01003]: invalid modifier
    ┌─ tests/move_2024/extensions/invalid_no_annotation.move:5:1
    │  
  5 │ ╭ extend module a::m {
@@ -15,4 +15,6 @@ error[E01003]: invalid modifier
    · │
 11 │ │     }
 12 │ │ }
-   │ ╰─^ Module extensions must have a 'mode' or 'test_only' attribute
+   │ ╰─^ Module extensions must be gated by a 'mode' or 'test_only' attribute
+   │  
+   = Add '#[mode(...)]' or '#[test_only]' to this module extension

@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//# init --addresses t1=0x0 t2=0x0 --shared-object-deletion true
+//# init --addresses t1=0x0 t2=0x0 --enable-feature-flags shared_object_deletion
 
 //# publish
 
@@ -34,11 +34,11 @@ module t2::o2 {
     }
 
     public fun dofer(parent: &mut Obj2, o2: Obj2) {
-        dof::add(&mut parent.id, 0, o2);
+        dof::add(&mut parent.id, 0u64, o2);
     }
 
     public fun dfer(parent: &mut Obj2, o2: Obj2) {
-        df::add(&mut parent.id, 0, o2);
+        df::add(&mut parent.id, 0u64, o2);
     }
 
     public fun transferer(o2: Obj2) {

@@ -16,13 +16,14 @@ title: Module `sui_system::genesis`
 <pre><code><b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/u64.md#std_u64">std::u64</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -40,6 +41,7 @@ title: Module `sui_system::genesis`
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
 <b>use</b> <a href="../sui/priority_queue.md#sui_priority_queue">sui::priority_queue</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/sui.md#sui_sui">sui::sui</a>;
 <b>use</b> <a href="../sui/table.md#sui_table">sui::table</a>;
 <b>use</b> <a href="../sui/table_vec.md#sui_table_vec">sui::table_vec</a>;
@@ -336,6 +338,16 @@ The <code><a href="../sui_system/genesis.md#sui_system_genesis_create">create</a
 
 
 
+<a name="sui_system_genesis_ENotAValidator"></a>
+
+The validator address is not in the validator set.
+
+
+<pre><code><b>const</b> <a href="../sui_system/genesis.md#sui_system_genesis_ENotAValidator">ENotAValidator</a>: u64 = 2;
+</code></pre>
+
+
+
 <a name="sui_system_genesis_create"></a>
 
 ## Function `create`
@@ -365,7 +377,7 @@ all the information we need in the system.
     // Ensure this is only called at <a href="../sui_system/genesis.md#sui_system_genesis">genesis</a>
     <b>assert</b>!(ctx.epoch() == 0, <a href="../sui_system/genesis.md#sui_system_genesis_ENotCalledAtGenesis">ENotCalledAtGenesis</a>);
     // Create all the `Validator` structs
-    <b>let</b> <b>mut</b> validators = vector[];
+    <b>let</b> <b>mut</b> validators = vector&lt;Validator&gt;[];
     genesis_validators.do!(|genesis_validator| {
         <b>let</b> <a href="../sui_system/genesis.md#sui_system_genesis_GenesisValidatorMetadata">GenesisValidatorMetadata</a> {
             name,
@@ -404,7 +416,7 @@ all the information we need in the system.
         );
         // Ensure that each <a href="../sui_system/validator.md#sui_system_validator">validator</a> is unique
         <b>assert</b>!(
-            !<a href="../sui_system/validator_set.md#sui_system_validator_set_is_duplicate_validator">validator_set::is_duplicate_validator</a>(&validators, &<a href="../sui_system/validator.md#sui_system_validator">validator</a>),
+            validators.all!(|v| v.sui_address() != sui_address && !v.is_duplicate(&<a href="../sui_system/validator.md#sui_system_validator">validator</a>)),
             <a href="../sui_system/genesis.md#sui_system_genesis_EDuplicateValidator">EDuplicateValidator</a>,
         );
         validators.push_back(<a href="../sui_system/validator.md#sui_system_validator">validator</a>);
@@ -480,8 +492,10 @@ all the information we need in the system.
             <b>let</b> allocation_balance = sui_supply.split(amount_mist);
             <b>if</b> (staked_with_validator.is_some()) {
                 <b>let</b> validator_address = staked_with_validator.destroy_some();
-                <b>let</b> <a href="../sui_system/validator.md#sui_system_validator">validator</a> = <a href="../sui_system/validator_set.md#sui_system_validator_set_get_validator_mut">validator_set::get_validator_mut</a>(validators, validator_address);
-                <a href="../sui_system/validator.md#sui_system_validator">validator</a>.request_add_stake_at_genesis(
+                <b>let</b> validator_idx = validators
+                    .find_index!(|v| v.sui_address() == validator_address)
+                    .destroy_or!(<b>abort</b> <a href="../sui_system/genesis.md#sui_system_genesis_ENotAValidator">ENotAValidator</a>);
+                validators[validator_idx].request_add_stake_at_genesis(
                     allocation_balance,
                     recipient_address,
                     ctx,

@@ -22,7 +22,7 @@ public struct Fake has key, store {
 
 entry fun t1(ctx: &mut TxContext) {
     let mut id = object::new(ctx);
-    add(&mut id, 0, Obj { id: object::new(ctx) });
+    add(&mut id, 0u64, Obj { id: object::new(ctx) });
     sui::transfer::public_transfer(Obj { id }, ctx.sender())
 }
 
@@ -35,4 +35,4 @@ entry fun t2(obj: &mut Obj) {
 
 //# run a::m::t1 --sender A
 
-//# run a::m::t2 --sender A --args object(2,1)
+//# run a::m::t2 --sender A --args object(2,0)

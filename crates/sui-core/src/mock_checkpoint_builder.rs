@@ -3,6 +3,7 @@
 
 use fastcrypto::traits::Signer;
 use std::mem;
+use sui_protocol_config::ProtocolConfig;
 use sui_types::base_types::{AuthorityName, VerifiedExecutionData};
 use sui_types::committee::Committee;
 use sui_types::crypto::{AuthoritySignInfo, AuthoritySignature, SuiAuthoritySignature};
@@ -11,12 +12,13 @@ use sui_types::gas::GasCostSummary;
 use sui_types::messages_checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary,
     CheckpointVersionSpecificData, EndOfEpochData, FullCheckpointContents, VerifiedCheckpoint,
-    VerifiedCheckpointContents,
+    VerifiedCheckpointContents, VersionedFullCheckpointContents,
 };
 use sui_types::object::OBJECT_START_VERSION;
 use sui_types::transaction::{Transaction, VerifiedTransaction};
 
-use crate::accumulators::AccumulatorSettlementTxBuilder;
+use crate::accumulators::{self, AccumulatorSettlementTxBuilder};
+use crate::checkpoints::CheckpointHeight;
 
 pub trait ValidatorKeypairProvider {
     fn get_validator_key(&self, name: &AuthorityName) -> &dyn Signer<AuthoritySignature>;
@@ -121,22 +123,52 @@ impl MockCheckpointBuilder {
         )
     }
 
-    pub fn get_settlement_txns(&self) -> Vec<Transaction> {
+    /// Returns the settlement transactions (without the barrier transaction) and the checkpoint height.
+    pub fn get_settlement_txns(
+        &self,
+        protocol_config: &ProtocolConfig,
+    ) -> (Vec<Transaction>, CheckpointHeight) {
         let effects: Vec<_> = self
             .transactions
             .iter()
             .map(|e| e.effects.clone())
             .collect();
 
-        let builder = AccumulatorSettlementTxBuilder::new(None, &effects);
-
         let checkpoint_height = self.get_next_checkpoint_number();
+        let checkpoint_seq = checkpoint_height;
 
-        builder
-            .build_tx(self.epoch, OBJECT_START_VERSION, checkpoint_height)
+        let builder = AccumulatorSettlementTxBuilder::new(None, &effects, checkpoint_seq, 0);
+
+        let settlement_txns = builder.build_tx(
+            protocol_config,
+            self.epoch,
+            OBJECT_START_VERSION,
+            checkpoint_height,
+            checkpoint_seq,
+        );
+
+        let txns = settlement_txns
             .into_iter()
             .map(|tx| VerifiedTransaction::new_system_transaction(tx).into_inner())
-            .collect()
+            .collect();
+
+        (txns, checkpoint_height)
+    }
+
+    /// Returns the barrier transaction using the effects from the executed settlement transactions.
+    pub fn get_barrier_tx(
+        &self,
+        checkpoint_height: CheckpointHeight,
+        settlement_effects: &[TransactionEffects],
+    ) -> Transaction {
+        let barrier_tx = accumulators::build_accumulator_barrier_tx(
+            self.epoch,
+            OBJECT_START_VERSION,
+            checkpoint_height,
+            settlement_effects,
+        );
+
+        VerifiedTransaction::new_system_transaction(barrier_tx).into_inner()
     }
 
     fn build_internal(
@@ -151,13 +183,14 @@ impl MockCheckpointBuilder {
     ) {
         let contents =
             CheckpointContents::new_with_causally_ordered_execution_data(self.transactions.iter());
-        let full_contents = VerifiedCheckpointContents::new_unchecked(
-            FullCheckpointContents::new_with_causally_ordered_transactions(
-                mem::take(&mut self.transactions)
-                    .into_iter()
-                    .map(|e| e.into_inner()),
-            ),
-        );
+        let full_contents =
+            VerifiedCheckpointContents::new_unchecked(VersionedFullCheckpointContents::V1(
+                FullCheckpointContents::new_with_causally_ordered_transactions(
+                    mem::take(&mut self.transactions)
+                        .into_iter()
+                        .map(|e| e.into_inner()),
+                ),
+            ));
 
         let (epoch, epoch_rolling_gas_cost_summary, end_of_epoch_data) =
             if let Some((next_epoch, end_of_epoch_data)) = new_epoch_data {

@@ -46,12 +46,13 @@ title: Module `deepbook::clob`
 <b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -70,6 +71,7 @@ title: Module `deepbook::clob`
 <b>use</b> <a href="../sui/linked_table.md#sui_linked_table">sui::linked_table</a>;
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/sui.md#sui_sui">sui::sui</a>;
 <b>use</b> <a href="../sui/table.md#sui_table">sui::table</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
@@ -1331,7 +1333,7 @@ Grouping order_ids like [0, 2, 1, 3] would make it the most gas efficient.
 ): vector&lt;<a href="../deepbook/clob.md#deepbook_clob_Order">Order</a>&gt; {
     <b>let</b> user = object::id(account_cap);
     <b>let</b> usr_open_order_ids = table::borrow(&pool.usr_open_orders, user);
-    <b>let</b> <b>mut</b> open_orders = vector::empty&lt;<a href="../deepbook/clob.md#deepbook_clob_Order">Order</a>&gt;();
+    <b>let</b> <b>mut</b> open_orders = vector[];
     <b>let</b> <b>mut</b> order_id = linked_table::front(usr_open_order_ids);
     <b>while</b> (!option::is_none(order_id)) {
         <b>let</b> order_price = *linked_table::borrow(usr_open_order_ids, *option::borrow(order_id));
@@ -1449,8 +1451,8 @@ The latter is the corresponding depth list
     <b>if</b> (price_high &gt; price_high_) price_high = price_high_;
     price_low = <a href="../deepbook/critbit.md#deepbook_critbit_find_closest_key">critbit::find_closest_key</a>(&pool.bids, price_low);
     price_high = <a href="../deepbook/critbit.md#deepbook_critbit_find_closest_key">critbit::find_closest_key</a>(&pool.bids, price_high);
-    <b>let</b> <b>mut</b> price_vec = vector::empty&lt;u64&gt;();
-    <b>let</b> <b>mut</b> depth_vec = vector::empty&lt;u64&gt;();
+    <b>let</b> <b>mut</b> price_vec = vector[];
+    <b>let</b> <b>mut</b> depth_vec = vector[];
     <b>if</b> (price_low == 0) { <b>return</b> (price_vec, depth_vec) };
     <b>while</b> (price_low &lt;= price_high) {
         <b>let</b> depth = <a href="../deepbook/clob.md#deepbook_clob_get_level2_book_status">get_level2_book_status</a>(
@@ -1503,8 +1505,8 @@ The latter is the corresponding depth list
     <b>if</b> (price_high &gt; price_high_) price_high = price_high_;
     price_low = <a href="../deepbook/critbit.md#deepbook_critbit_find_closest_key">critbit::find_closest_key</a>(&pool.asks, price_low);
     price_high = <a href="../deepbook/critbit.md#deepbook_critbit_find_closest_key">critbit::find_closest_key</a>(&pool.asks, price_high);
-    <b>let</b> <b>mut</b> price_vec = vector::empty&lt;u64&gt;();
-    <b>let</b> <b>mut</b> depth_vec = vector::empty&lt;u64&gt;();
+    <b>let</b> <b>mut</b> price_vec = vector[];
+    <b>let</b> <b>mut</b> depth_vec = vector[];
     <b>if</b> (price_low == 0) { <b>return</b> (price_vec, depth_vec) };
     <b>while</b> (price_low &lt;= price_high) {
         <b>let</b> depth = <a href="../deepbook/clob.md#deepbook_clob_get_level2_book_status">get_level2_book_status</a>(

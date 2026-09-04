@@ -3,18 +3,21 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    ops::Bound::Included,
+    ops::Bound::{Excluded, Included},
     time::Duration,
 };
 
 use bytes::Bytes;
 use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockDigest, BlockRef, Round, TransactionIndex};
+use mysten_common::ZipDebugEqIteratorExt;
 use sui_macros::fail_point;
+#[cfg(not(tidehunter))]
+use typed_store::rocks::{DBMapTableConfigMap, default_db_options};
 use typed_store::{
-    metrics::SamplingInterval,
-    rocks::{default_db_options, DBMap, DBMapTableConfigMap, MetricConf},
     DBMapUtils, Map as _,
+    metrics::SamplingInterval,
+    rocks::{DBMap, MetricConf},
 };
 
 use super::{CommitInfo, Store, WriteBatch};
@@ -58,15 +61,16 @@ impl RocksDBStore {
     pub fn new(path: &str) -> Self {
         // Consensus data has high write throughput (all transactions) and is rarely read
         // (only during recovery and when helping peers catch up).
-        let db_options = default_db_options().optimize_db_for_write_throughput(2);
+        let db_options =
+            default_db_options().optimize_db_for_write_throughput(2, /* unlimited */ true);
         let mut metrics_conf = MetricConf::new("consensus");
         metrics_conf.read_sample_interval = SamplingInterval::new(Duration::from_secs(60), 0);
-        let cf_options = default_db_options().optimize_for_write_throughput();
+        let cf_options = default_db_options().optimize_for_no_deletion();
         let column_family_options = DBMapTableConfigMap::new(BTreeMap::from([
             (
                 Self::BLOCKS_CF.to_string(),
-                default_db_options()
-                    .optimize_for_write_throughput_no_deletion()
+                cf_options
+                    .clone()
                     // Using larger block is ok since there is not much point reads on the cf.
                     .set_block_options(512, 128 << 10),
             ),
@@ -91,23 +95,22 @@ impl RocksDBStore {
     pub fn new(path: &str) -> Self {
         tracing::warn!("Consensus store using tidehunter");
         use typed_store::tidehunter_util::{
-            default_mutex_count, KeyIndexing, KeySpaceConfig, KeyType, ThConfig,
+            KeyIndexing, KeySpaceConfig, KeyType, ThConfig, default_mutex_count,
         };
         let mutexes = default_mutex_count();
         let index_digest_key = KeyIndexing::key_reduction(36, 0..12);
         let index_index_digest_key = KeyIndexing::key_reduction(40, 0..24);
         let commit_vote_key = KeyIndexing::key_reduction(76, 0..60);
-        let u32_prefix = KeyType::prefix_uniform(3, 0);
-        let u64_prefix = KeyType::prefix_uniform(6, 0);
-        let override_dirty_keys_config = KeySpaceConfig::new().with_max_dirty_keys(4_000);
+        let u32_prefix = KeyType::from_prefix_bits(3 * 8);
+        let u64_prefix = KeyType::from_prefix_bits(6 * 8);
         let configs = vec![
             (
                 Self::BLOCKS_CF.to_string(),
                 ThConfig::new_with_config_indexing(
                     index_index_digest_key.clone(),
                     mutexes,
-                    u32_prefix.clone(),
-                    override_dirty_keys_config.clone(),
+                    u32_prefix,
+                    KeySpaceConfig::new(),
                 ),
             ),
             (
@@ -115,36 +118,37 @@ impl RocksDBStore {
                 ThConfig::new_with_config_indexing(
                     index_index_digest_key.clone(),
                     mutexes,
-                    u64_prefix.clone(),
-                    override_dirty_keys_config.clone(),
+                    u64_prefix,
+                    KeySpaceConfig::new(),
                 ),
             ),
             (
                 Self::COMMITS_CF.to_string(),
-                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix.clone()),
+                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix),
             ),
             (
                 Self::COMMIT_VOTES_CF.to_string(),
                 ThConfig::new_with_config_indexing(
                     commit_vote_key,
                     mutexes,
-                    u32_prefix.clone(),
-                    override_dirty_keys_config.clone(),
+                    u32_prefix,
+                    KeySpaceConfig::new(),
                 ),
             ),
             (
                 Self::COMMIT_INFO_CF.to_string(),
-                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix.clone()),
+                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix),
             ),
             (
                 Self::FINALIZED_COMMITS_CF.to_string(),
-                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix.clone()),
+                ThConfig::new_with_indexing(index_digest_key.clone(), mutexes, u32_prefix),
             ),
         ];
         Self::open_tables_read_write(
             path.into(),
             MetricConf::new("consensus")
-                .with_sampling(SamplingInterval::new(Duration::from_secs(60), 0)),
+                .with_sampling(SamplingInterval::new(Duration::from_secs(60), 0))
+                .with_th_batch_compression(),
             configs.into_iter().collect(),
         )
     }
@@ -221,7 +225,7 @@ impl Store for RocksDBStore {
             .collect::<Vec<_>>();
         let serialized = self.blocks.multi_get(keys)?;
         let mut blocks = vec![];
-        for (key, serialized) in refs.iter().zip(serialized) {
+        for (key, serialized) in refs.iter().zip_debug_eq(serialized) {
             if let Some(serialized) = serialized {
                 let signed_block: SignedBlock =
                     bcs::from_bytes(&serialized).map_err(ConsensusError::MalformedBlock)?;
@@ -251,17 +255,30 @@ impl Store for RocksDBStore {
         author: AuthorityIndex,
         start_round: Round,
     ) -> ConsensusResult<Vec<VerifiedBlock>> {
+        self.scan_blocks_by_author_in_range(author, start_round, Round::MAX, usize::MAX)
+    }
+
+    fn scan_blocks_by_author_in_range(
+        &self,
+        author: AuthorityIndex,
+        start_round: Round,
+        end_round: Round,
+        limit: usize,
+    ) -> ConsensusResult<Vec<VerifiedBlock>> {
         let mut refs = vec![];
         for kv in self.digests_by_authorities.safe_range_iter((
             Included((author, start_round, BlockDigest::MIN)),
-            Included((author, Round::MAX, BlockDigest::MAX)),
+            Excluded((author, end_round, BlockDigest::MIN)),
         )) {
             let ((author, round, digest), _) = kv?;
             refs.push(BlockRef::new(round, author, digest));
+            if refs.len() >= limit {
+                break;
+            }
         }
         let results = self.read_blocks(refs.as_slice())?;
         let mut blocks = Vec::with_capacity(refs.len());
-        for (r, block) in refs.into_iter().zip(results.into_iter()) {
+        for (r, block) in refs.into_iter().zip_debug_eq(results) {
             blocks.push(
                 block.unwrap_or_else(|| panic!("Storage inconsistency: block {:?} not found!", r)),
             );
@@ -291,9 +308,10 @@ impl Store for RocksDBStore {
             let ((author, round, digest), _) = kv?;
             refs.push_front(BlockRef::new(round, author, digest));
         }
-        let results = self.read_blocks(refs.as_slices().0)?;
+        let refs_slice = refs.make_contiguous();
+        let results = self.read_blocks(refs_slice)?;
         let mut blocks = vec![];
-        for (r, block) in refs.into_iter().zip(results.into_iter()) {
+        for (r, block) in refs.into_iter().zip_debug_eq(results) {
             blocks.push(
                 block.unwrap_or_else(|| panic!("Storage inconsistency: block {:?} not found!", r)),
             );
@@ -371,19 +389,13 @@ impl Store for RocksDBStore {
         Ok(Some(CommitRef::new(index, digest)))
     }
 
-    fn scan_finalized_commits(
+    fn read_rejected_transactions(
         &self,
-        range: CommitRange,
-    ) -> ConsensusResult<Vec<(CommitRef, BTreeMap<BlockRef, Vec<TransactionIndex>>)>> {
-        let mut finalized_commits = vec![];
-        for result in self.finalized_commits.safe_range_iter((
-            Included((range.start(), CommitDigest::MIN)),
-            Included((range.end(), CommitDigest::MAX)),
-        )) {
-            let ((index, digest), rejected_transactions) =
-                result.map_err(ConsensusError::RocksDBFailure)?;
-            finalized_commits.push((CommitRef::new(index, digest), rejected_transactions));
-        }
-        Ok(finalized_commits)
+        commit_ref: CommitRef,
+    ) -> ConsensusResult<Option<BTreeMap<BlockRef, Vec<TransactionIndex>>>> {
+        let result = self
+            .finalized_commits
+            .get(&(commit_ref.index, commit_ref.digest))?;
+        Ok(result)
     }
 }

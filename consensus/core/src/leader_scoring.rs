@@ -112,13 +112,12 @@ impl ScoringSubdag {
         for subdag in committed_subdags {
             // If the commit range is not set, then set it to the range of the first
             // committed subdag index.
-            if self.commit_range.is_none() {
+            if let Some(commit_range) = &mut self.commit_range {
+                commit_range.extend_to(subdag.commit_ref.index);
+            } else {
                 self.commit_range = Some(CommitRange::new(
                     subdag.commit_ref.index..=subdag.commit_ref.index,
                 ));
-            } else {
-                let commit_range = self.commit_range.as_mut().unwrap();
-                commit_range.extend_to(subdag.commit_ref.index);
             }
 
             // Add the committed leader to the list of leaders we will be scoring.
@@ -145,10 +144,12 @@ impl ScoringSubdag {
                             block.reference(),
                             block.author()
                         );
-                        assert!(self
-                            .votes
-                            .insert(block.reference(), StakeAggregator::new())
-                            .is_none(), "Vote {block} already exists. Duplicate vote found for leader {ancestor}");
+                        assert!(
+                            self.votes
+                                .insert(block.reference(), StakeAggregator::new())
+                                .is_none(),
+                            "Vote {block} already exists. Duplicate vote found for leader {ancestor}"
+                        );
                     }
 
                     if let Some(stake) = self.votes.get_mut(ancestor) {

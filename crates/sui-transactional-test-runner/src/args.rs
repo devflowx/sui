@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use crate::test_adapter::{FakeID, SuiTestAdapter};
 use anyhow::{bail, ensure};
 use clap;
-use clap::{Args, Parser};
+use clap::{ArgAction, Args, Parser};
 use move_compiler::editions::Flavor;
 use move_core_types::parsing::{
+    address::ParsedAddress,
     parser::Parser as MoveCLParser,
-    parser::{parse_u256, parse_u64},
+    parser::{parse_u64, parse_u256},
+    types::ParsedType,
     values::ValueToken,
     values::{ParsableValue, ParsedValue},
 };
@@ -18,14 +20,21 @@ use move_core_types::runtime_value::{MoveStruct, MoveValue};
 use move_core_types::u256::U256;
 use move_symbol_pool::Symbol;
 use move_transactional_test_runner::tasks::{RunCommand, SyntaxChoice};
-use sui_graphql_rpc::test_infra::cluster::SnapshotLagConfig;
+use sui_protocol_config::Chain;
+use sui_types::accumulator_root::AccumulatorValue;
+use sui_types::balance::Balance;
 use sui_types::base_types::{SequenceNumber, SuiAddress};
+use sui_types::coin_reservation::ParsedObjectRefWithdrawal;
 use sui_types::move_package::UpgradePolicy;
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::transaction::{Argument, CallArg, ObjectArg};
+use sui_types::storage::ReadStore;
+use sui_types::transaction::{
+    Argument, CallArg, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
+};
 
 pub const SUI_ARGS_LONG: &str = "sui-args";
+const DEFAULT_CONSISTENT_RANGE: usize = 300;
 
 #[derive(Clone, Debug, clap::Parser)]
 pub struct SuiRunArgs {
@@ -57,10 +66,12 @@ pub struct SuiInitArgs {
     pub accounts: Option<Vec<String>>,
     #[clap(long = "protocol-version")]
     pub protocol_version: Option<u64>,
+    /// Chain to build the protocol config for (mainnet, testnet, unknown).
+    /// Affects chain-gated feature flags. Defaults to `unknown`.
+    #[clap(long = "chain", value_enum)]
+    pub chain: Option<Chain>,
     #[clap(long = "max-gas")]
     pub max_gas: Option<u64>,
-    #[clap(long = "shared-object-deletion")]
-    pub shared_object_deletion: Option<bool>,
     #[clap(long = "simulator")]
     pub simulator: bool,
     #[clap(long = "num-custom-validator-accounts")]
@@ -69,14 +80,10 @@ pub struct SuiInitArgs {
     pub reference_gas_price: Option<u64>,
     #[clap(long = "default-gas-price")]
     pub default_gas_price: Option<u64>,
-    #[clap(flatten)]
-    pub snapshot_config: SnapshotLagConfig,
     #[clap(long = "flavor")]
     pub flavor: Option<Flavor>,
-    /// The number of epochs to keep in the database. Epochs outside of this range will be pruned by
-    /// the indexer.
-    #[clap(long = "epochs-to-keep")]
-    pub epochs_to_keep: Option<u64>,
+    #[clap(long = "consistent-range", default_value_t = DEFAULT_CONSISTENT_RANGE)]
+    pub consistent_range: usize,
     /// Dir for simulacrum to write checkpoint files to. To be passed to the offchain indexer and
     /// reader.
     #[clap(long)]
@@ -84,18 +91,41 @@ pub struct SuiInitArgs {
     /// URL for the Sui REST API. To be passed to the offchain indexer and reader.
     #[clap(long)]
     pub rest_api_url: Option<String>,
-    /// Enable accumulator features for testing (e.g., authenticated event streams)
-    #[clap(long = "enable-accumulators")]
-    pub enable_accumulators: bool,
-    /// Enable authenticated event streams for testing
-    #[clap(long = "enable-authenticated-event-streams")]
-    pub enable_authenticated_event_streams: bool,
+    /// Override the file format version used when serializing compiled modules
+    #[clap(long = "file-format")]
+    pub file_format_version: Option<u32>,
+    /// Enable gasless feature for testing
+    #[clap(long = "enable-gasless")]
+    pub enable_gasless: bool,
+    /// Set maximum size in bytes for Pure inputs in gasless transactions
+    #[clap(long = "gasless-max-pure-input-bytes")]
+    pub gasless_max_pure_input_bytes: Option<u64>,
+    /// Set maximum number of unused Pure inputs in gasless transactions
+    #[clap(long = "gasless-max-unused-inputs")]
+    pub gasless_max_unused_inputs: Option<u64>,
+    /// Enable a boolean protocol feature flag by name, e.g.
+    /// `--enable-feature-flags zklogin_auth --enable-feature-flags enable_party_transfer`.
+    /// Flag names match the field names of `FeatureFlags` in the sui-protocol-config crate.
+    #[clap(long = "enable-feature-flags", action = ArgAction::Append)]
+    pub enable_feature_flags: Vec<String>,
+    /// Disable a boolean protocol feature flag by name.
+    #[clap(long = "disable-feature-flags", action = ArgAction::Append)]
+    pub disable_feature_flags: Vec<String>,
 }
 
 #[derive(Debug, clap::Parser)]
 pub struct ViewObjectCommand {
     #[clap(value_parser = parse_fake_id)]
     pub id: FakeID,
+    #[clap(long = "hide-contents")]
+    pub hide_contents: bool,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct ViewFundsCommand {
+    #[clap(value_parser = ParsedType::parse)]
+    pub funds_type: ParsedType,
+    pub address: String,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -108,6 +138,8 @@ pub struct TransferObjectCommand {
     pub sender: Option<String>,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
+    #[clap(long = "address-balance-gas")]
+    pub address_balance_gas: bool,
     #[clap(long = "gas-price")]
     pub gas_price: Option<u64>,
 }
@@ -126,10 +158,12 @@ pub struct ProgrammableTransactionCommand {
     pub sponsor: Option<String>,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
+    #[clap(long = "address-balance-gas")]
+    pub address_balance_gas: bool,
     #[clap(long = "gas-price")]
     pub gas_price: Option<u64>,
-    #[clap(long = "gas-payment", value_parser = parse_fake_id)]
-    pub gas_payment: Option<Vec<FakeID>>,
+    #[clap(long = "gas-payment", value_parser = ParsedValue::<SuiExtraValueArgs>::parse)]
+    pub gas_payment: Option<Vec<ParsedValue<SuiExtraValueArgs>>>,
     #[clap(long = "dev-inspect")]
     pub dev_inspect: bool,
     #[clap(long = "dry-run")]
@@ -157,6 +191,8 @@ pub struct UpgradePackageCommand {
     pub sender: String,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
+    #[clap(long = "address-balance-gas")]
+    pub address_balance_gas: bool,
     #[clap(long = "dry-run")]
     pub dry_run: bool,
     #[clap(long = "syntax")]
@@ -272,9 +308,18 @@ pub struct AuthenticatorStateUpdateCommand {
     pub authenticator_obj_initial_shared_version: Option<u64>,
 }
 
+#[derive(Debug, clap::Parser)]
+pub struct GaslessAllowTokenCommand {
+    #[clap(value_parser = ParsedType::parse)]
+    pub token_type: ParsedType,
+    #[clap(long = "min-transfer", default_value = "0")]
+    pub min_transfer: u64,
+}
+
 #[derive(Debug)]
 pub enum SuiSubcommand<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> {
     ViewObject(ViewObjectCommand),
+    ViewFunds(ViewFundsCommand),
     TransferObject(TransferObjectCommand),
     ConsensusCommitPrologue(ConsensusCommitPrologueCommand),
     ProgrammableTransaction(ProgrammableTransactionCommand),
@@ -286,10 +331,12 @@ pub enum SuiSubcommand<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> {
     AdvanceClock(AdvanceClockCommand),
     SetRandomState(SetRandomStateCommand),
     AuthenticatorStateUpdate(AuthenticatorStateUpdateCommand),
+    GaslessAllowToken(GaslessAllowTokenCommand),
     ViewCheckpoint,
     RunGraphql(RunGraphqlCommand),
     RunJsonRpc(RunJsonRpcCommand),
     Bench(RunCommand<ExtraValueArgs>, ExtraRunArgs),
+    BenchProgrammable(ProgrammableTransactionCommand),
 }
 
 impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
@@ -299,6 +346,9 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
         Ok(match matches.subcommand() {
             Some(("view-object", matches)) => {
                 SuiSubcommand::ViewObject(ViewObjectCommand::from_arg_matches(matches)?)
+            }
+            Some(("view-funds", matches)) => {
+                SuiSubcommand::ViewFunds(ViewFundsCommand::from_arg_matches(matches)?)
             }
             Some(("transfer-object", matches)) => {
                 SuiSubcommand::TransferObject(TransferObjectCommand::from_arg_matches(matches)?)
@@ -335,6 +385,9 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
                     AuthenticatorStateUpdateCommand::from_arg_matches(matches)?,
                 )
             }
+            Some(("gasless-allow-token", matches)) => SuiSubcommand::GaslessAllowToken(
+                GaslessAllowTokenCommand::from_arg_matches(matches)?,
+            ),
             Some(("view-checkpoint", _)) => SuiSubcommand::ViewCheckpoint,
             Some(("run-graphql", matches)) => {
                 SuiSubcommand::RunGraphql(RunGraphqlCommand::from_arg_matches(matches)?)
@@ -342,10 +395,15 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
             Some(("run-jsonrpc", matches)) => {
                 SuiSubcommand::RunJsonRpc(RunJsonRpcCommand::from_arg_matches(matches)?)
             }
-            Some(("bench", matches)) => SuiSubcommand::Bench(
-                RunCommand::from_arg_matches(matches)?,
-                ExtraRunArgs::from_arg_matches(matches)?,
-            ),
+            Some(("bench", matches)) => match matches.subcommand() {
+                Some(("ptb", sub_matches)) => SuiSubcommand::BenchProgrammable(
+                    ProgrammableTransactionCommand::from_arg_matches(sub_matches)?,
+                ),
+                _ => SuiSubcommand::Bench(
+                    RunCommand::from_arg_matches(matches)?,
+                    ExtraRunArgs::from_arg_matches(matches)?,
+                ),
+            },
             _ => {
                 return Err(clap::Error::raw(
                     clap::error::ErrorKind::InvalidSubcommand,
@@ -367,6 +425,7 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::CommandFactory
     fn command() -> clap::Command {
         clap::Command::new("sui_sub_command")
             .subcommand(ViewObjectCommand::command().name("view-object"))
+            .subcommand(ViewFundsCommand::command().name("view-funds"))
             .subcommand(TransferObjectCommand::command().name("transfer-object"))
             .subcommand(ConsensusCommitPrologueCommand::command().name("consensus-commit-prologue"))
             .subcommand(ProgrammableTransactionCommand::command().name("programmable"))
@@ -380,11 +439,15 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::CommandFactory
             .subcommand(
                 AuthenticatorStateUpdateCommand::command().name("authenticator-state-update"),
             )
+            .subcommand(GaslessAllowTokenCommand::command().name("gasless-allow-token"))
             .subcommand(clap::Command::new("view-checkpoint"))
             .subcommand(RunGraphqlCommand::command().name("run-graphql"))
             .subcommand(RunJsonRpcCommand::command().name("run-jsonrpc"))
             .subcommand(
-                RunCommand::<ExtraValueArgs>::augment_args(ExtraRunArgs::command()).name("bench"),
+                RunCommand::<ExtraValueArgs>::augment_args(ExtraRunArgs::command())
+                    .name("bench")
+                    .args_conflicts_with_subcommands(true)
+                    .subcommand(ProgrammableTransactionCommand::command().name("ptb")),
             )
     }
 
@@ -403,7 +466,11 @@ pub enum SuiExtraValueArgs {
     Object(FakeID, Option<SequenceNumber>),
     Digest(String),
     Receiving(FakeID, Option<SequenceNumber>),
-    ImmShared(FakeID, Option<SequenceNumber>),
+    Owned(FakeID, Option<SequenceNumber>),
+    Shared(SharedObjectMutability, FakeID, Option<SequenceNumber>),
+    Withdraw(u64, ParsedType),
+    CoinReservation(u64, ParsedType),
+    AllowanceWithdraw(u64, ParsedType, ParsedAddress, FakeID),
 }
 
 #[derive(Clone)]
@@ -413,7 +480,16 @@ pub enum SuiValue {
     ObjVec(Vec<(FakeID, Option<SequenceNumber>)>),
     Digest(String),
     Receiving(FakeID, Option<SequenceNumber>),
-    ImmShared(FakeID, Option<SequenceNumber>),
+    Owned(FakeID, Option<SequenceNumber>),
+    Shared(SharedObjectMutability, FakeID, Option<SequenceNumber>),
+    Withdraw(u64, move_core_types::language_storage::TypeTag),
+    CoinReservation(u64, move_core_types::language_storage::TypeTag),
+    AllowanceWithdraw(
+        u64,
+        move_core_types::language_storage::TypeTag,
+        SuiAddress,
+        FakeID,
+    ),
 }
 
 impl SuiExtraValueArgs {
@@ -431,11 +507,44 @@ impl SuiExtraValueArgs {
         Ok(SuiExtraValueArgs::Receiving(fake_id, version))
     }
 
+    fn parse_owned_object_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let (fake_id, version) = Self::parse_receiving_or_object_value(parser, "owned")?;
+        Ok(SuiExtraValueArgs::Owned(fake_id, version))
+    }
+
     fn parse_read_shared_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
         parser: &mut MoveCLParser<'a, ValueToken, I>,
     ) -> anyhow::Result<Self> {
         let (fake_id, version) = Self::parse_receiving_or_object_value(parser, "immshared")?;
-        Ok(SuiExtraValueArgs::ImmShared(fake_id, version))
+        Ok(SuiExtraValueArgs::Shared(
+            SharedObjectMutability::Immutable,
+            fake_id,
+            version,
+        ))
+    }
+
+    fn parse_mut_shared_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let (fake_id, version) = Self::parse_receiving_or_object_value(parser, "mutshared")?;
+        Ok(SuiExtraValueArgs::Shared(
+            SharedObjectMutability::Mutable,
+            fake_id,
+            version,
+        ))
+    }
+
+    fn parse_non_exlucsive_write_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let (fake_id, version) = Self::parse_receiving_or_object_value(parser, "nonexclusive")?;
+        Ok(SuiExtraValueArgs::Shared(
+            SharedObjectMutability::NonExclusiveWrite,
+            fake_id,
+            version,
+        ))
     }
 
     fn parse_digest_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
@@ -447,6 +556,84 @@ impl SuiExtraValueArgs {
         let package = parser.advance(ValueToken::Ident)?;
         parser.advance(ValueToken::RParen)?;
         Ok(SuiExtraValueArgs::Digest(package.to_owned()))
+    }
+
+    fn parse_withdraw_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let (amount, parsed_type) = Self::parse_typed_amount(parser, "withdraw")?;
+        Ok(SuiExtraValueArgs::Withdraw(amount, parsed_type))
+    }
+
+    fn parse_coin_reservation_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let (amount, parsed_type) = Self::parse_typed_amount(parser, "coin_reservation")?;
+        Ok(SuiExtraValueArgs::CoinReservation(amount, parsed_type))
+    }
+
+    /// Parses `<ident_name><Type>(amount)`.
+    fn parse_typed_amount<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+        ident_name: &str,
+    ) -> anyhow::Result<(u64, ParsedType)> {
+        let contents = parser.advance(ValueToken::Ident)?;
+        ensure!(contents == ident_name);
+
+        let type_args = parser.parse_type_args()?;
+        let [parsed_type]: [ParsedType; 1] =
+            type_args.try_into().map_err(|type_args: Vec<_>| {
+                anyhow::anyhow!(
+                    "{} expects exactly one type argument, got {}",
+                    ident_name,
+                    type_args.len()
+                )
+            })?;
+
+        parser.advance(ValueToken::LParen)?;
+        let amount_str = parser.advance(ValueToken::Number)?;
+        let (amount, _) = parse_u64(amount_str)?;
+        parser.advance(ValueToken::RParen)?;
+
+        Ok((amount, parsed_type))
+    }
+
+    fn parse_allowance_withdraw_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
+    ) -> anyhow::Result<Self> {
+        let contents = parser.advance(ValueToken::Ident)?;
+        ensure!(contents == "allowance_withdraw");
+
+        // Format: allowance_withdraw<Type>(amount, @funder, object(N,M))
+        let type_args = parser.parse_type_args()?;
+        let [parsed_type]: [ParsedType; 1] =
+            type_args.try_into().map_err(|type_args: Vec<_>| {
+                anyhow::anyhow!(
+                    "allowance_withdraw expects exactly one type argument, got {}",
+                    type_args.len()
+                )
+            })?;
+
+        parser.advance(ValueToken::LParen)?;
+        let amount_str = parser.advance(ValueToken::Number)?;
+        let (amount, _) = parse_u64(amount_str)?;
+        parser.advance(ValueToken::Comma)?;
+        parser.advance(ValueToken::AtSign)?;
+        let funder = parser.parse_address()?;
+        parser.advance(ValueToken::Comma)?;
+        let (fake_id, version) = Self::parse_receiving_or_object_value(parser, "object")?;
+        ensure!(
+            version.is_none(),
+            "allowance_withdraw does not take an object version"
+        );
+        parser.advance(ValueToken::RParen)?;
+
+        Ok(SuiExtraValueArgs::AllowanceWithdraw(
+            amount,
+            parsed_type,
+            funder,
+            fake_id,
+        ))
     }
 
     fn parse_receiving_or_object_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
@@ -493,7 +680,17 @@ impl SuiValue {
             SuiValue::ObjVec(_) => panic!("unexpected nested Sui object vector in args"),
             SuiValue::Digest(_) => panic!("unexpected nested Sui package digest in args"),
             SuiValue::Receiving(_, _) => panic!("unexpected nested Sui receiving object in args"),
-            SuiValue::ImmShared(_, _) => panic!("unexpected nested Sui shared object in args"),
+            SuiValue::Owned(_, _) => panic!("unexpected nested Sui owned object in args"),
+            SuiValue::Shared(_, _, _) => panic!("unexpected nested Sui shared object in args"),
+            SuiValue::Withdraw(_, _) => {
+                panic!("unexpected nested Sui withdraw reservation in args")
+            }
+            SuiValue::CoinReservation(_, _) => {
+                panic!("unexpected nested Sui coin reservation in args")
+            }
+            SuiValue::AllowanceWithdraw(_, _, _, _) => {
+                panic!("unexpected nested Sui allowance withdraw reservation in args")
+            }
         }
     }
 
@@ -504,7 +701,17 @@ impl SuiValue {
             SuiValue::ObjVec(_) => panic!("unexpected nested Sui object vector in args"),
             SuiValue::Digest(_) => panic!("unexpected nested Sui package digest in args"),
             SuiValue::Receiving(_, _) => panic!("unexpected nested Sui receiving object in args"),
-            SuiValue::ImmShared(_, _) => panic!("unexpected nested Sui shared object in args"),
+            SuiValue::Owned(_, _) => panic!("unexpected nested Sui owned object in args"),
+            SuiValue::Shared(_, _, _) => panic!("unexpected nested Sui shared object in args"),
+            SuiValue::Withdraw(_, _) => {
+                panic!("unexpected nested Sui withdraw reservation in args")
+            }
+            SuiValue::CoinReservation(_, _) => {
+                panic!("unexpected nested Sui coin reservation in args")
+            }
+            SuiValue::AllowanceWithdraw(_, _, _, _) => {
+                panic!("unexpected nested Sui allowance withdraw reservation in args")
+            }
         }
     }
 
@@ -538,25 +745,39 @@ impl SuiValue {
         Ok(ObjectArg::Receiving(obj.compute_object_reference()))
     }
 
-    fn read_shared_arg(
+    fn owned_arg(
         fake_id: FakeID,
         version: Option<SequenceNumber>,
         test_adapter: &SuiTestAdapter,
     ) -> anyhow::Result<ObjectArg> {
         let obj = Self::resolve_object(fake_id, version, test_adapter)?;
+        let obj_ref = obj.compute_object_reference();
+        Ok(ObjectArg::ImmOrOwnedObject(obj_ref))
+    }
+
+    fn shared_arg(
+        fake_id: FakeID,
+        version: Option<SequenceNumber>,
+        test_adapter: &SuiTestAdapter,
+        mutability: SharedObjectMutability,
+    ) -> anyhow::Result<ObjectArg> {
+        let obj = Self::resolve_object(fake_id, version, test_adapter)?;
         let id = obj.id();
-        if let Owner::Shared {
-            initial_shared_version,
-        } = obj.owner
-        {
-            Ok(ObjectArg::SharedObject {
-                id,
+        let initial_shared_version = match obj.owner {
+            Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
+                SequenceNumber::from_u64(0)
+            }
+            Owner::Shared {
                 initial_shared_version,
-                mutable: false,
-            })
-        } else {
-            bail!("{fake_id} is not a shared object.")
-        }
+            } => initial_shared_version,
+            Owner::ConsensusAddressOwner { start_version, .. } => start_version,
+            Owner::Party { start_version, .. } => start_version,
+        };
+        Ok(ObjectArg::SharedObject {
+            id,
+            initial_shared_version,
+            mutability,
+        })
     }
 
     fn object_arg(
@@ -576,8 +797,13 @@ impl SuiValue {
             } => Ok(ObjectArg::SharedObject {
                 id,
                 initial_shared_version,
-                mutable: true,
+                mutability: SharedObjectMutability::Mutable,
             }),
+            Owner::Party { .. } => {
+                // TODO(Party WIP)
+                // We need to know the sender for mutability flag
+                todo!("Party WIP")
+            }
             Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
                 let obj_ref = obj.compute_object_reference();
                 Ok(ObjectArg::ImmOrOwnedObject(obj_ref))
@@ -585,7 +811,11 @@ impl SuiValue {
         }
     }
 
-    pub(crate) fn into_call_arg(self, test_adapter: &SuiTestAdapter) -> anyhow::Result<CallArg> {
+    pub(crate) fn into_call_arg(
+        self,
+        test_adapter: &SuiTestAdapter,
+        sender: SuiAddress,
+    ) -> anyhow::Result<CallArg> {
         Ok(match self {
             SuiValue::Object(fake_id, version) => {
                 CallArg::Object(Self::object_arg(fake_id, version, test_adapter)?)
@@ -594,9 +824,15 @@ impl SuiValue {
             SuiValue::Receiving(fake_id, version) => {
                 CallArg::Object(Self::receiving_arg(fake_id, version, test_adapter)?)
             }
-            SuiValue::ImmShared(fake_id, version) => {
-                CallArg::Object(Self::read_shared_arg(fake_id, version, test_adapter)?)
+            SuiValue::Owned(fake_id, version) => {
+                CallArg::Object(Self::owned_arg(fake_id, version, test_adapter)?)
             }
+            SuiValue::Shared(mutability, fake_id, version) => CallArg::Object(Self::shared_arg(
+                fake_id,
+                version,
+                test_adapter,
+                mutability,
+            )?),
             SuiValue::ObjVec(_) => bail!("obj vec is not supported as an input"),
             SuiValue::Digest(pkg) => {
                 let pkg = Symbol::from(pkg);
@@ -605,6 +841,42 @@ impl SuiValue {
                 };
                 CallArg::Pure(bcs::to_bytes(&staged.digest).unwrap())
             }
+            SuiValue::Withdraw(amount, type_tag) => {
+                // Check if the type is Balance<T> and extract the inner type T
+                // For now, we only support Balance type for withdraw
+                let inner_type =
+                    Balance::maybe_get_balance_type_param(&type_tag).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Withdraw only supports Balance<T> types, got: {}",
+                            type_tag
+                        )
+                    })?;
+                CallArg::FundsWithdrawal(FundsWithdrawalArg::balance_from_sender(
+                    amount, inner_type,
+                ))
+            }
+            SuiValue::CoinReservation(amount, type_tag) => {
+                let accumulator_obj_id = *AccumulatorValue::get_field_id(sender, &type_tag)
+                    .map_err(|e| anyhow::anyhow!("Failed to compute accumulator object ID: {e}"))?
+                    .inner();
+                let epoch = test_adapter.get_latest_epoch_id().unwrap_or(0);
+                let object_ref = ParsedObjectRefWithdrawal::new(accumulator_obj_id, epoch, amount)
+                    .encode(SequenceNumber::new(), test_adapter.get_chain_identifier());
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(object_ref))
+            }
+            SuiValue::AllowanceWithdraw(amount, type_tag, funder, fake_id) => {
+                let inner_type =
+                    Balance::maybe_get_balance_type_param(&type_tag).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "allowance_withdraw only supports Balance<T> types, got: {}",
+                            type_tag
+                        )
+                    })?;
+                let allowance = Self::resolve_object(fake_id, None, test_adapter)?.id();
+                CallArg::FundsWithdrawal(FundsWithdrawalArg::balance_from_allowance(
+                    amount, inner_type, funder, allowance,
+                ))
+            }
         })
     }
 
@@ -612,6 +884,7 @@ impl SuiValue {
         self,
         builder: &mut ProgrammableTransactionBuilder,
         test_adapter: &SuiTestAdapter,
+        sender: SuiAddress,
     ) -> anyhow::Result<Argument> {
         match self {
             SuiValue::ObjVec(vec) => builder.make_obj_vec(
@@ -620,7 +893,7 @@ impl SuiValue {
                     .collect::<Result<Vec<ObjectArg>, _>>()?,
             ),
             value => {
-                let call_arg = value.into_call_arg(test_adapter)?;
+                let call_arg = value.into_call_arg(test_adapter, sender)?;
                 builder.input(call_arg)
             }
         }
@@ -637,7 +910,19 @@ impl ParsableValue for SuiExtraValueArgs {
             (ValueToken::Ident, "object") => Some(Self::parse_object_value(parser)),
             (ValueToken::Ident, "digest") => Some(Self::parse_digest_value(parser)),
             (ValueToken::Ident, "receiving") => Some(Self::parse_receiving_value(parser)),
+            (ValueToken::Ident, "owned") => Some(Self::parse_owned_object_value(parser)),
+            (ValueToken::Ident, "mutshared") => Some(Self::parse_mut_shared_value(parser)),
             (ValueToken::Ident, "immshared") => Some(Self::parse_read_shared_value(parser)),
+            (ValueToken::Ident, "nonexclusive") => {
+                Some(Self::parse_non_exlucsive_write_value(parser))
+            }
+            (ValueToken::Ident, "withdraw") => Some(Self::parse_withdraw_value(parser)),
+            (ValueToken::Ident, "coin_reservation") => {
+                Some(Self::parse_coin_reservation_value(parser))
+            }
+            (ValueToken::Ident, "allowance_withdraw") => {
+                Some(Self::parse_allowance_withdraw_value(parser))
+            }
             _ => None,
         }
     }
@@ -666,13 +951,29 @@ impl ParsableValue for SuiExtraValueArgs {
 
     fn into_concrete_value(
         self,
-        _mapping: &impl Fn(&str) -> Option<move_core_types::account_address::AccountAddress>,
+        mapping: &impl Fn(&str) -> Option<move_core_types::account_address::AccountAddress>,
     ) -> anyhow::Result<Self::ConcreteValue> {
         match self {
             SuiExtraValueArgs::Object(id, version) => Ok(SuiValue::Object(id, version)),
             SuiExtraValueArgs::Digest(pkg) => Ok(SuiValue::Digest(pkg)),
             SuiExtraValueArgs::Receiving(id, version) => Ok(SuiValue::Receiving(id, version)),
-            SuiExtraValueArgs::ImmShared(id, version) => Ok(SuiValue::ImmShared(id, version)),
+            SuiExtraValueArgs::Owned(id, version) => Ok(SuiValue::Owned(id, version)),
+            SuiExtraValueArgs::Shared(mutability, id, version) => {
+                Ok(SuiValue::Shared(mutability, id, version))
+            }
+            SuiExtraValueArgs::Withdraw(amount, parsed_type) => {
+                let type_tag = parsed_type.into_type_tag(mapping)?;
+                Ok(SuiValue::Withdraw(amount, type_tag))
+            }
+            SuiExtraValueArgs::CoinReservation(amount, parsed_type) => {
+                let type_tag = parsed_type.into_type_tag(mapping)?;
+                Ok(SuiValue::CoinReservation(amount, type_tag))
+            }
+            SuiExtraValueArgs::AllowanceWithdraw(amount, parsed_type, funder, id) => {
+                let type_tag = parsed_type.into_type_tag(mapping)?;
+                let funder: SuiAddress = funder.into_account_address(&|s| mapping(s))?.into();
+                Ok(SuiValue::AllowanceWithdraw(amount, type_tag, funder, id))
+            }
         }
     }
 }
@@ -693,9 +994,11 @@ fn parse_fake_id(s: &str) -> anyhow::Result<FakeID> {
 
 fn parse_policy(x: &str) -> anyhow::Result<u8> {
     Ok(match x {
-            "compatible" => UpgradePolicy::COMPATIBLE,
-            "additive" => UpgradePolicy::ADDITIVE,
-            "dep_only" => UpgradePolicy::DEP_ONLY,
-        _ => bail!("Invalid upgrade policy {x}. Policy must be one of 'compatible', 'additive', or 'dep_only'")
+        "compatible" => UpgradePolicy::COMPATIBLE,
+        "additive" => UpgradePolicy::ADDITIVE,
+        "dep_only" => UpgradePolicy::DEP_ONLY,
+        _ => bail!(
+            "Invalid upgrade policy {x}. Policy must be one of 'compatible', 'additive', or 'dep_only'"
+        ),
     })
 }

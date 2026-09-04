@@ -2,24 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use prometheus::default_registry;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+#[cfg(not(tidehunter))]
+use rand::Rng;
+use rand::{SeedableRng, rngs::StdRng};
+#[cfg(not(tidehunter))]
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     },
-    time::{Duration, Instant},
 };
 use sui_framework::BuiltInFramework;
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::{
-    base_types::{random_object_ref, FullObjectRef, SuiAddress},
-    crypto::{deterministic_random_account_key, get_key_pair_from_rng, AccountKeyPair},
-    object::{MoveObject, Owner, OBJECT_START_VERSION},
-    storage::ChildObjectResolver,
+    base_types::{FullObjectRef, SuiAddress, random_object_ref},
+    crypto::{AccountKeyPair, deterministic_random_account_key, get_key_pair_from_rng},
+    object::{MoveObject, OBJECT_START_VERSION, Owner},
+    storage::RuntimeObjectResolver,
 };
 use sui_types::{
     effects::{TestEffectsBuilder, TransactionEffectsAPI},
@@ -29,7 +32,7 @@ use tokio::sync::RwLock;
 
 use super::*;
 use crate::{
-    authority::{test_authority_builder::TestAuthorityBuilder, AuthorityState, AuthorityStore},
+    authority::{AuthorityStore, test_authority_builder::TestAuthorityBuilder},
     execution_cache::ExecutionCacheAPI,
 };
 
@@ -52,9 +55,7 @@ impl AssertInserted for bool {
 type ActionCb = Box<dyn Fn(&mut Scenario) + Send>;
 
 pub(crate) struct Scenario {
-    pub authority: Arc<AuthorityState>,
     pub store: Arc<AuthorityStore>,
-    pub epoch_store: Arc<AuthorityPerEpochStore>,
     pub cache: Arc<WritebackCache>,
 
     id_map: BTreeMap<u32, ObjectID>,
@@ -69,9 +70,7 @@ pub(crate) struct Scenario {
 impl Scenario {
     async fn new(do_after: Option<(u32, ActionCb)>, action_count: Arc<AtomicU32>) -> Self {
         let authority = TestAuthorityBuilder::new().build().await;
-
         let store = authority.database_for_testing().clone();
-        let epoch_store = authority.epoch_store_for_testing().clone();
 
         static METRICS: once_cell::sync::Lazy<Arc<ExecutionCacheMetrics>> =
             once_cell::sync::Lazy::new(|| Arc::new(ExecutionCacheMetrics::new(default_registry())));
@@ -83,9 +82,7 @@ impl Scenario {
             BackpressureManager::new_for_tests(),
         ));
         Self {
-            authority,
             store,
-            epoch_store,
             cache,
             id_map: BTreeMap::new(),
             objects: BTreeMap::new(),
@@ -103,11 +100,11 @@ impl Scenario {
 
     fn count_action(&mut self) {
         let prev = self.action_count.fetch_add(1, Ordering::Relaxed);
-        if let Some((count, _)) = &self.do_after {
-            if prev == *count {
-                let (_, f) = self.do_after.take().unwrap();
-                f(self);
-            }
+        if let Some((count, _)) = &self.do_after
+            && prev == *count
+        {
+            let (_, f) = self.do_after.take().unwrap();
+            f(self);
         }
     }
 
@@ -167,10 +164,7 @@ impl Scenario {
             markers: Default::default(),
             wrapped: Default::default(),
             deleted: Default::default(),
-            locks_to_delete: Default::default(),
-            new_locks_to_init: Default::default(),
             written: Default::default(),
-            output_keys: Default::default(),
         }
     }
 
@@ -224,9 +218,6 @@ impl Scenario {
     pub fn with_child(&mut self, short_id: u32, owner: u32) {
         let owner_id = self.id_map.get(&owner).expect("no such object");
         let object = Self::new_child(*owner_id);
-        self.outputs
-            .new_locks_to_init
-            .push(object.compute_object_reference());
         let id = object.id();
         assert!(self.id_map.insert(short_id, id).is_none());
         self.outputs.written.insert(id, object.clone());
@@ -237,9 +228,6 @@ impl Scenario {
         // for every id in short_ids, create an object with that id if it doesn't exist
         for short_id in short_ids {
             let object = Self::new_object();
-            self.outputs
-                .new_locks_to_init
-                .push(object.compute_object_reference());
             let id = object.id();
             assert!(self.id_map.insert(*short_id, id).is_none());
             self.outputs.written.insert(id, object.clone());
@@ -278,14 +266,8 @@ impl Scenario {
         for short_id in short_ids {
             let id = self.id_map.get(short_id).expect("object not found");
             let object = self.objects.get(id).cloned().expect("object not found");
-            self.outputs
-                .locks_to_delete
-                .push(object.compute_object_reference());
             let object = Self::inc_version_by(object, delta);
             self.objects.insert(*id, object.clone());
-            self.outputs
-                .new_locks_to_init
-                .push(object.compute_object_reference());
             self.outputs.written.insert(object.id(), object);
         }
     }
@@ -297,7 +279,6 @@ impl Scenario {
             let id = self.id_map.get(short_id).expect("object not found");
             let object = self.objects.remove(id).expect("object not found");
             let mut object_ref = object.compute_object_reference();
-            self.outputs.locks_to_delete.push(object_ref);
             // in the authority this would be set to the lamport version of the tx
             object_ref.1.increment();
             self.outputs.deleted.push(object_ref.into());
@@ -311,7 +292,6 @@ impl Scenario {
             let id = self.id_map.get(short_id).expect("object not found");
             let object = self.objects.get(id).cloned().expect("object not found");
             let mut object_ref = object.compute_object_reference();
-            self.outputs.locks_to_delete.push(object_ref);
             // in the authority this would be set to the lamport version of the tx
             object_ref.1.increment();
             self.outputs.wrapped.push(object_ref.into());
@@ -320,16 +300,16 @@ impl Scenario {
 
     pub fn with_received(&mut self, short_ids: &[u32]) {
         // for every id in short_ids, assert than an object with that id exists, that
-        // it has a new lock (which proves it was mutated) and then write a received
-        // marker for it
+        // it was written at its current version (which proves it was mutated) and then
+        // write a received marker for it
         for short_id in short_ids {
             let id = self.id_map.get(short_id).expect("object not found");
             let object = self.objects.get(id).cloned().expect("object not found");
             self.outputs
-                .new_locks_to_init
-                .iter()
-                .find(|o| **o == object.compute_object_reference())
-                .expect("received object must have new lock");
+                .written
+                .get(id)
+                .filter(|o| o.compute_object_reference() == object.compute_object_reference())
+                .expect("received object must have been written");
             self.outputs.markers.push((
                 object.compute_full_object_reference().into(),
                 MarkerValue::Received,
@@ -521,19 +501,6 @@ impl Scenario {
             .get(&self.obj_id(short_id))
             .expect("no such object")
             .clone()
-    }
-
-    pub fn obj_ref(&self, short_id: u32) -> ObjectRef {
-        self.object(short_id).compute_object_reference()
-    }
-
-    pub fn make_signed_transaction(&self, tx: &VerifiedTransaction) -> VerifiedSignedTransaction {
-        VerifiedSignedTransaction::new(
-            self.epoch_store.epoch(),
-            tx.clone(),
-            self.authority.name,
-            &*self.authority.secret,
-        )
     }
 }
 
@@ -778,10 +745,11 @@ async fn test_lt_or_eq_caching() {
         assert!(!s.cache.object_by_id_cache.contains_key(&s.obj_id(1)));
 
         // version <= 0 does not exist
-        assert!(s
-            .cache()
-            .find_object_lt_or_eq_version(s.obj_id(1), 0.into())
-            .is_none());
+        assert!(
+            s.cache()
+                .find_object_lt_or_eq_version(s.obj_id(1), 0.into())
+                .is_none()
+        );
 
         // query above populates cache
         assert_eq!(
@@ -922,11 +890,12 @@ async fn test_invalidate_package_cache_on_clear() {
 
         s.clear_state_end_of_epoch();
 
-        assert!(s
-            .cache()
-            .get_package_object(&s.obj_id(2))
-            .unwrap()
-            .is_none());
+        assert!(
+            s.cache()
+                .get_package_object(&s.obj_id(2))
+                .unwrap()
+                .is_none()
+        );
     })
     .await;
 }
@@ -1007,166 +976,8 @@ async fn test_concurrent_readers() {
     t2.await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_concurrent_lockers() {
-    telemetry_subscribers::init_for_testing();
-
-    let mut s = Scenario::new(None, Arc::new(AtomicU32::new(0))).await;
-    let cache = s.cache.clone();
-    let mut txns = Vec::new();
-
-    for i in 0..1000 {
-        let a = i * 4;
-        let b = i * 4 + 1;
-        let c = i * 4 + 2;
-        let d = i * 4 + 3;
-        s.with_created(&[a, b]);
-        s.do_tx().await;
-
-        let a_ref = s.obj_ref(a);
-        let b_ref = s.obj_ref(b);
-
-        // these contents of these txns are never used, they are just unique transactions to use for
-        // attempted equivocation
-        s.with_created(&[c]);
-        let tx1 = s.take_outputs();
-
-        s.with_created(&[d]);
-        let tx2 = s.take_outputs();
-
-        let tx1 = s.make_signed_transaction(&tx1.transaction);
-        let tx2 = s.make_signed_transaction(&tx2.transaction);
-
-        txns.push((tx1, tx2, a_ref, b_ref));
-    }
-
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-
-    let t1 = {
-        let txns = txns.clone();
-        let cache = cache.clone();
-        let barrier = barrier.clone();
-        let epoch_store = s.epoch_store.clone();
-        tokio::task::spawn(async move {
-            let mut results = Vec::new();
-            for (tx1, _, a_ref, b_ref) in txns {
-                results.push(cache.acquire_transaction_locks(
-                    &epoch_store,
-                    &[a_ref, b_ref],
-                    *tx1.digest(),
-                    Some(tx1.clone()),
-                ));
-                barrier.wait().await;
-            }
-            results
-        })
-    };
-
-    let t2 = {
-        let txns = txns.clone();
-        let cache = cache.clone();
-        let barrier = barrier.clone();
-        let epoch_store = s.epoch_store.clone();
-        tokio::task::spawn(async move {
-            let mut results = Vec::new();
-            for (_, tx2, a_ref, b_ref) in txns {
-                results.push(cache.acquire_transaction_locks(
-                    &epoch_store,
-                    &[a_ref, b_ref],
-                    *tx2.digest(),
-                    Some(tx2.clone()),
-                ));
-                barrier.wait().await;
-            }
-            results
-        })
-    };
-
-    let results1 = t1.await.unwrap();
-    let results2 = t2.await.unwrap();
-
-    for (r1, r2) in results1.into_iter().zip(results2) {
-        // exactly one should succeed in each case
-        assert_eq!(r1.is_ok(), r2.is_err());
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_concurrent_lockers_same_tx() {
-    telemetry_subscribers::init_for_testing();
-
-    let mut s = Scenario::new(None, Arc::new(AtomicU32::new(0))).await;
-    let cache = s.cache.clone();
-    let mut txns = Vec::new();
-
-    for i in 0..1000 {
-        let a = i * 4;
-        let b = i * 4 + 1;
-        s.with_created(&[a, b]);
-        s.do_tx().await;
-
-        let a_ref = s.obj_ref(a);
-        let b_ref = s.obj_ref(b);
-
-        let tx1 = s.take_outputs();
-
-        let tx1 = s.make_signed_transaction(&tx1.transaction);
-
-        txns.push((tx1, a_ref, b_ref));
-    }
-
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-
-    let t1 = {
-        let txns = txns.clone();
-        let cache = cache.clone();
-        let barrier = barrier.clone();
-        let epoch_store = s.epoch_store.clone();
-        tokio::task::spawn(async move {
-            let mut results = Vec::new();
-            for (tx1, a_ref, b_ref) in txns {
-                results.push(cache.acquire_transaction_locks(
-                    &epoch_store,
-                    &[a_ref, b_ref],
-                    *tx1.digest(),
-                    Some(tx1.clone()),
-                ));
-                barrier.wait().await;
-            }
-            results
-        })
-    };
-
-    let t2 = {
-        let txns = txns.clone();
-        let cache = cache.clone();
-        let barrier = barrier.clone();
-        let epoch_store = s.epoch_store.clone();
-        tokio::task::spawn(async move {
-            let mut results = Vec::new();
-            for (tx1, a_ref, b_ref) in txns {
-                results.push(cache.acquire_transaction_locks(
-                    &epoch_store,
-                    &[a_ref, b_ref],
-                    *tx1.digest(),
-                    Some(tx1.clone()),
-                ));
-                barrier.wait().await;
-            }
-            results
-        })
-    };
-
-    let results1 = t1.await.unwrap();
-    let results2 = t2.await.unwrap();
-
-    for (r1, r2) in results1.into_iter().zip(results2) {
-        assert!(r1.is_ok());
-        assert!(r2.is_ok());
-    }
-}
-
 #[tokio::test]
+#[cfg(not(tidehunter))] // something about metrics initialization in this test does not work w/ tidheunter build and cause 'AlreadyReg' error
 async fn latest_object_cache_race_test() {
     telemetry_subscribers::init_for_testing();
     let authority = TestAuthorityBuilder::new().build().await;
@@ -1344,4 +1155,76 @@ async fn test_transaction_cache_race() {
 
     t1.join().unwrap();
     t2.join().unwrap();
+}
+
+// Regression test for the race described in Mark's original report: an account at
+// version V is deleted by a settlement tx that writes a tombstone at V+1, but the
+// barrier tx that bumps the root from V to V+1 has not yet run. In that window a
+// reader observes (live object at V, tombstone at V+1, root at V). The consistent
+// read must cap the account read at the root version instead of reading the latest
+// account tombstone.
+#[tokio::test]
+async fn test_get_consistent_latest_account_amount_race_with_pending_settlement() {
+    use crate::accumulators::funds_read::AccountFundsRead;
+    use sui_types::{
+        SUI_ACCUMULATOR_ROOT_OBJECT_ID, accumulator_root::AccumulatorValue, balance::Balance,
+        gas_coin::GAS,
+    };
+
+    let authority = TestAuthorityBuilder::new().build().await;
+    let store = authority.database_for_testing().clone();
+
+    static METRICS: once_cell::sync::Lazy<Arc<ExecutionCacheMetrics>> =
+        once_cell::sync::Lazy::new(|| Arc::new(ExecutionCacheMetrics::new(default_registry())));
+
+    let cache = Arc::new(WritebackCache::new(
+        &Default::default(),
+        store.clone(),
+        (*METRICS).clone(),
+        BackpressureManager::new_for_tests(),
+    ));
+
+    // Pre-settlement state: root and live account are both at V.
+    let v = SequenceNumber::from_u64(10);
+    let root_object = Object::with_id_owner_version_for_testing(
+        SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+        v,
+        Owner::Shared {
+            initial_shared_version: SequenceNumber::from_u64(1),
+        },
+    );
+    cache.write_object_entry(&SUI_ACCUMULATOR_ROOT_OBJECT_ID, v, root_object.into());
+
+    let (owner, _) = deterministic_random_account_key();
+    let balance_type_tag: sui_types::TypeTag = Balance::type_(GAS::type_tag()).into();
+    let expected_balance: u64 = 1_000;
+    let account =
+        AccumulatorValue::create_for_testing(owner, balance_type_tag.clone(), expected_balance);
+    let account_id = AccumulatorValue::get_field_id(owner, &balance_type_tag).unwrap();
+    assert_eq!(account.id(), *account_id.inner());
+    let mut account_inner = account.into_inner();
+    account_inner
+        .data
+        .try_as_move_mut()
+        .unwrap()
+        .increment_version_to(v);
+    let account: Object = account_inner.into();
+    cache.write_object_entry(account_id.inner(), v, account.into());
+
+    // Simulate partial settlement: the settlement tx has written a tombstone for the
+    // account at V+1 (deleting it), but the barrier has NOT yet bumped the root from
+    // V to V+1.
+    cache.write_object_entry(account_id.inner(), v.next(), ObjectEntry::Deleted);
+
+    assert_eq!(
+        AccountFundsRead::get_latest_account_amount(&*cache, &account_id),
+        0
+    );
+
+    // The consistent read must observe the pre-settlement balance at V: settlement
+    // must appear atomic to readers that need the root version paired with the amount.
+    let (balance, version) =
+        AccountFundsRead::get_consistent_latest_account_amount_and_version(&*cache, &account_id);
+    assert_eq!(version, v);
+    assert_eq!(balance, expected_balance as u128);
 }

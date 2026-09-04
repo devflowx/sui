@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 
+use anyhow::ensure;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_spanned::Spanned;
 
@@ -8,13 +9,19 @@ use move_compiler::editions::Edition;
 use crate::compatibility::legacy::LegacyData;
 
 use super::{
-    EnvironmentName, LocalDepInfo, OnChainDepInfo, PackageName, PublishAddresses, ResolverName,
-    toml_format::RenderToml,
+    EnvironmentName, LocalDepInfo, OnChainAddress, OnChainPlaceholder, PackageName,
+    PublishAddresses, ResolverName,
 };
 
 /// The on-chain identifier for an environment (such as a chain ID); these are bound to environment
 /// names in the `[environments]` table of the manifest
 pub type EnvironmentID = String;
+
+/// The name of a mode
+pub type ModeName = String;
+
+/// The identifier for a system dependency (in `{system = "dep_id"}` dependencies
+pub type SystemDepName = String;
 
 // Note: [Manifest] objects should not be mutated or serialized; they are user-defined files so
 // tools that write them should use [toml_edit] to set / preserve the formatting. However, we do
@@ -50,11 +57,15 @@ pub struct PackageMetadata {
     #[serde(default, deserialize_with = "from_str_option")]
     pub edition: Option<Edition>,
 
-    #[serde(default)]
-    pub system_dependencies: Option<Vec<String>>,
+    #[serde(default = "return_true")]
+    pub implicit_dependencies: bool,
 
     #[serde(flatten)]
     pub unrecognized_fields: BTreeMap<String, toml::Value>,
+}
+
+fn return_true() -> bool {
+    true
 }
 
 /// An entry in the `[dependencies]` section of a manifest
@@ -69,6 +80,9 @@ pub struct DefaultDependency {
 
     #[serde(default)]
     pub rename_from: Option<PackageName>,
+
+    #[serde(default)]
+    pub modes: Option<Vec<ModeName>>,
 }
 
 /// An entry in the `[dep-replacements]` section of a manifest
@@ -96,7 +110,9 @@ pub enum ManifestDependencyInfo {
     Git(ManifestGitDependency),
     External(ExternalDependency),
     Local(LocalDepInfo),
-    OnChain(OnChainDepInfo),
+    OnChainPlaceholder(OnChainPlaceholder),
+    OnChain(OnChainAddress),
+    System(SystemDependency),
 }
 
 /// An external dependency has the form `{ r.<res> = <data> }`. External
@@ -127,15 +143,33 @@ pub struct ManifestGitDependency {
     pub subdir: PathBuf,
 }
 
+/// A `{system = "..."}` dependency in a manifest
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SystemDependency {
+    pub system: SystemDepName,
+}
+
 /// Convenience type for serializing/deserializing external deps
 #[derive(Serialize, Deserialize)]
 struct RField {
-    r: BTreeMap<String, toml::Value>,
+    r: BTreeMap<ResolverName, toml::Value>,
 }
 
-impl RenderToml for ParsedManifest {
-    fn render_as_toml(&self) -> String {
-        todo!()
+impl ReplacementDependency {
+    /// Convenience method for creating a `{ system = <name>, override = true }` dep
+    pub fn override_system_dep(name: &str) -> ReplacementDependency {
+        ReplacementDependency {
+            dependency: Some(DefaultDependency {
+                dependency_info: ManifestDependencyInfo::System(SystemDependency {
+                    system: name.into(),
+                }),
+                is_override: true,
+                rename_from: None,
+                modes: None,
+            }),
+            addresses: None,
+            use_environment: None,
+        }
     }
 }
 
@@ -151,6 +185,9 @@ impl<'de> Deserialize<'de> for ManifestDependencyInfo {
             if tbl.contains_key("git") {
                 let dep = ManifestGitDependency::deserialize(data).map_err(de::Error::custom)?;
                 Ok(ManifestDependencyInfo::Git(dep))
+            } else if tbl.contains_key("system") {
+                let dep = SystemDependency::deserialize(data).map_err(de::Error::custom)?;
+                Ok(ManifestDependencyInfo::System(dep))
             } else if tbl.contains_key("r") {
                 let dep = ExternalDependency::deserialize(data).map_err(de::Error::custom)?;
                 Ok(ManifestDependencyInfo::External(dep))
@@ -158,11 +195,21 @@ impl<'de> Deserialize<'de> for ManifestDependencyInfo {
                 let dep = LocalDepInfo::deserialize(data).map_err(de::Error::custom)?;
                 Ok(ManifestDependencyInfo::Local(dep))
             } else if tbl.contains_key("on-chain") {
-                let dep = OnChainDepInfo::deserialize(data).map_err(de::Error::custom)?;
-                Ok(ManifestDependencyInfo::OnChain(dep))
+                match &tbl["on-chain"] {
+                    toml::Value::Boolean(_) => OnChainPlaceholder::deserialize(data)
+                        .map(ManifestDependencyInfo::OnChainPlaceholder)
+                        .map_err(de::Error::custom),
+                    toml::Value::String(_) => OnChainAddress::deserialize(data)
+                        .map(ManifestDependencyInfo::OnChain)
+                        .map_err(de::Error::custom),
+                    _ => Err(de::Error::custom(
+                        "on-chain must be `true` (in [dependencies]) or a hex address string \
+                         like \"0x...\" (in [dep-replacements])",
+                    )),
+                }
             } else {
                 Err(de::Error::custom(
-                    "Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.",
+                    "Invalid dependency; dependencies must have exactly one of the following fields: `system`, `git`, `r.<resolver>`, `local`, or `on-chain`.",
                 ))
             }
         } else {
@@ -172,13 +219,14 @@ impl<'de> Deserialize<'de> for ManifestDependencyInfo {
 }
 
 impl TryFrom<RField> for ExternalDependency {
-    type Error = &'static str;
+    type Error = anyhow::Error;
 
     /// Convert from [RField] (`{r.<res> = <data>}`) to [ExternalDependency] (`{ res, data }`)
     fn try_from(value: RField) -> Result<Self, Self::Error> {
-        if value.r.len() != 1 {
-            return Err("Externally resolved dependencies may only have one `r.<resolver>` field");
-        }
+        ensure!(
+            value.r.len() == 1,
+            "Externally resolved dependencies may only have one `r.<resolver>` field"
+        );
 
         let (resolver, data) = value
             .r
@@ -294,6 +342,8 @@ mod tests {
             [dependencies]
             foo = { git = "https://example.com/foo.git", rev = "releases/v1", rename-from = "Foo", override = true}
             qwer = { r.mvr = "@pkg/qwer" }
+            tester = { local = "../tester", modes = ["test"] }
+            system = { system = "foo" }
 
             [dep-replacements]
             # used to replace dependencies for specific environments
@@ -328,7 +378,7 @@ mod tests {
 
         let dep = manifest.get_dep("mock").dependency_info.as_external();
 
-        assert_eq!(dep.resolver, "mock-resolver");
+        assert_eq!(dep.resolver.to_string(), "mock-resolver");
         assert_eq!(
             dep.data,
             toml_edit::de::from_str(r#"resolved = { local = "." }"#).unwrap()
@@ -359,6 +409,29 @@ mod tests {
         "###);
     }
 
+    /// external resolver names can't contain invalid characters (DVX-2019)
+    #[test]
+    fn parse_malformed_external_resolver() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+
+            [dependencies]
+            foo = { r."foo//bar" = "foo" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 6, column 19
+          |
+        6 |             foo = { r."foo//bar" = "foo" }
+          |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+        invalid character in external resolver name `foo//bar` for key `r`
+        "###);
+    }
+
     /// `r` fields (for external deps) must be objects
     #[test]
     fn parse_nonobject_external() {
@@ -385,7 +458,7 @@ mod tests {
 
     // Implicit dependency parsing ///////////////////////////////////////////////////////
 
-    /// The default value for `implicit-deps` is `Enabled`
+    /// The default value for `implicit-dependencies` is `Enabled`
     #[test]
     fn parse_implicit_deps() {
         let manifest: ParsedManifest = toml_edit::de::from_str(
@@ -397,7 +470,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manifest.package.system_dependencies.is_none());
+        assert!(manifest.package.implicit_dependencies);
     }
 
     /// You can turn implicit deps off
@@ -408,34 +481,13 @@ mod tests {
             [package]
             name = "test"
             edition = "2024"
-            system-dependencies = []
+            implicit-dependencies = false
             "#,
         )
         .unwrap();
 
-        assert!(manifest.package.system_dependencies == Some(vec![]));
+        assert!(!manifest.package.implicit_dependencies);
     }
-
-    /// You can define specific implicit deps.
-    #[test]
-    fn parse_specific_implicit_deps() {
-        let manifest: ParsedManifest = toml_edit::de::from_str(
-            r#"
-                [package]
-                name = "test"
-                edition = "2024"
-                system-dependencies = ["foo", "bar"]
-                "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest.package.system_dependencies,
-            Some(vec!["foo".to_string(), "bar".to_string()])
-        );
-    }
-
-    // Dependency and dep-replacement parsing ////////////////////////////////////////////
 
     /// You need the `git` field to have a git dependency
     #[test]
@@ -458,7 +510,7 @@ mod tests {
           |
         7 |             foo = { rename-from = "Foo", override = true, rev = "releases/v1" }
           |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.
+        Invalid dependency; dependencies must have exactly one of the following fields: `system`, `git`, `r.<resolver>`, `local`, or `on-chain`.
         "###);
     }
 
@@ -482,7 +534,7 @@ mod tests {
           |
         7 |             foo = {}
           |                   ^^
-        Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.
+        Invalid dependency; dependencies must have exactly one of the following fields: `system`, `git`, `r.<resolver>`, `local`, or `on-chain`.
         "###);
     }
 
@@ -900,7 +952,7 @@ mod tests {
     /// You can't add partial dependency information (e.g. just updating the `rev` field) in a
     /// `dep-replacement`
     #[test]
-    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
+    #[ignore] // TODO: pkg-alt this test is currently failing because the extra stuff just gets dropped
     fn parse_git_partial_replacement() {
         let error = toml_edit::de::from_str::<ParsedManifest>(
             r#"
@@ -943,6 +995,159 @@ mod tests {
           |                 ^^^^^^^^^^^^^
         invalid type: integer `1`, expected path string for key `local`
         "###);
+    }
+
+    // On-chain dependency parsing ///////////////////////////////////////////////////
+
+    /// Parsing `on-chain = true` in [dependencies] succeeds
+    #[test]
+    fn parse_on_chain_flag() {
+        let manifest: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = true }
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            manifest.get_dep("foo").dependency_info,
+            ManifestDependencyInfo::OnChainPlaceholder(_)
+        ));
+    }
+
+    /// Parsing `on-chain = "0x1234"` in [dep-replacements] succeeds
+    #[test]
+    fn parse_on_chain_address_in_replacement() {
+        let _: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = true }
+
+            [dep-replacements]
+            mainnet.foo = { on-chain = "0x0000000000000000000000000000000000000000000000000000000000000001" }
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// Parsing `on-chain = false` is rejected
+    #[test]
+    fn parse_on_chain_false() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = false }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = { on-chain = false }
+          |                   ^^^^^^^^^^^^^^^^^^^^
+        Expected the constant `true` for key `on-chain`
+        "###);
+    }
+
+    /// Parsing `on-chain = 42` is rejected
+    #[test]
+    fn parse_on_chain_integer() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = 42 }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = { on-chain = 42 }
+          |                   ^^^^^^^^^^^^^^^^^
+        on-chain must be `true` (in [dependencies]) or a hex address string like "0x..." (in [dep-replacements])
+        "###);
+    }
+
+    /// Parsing a short hex address like `on-chain = "0x1"` succeeds (addresses are zero-padded)
+    #[test]
+    fn parse_on_chain_short_address() {
+        let _: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = true }
+
+            [dep-replacements]
+            mainnet.foo = { on-chain = "0x1" }
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// Parsing an address longer than 32 bytes should be a parse error.
+    // TODO(DVX-2143): currently silently drops the invalid address due to serde flatten+default
+    #[test]
+    #[ignore]
+    fn parse_on_chain_too_long_address() {
+        toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = true }
+
+            [dep-replacements]
+            mainnet.foo = { on-chain = "0x00000000000000000000000000000000000000000000000000000000000000000001" }
+            "#,
+        )
+        .unwrap_err();
+    }
+
+    /// Parsing an invalid hex string should be a parse error.
+    // TODO(DVX-2143): currently silently drops the invalid address due to serde flatten+default
+    #[test]
+    #[ignore]
+    fn parse_on_chain_invalid_hex() {
+        toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { on-chain = true }
+
+            [dep-replacements]
+            mainnet.foo = { on-chain = "0x0000q" }
+            "#,
+        )
+        .unwrap_err();
     }
 
     /// [addresses] is dead ♥

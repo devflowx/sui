@@ -4,7 +4,7 @@
 // tests that shared objects cannot become dynamic fields and that a shared object
 // dynamic field added and removed in the same transaction does not error
 
-//# init --addresses a=0x0 --accounts A --shared-object-deletion true
+//# init --addresses a=0x0 --accounts A --enable-feature-flags shared_object_deletion
 
 //# publish
 module a::m {
@@ -24,14 +24,14 @@ module a::m {
 
     public entry fun add_dynamic_object_field(inner: Inner, ctx: &mut TxContext) {
         let mut outer = Outer {id: object::new(ctx)};
-        add(&mut outer.id, 0, inner);
+        add(&mut outer.id, 0u64, inner);
         transfer::transfer(outer, ctx.sender());
     }
 
     public entry fun add_and_remove_dynamic_object_field(inner: Inner, ctx: &mut TxContext) {
         let mut outer = Outer {id: object::new(ctx)};
-        add(&mut outer.id, 0, inner);
-        let removed: Inner = remove(&mut outer.id, 0);
+        add(&mut outer.id, 0u64, inner);
+        let removed: Inner = remove(&mut outer.id, 0u64);
         transfer::public_share_object(removed);
         transfer::transfer(outer, ctx.sender());
     }

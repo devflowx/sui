@@ -49,7 +49,6 @@ fun test_nitro_attestation() {
     assert!(
         res.pcrs()[5].value() == x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
     );
-
     assert!(res.user_data().is_none());
     assert!(res.nonce().is_none());
     assert_eq!(

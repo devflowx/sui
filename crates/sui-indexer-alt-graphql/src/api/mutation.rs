@@ -2,16 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::anyhow;
-use async_graphql::{Context, Object, Result};
+use async_graphql::Context;
+use async_graphql::Object;
+use async_graphql::Result;
 use fastcrypto::error::FastCryptoError;
+use prost_types::FieldMask;
 
-use sui_indexer_alt_reader::fullnode_client::{Error::GrpcExecutionError, FullnodeClient};
+use sui_indexer_alt_reader::fullnode_client::Error::GrpcExecutionError;
+use sui_indexer_alt_reader::fullnode_client::FullnodeClient;
+use sui_rpc::field::FieldMaskUtil;
 use sui_types::crypto::ToFromBytes;
 use sui_types::signature::GenericSignature;
 use sui_types::transaction::TransactionData;
+use tonic::Code;
 
 use crate::api::scalars::base64::Base64;
-use crate::error::{bad_user_input, upcast, RpcError};
+use crate::api::types::execution_result::ExecutionResult;
+use crate::api::types::transaction_effects::TransactionEffects;
+use crate::error::RpcError;
+use crate::error::bad_user_input;
+use crate::error::feature_unavailable;
+use crate::error::upcast;
+use crate::scope::Scope;
 
 /// Error type for user input validation in transaction operations
 #[allow(clippy::enum_variant_names)]
@@ -25,11 +37,10 @@ pub enum TransactionInputError {
 
     #[error("Invalid JSON-encoded gRPC Transaction: {0}")]
     InvalidTransactionJson(serde_json::Error),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 }
-use crate::{
-    api::types::{execution_result::ExecutionResult, transaction_effects::TransactionEffects},
-    scope::Scope,
-};
 
 pub struct Mutation;
 
@@ -50,8 +61,11 @@ impl Mutation {
         transaction_data_bcs: Base64,
         signatures: Vec<Base64>,
     ) -> Result<ExecutionResult, RpcError<TransactionInputError>> {
-        // Get the gRPC client from context
-        let fullnode_client: &FullnodeClient = ctx.data()?;
+        // Get the gRPC client from context. If the service was started without a fullnode URL
+        // there is no client to dispatch the transaction to.
+        let Some(fullnode_client) = ctx.data_opt::<FullnodeClient>() else {
+            return Err(feature_unavailable("executing transactions"));
+        };
 
         // Parse transaction data from BCS
         let tx_data: TransactionData = {
@@ -71,16 +85,31 @@ impl Mutation {
             parsed_signatures.push(signature);
         }
 
-        // Execute transaction - capture gRPC errors for ExecutionResult.errors
+        let read_mask = FieldMask::from_paths([
+            "effects",
+            "transaction",
+            "events.bcs",
+            "balance_changes",
+            "objects.objects.bcs",
+        ]);
+
+        // Execute transaction via gRPC
         match fullnode_client
-            .execute_transaction(tx_data.clone(), parsed_signatures.clone())
+            .execute_transaction(tx_data.clone(), parsed_signatures.clone(), read_mask)
             .await
         {
             Ok(response) => {
-                let scope = Scope::new(ctx)?;
-                let effects = TransactionEffects::from_execution_response(
+                let executed_transaction = response
+                    .transaction
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("ExecuteTransactionResponse should have transaction"))?;
+
+                let scope = Scope::new(ctx)?
+                    .with_executed_transaction(executed_transaction)
+                    .map_err(crate::error::upcast)?;
+                let effects = TransactionEffects::from_executed_transaction(
                     scope,
-                    response,
+                    executed_transaction,
                     tx_data,
                     parsed_signatures,
                 )
@@ -88,13 +117,15 @@ impl Mutation {
 
                 Ok(ExecutionResult {
                     effects: Some(effects),
-                    errors: None,
                 })
             }
-            Err(GrpcExecutionError(status)) => Ok(ExecutionResult {
-                effects: None,
-                errors: Some(vec![status.to_string()]),
-            }),
+            Err(GrpcExecutionError(status))
+                if matches!(status.code(), Code::InvalidArgument | Code::NotFound) =>
+            {
+                Err(bad_user_input(TransactionInputError::InvalidArgument(
+                    status.message().to_string(),
+                )))
+            }
             Err(other_error) => Err(anyhow!(other_error)
                 .context("Failed to execute transaction")
                 .into()),

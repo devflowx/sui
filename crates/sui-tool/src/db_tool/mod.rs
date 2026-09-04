@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use self::db_dump::{dump_table, duplicate_objects_summary, list_tables, table_summary, StoreName};
-use self::index_search::{search_index, SearchRange};
+use self::db_dump::{StoreName, dump_table, list_tables, table_summary};
+use self::index_search::{SearchRange, search_index};
 use crate::db_tool::db_dump::{compact, print_table_metadata, prune_checkpoints, prune_objects};
 use anyhow::{anyhow, bail};
 use clap::Parser;
@@ -16,7 +16,9 @@ use sui_types::base_types::{EpochId, ObjectID};
 use sui_types::digests::{CheckpointContentsDigest, TransactionDigest};
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::messages_checkpoint::{CheckpointDigest, CheckpointSequenceNumber};
-use typed_store::rocks::{safe_drop_db, MetricConf};
+#[cfg(not(tidehunter))]
+use typed_store::rocks::MetricConf;
+use typed_store::rocks::safe_drop_db;
 pub mod db_dump;
 mod index_search;
 
@@ -28,7 +30,6 @@ pub enum DbToolCommand {
     IndexSearchKeyRange(IndexSearchKeyRangeOptions),
     IndexSearchCount(IndexSearchCountOptions),
     TableSummary(Options),
-    DuplicatesSummary,
     ListDBMetadata(Options),
     PrintLastConsensusIndex,
     PrintConsensusCommit(PrintConsensusCommitOptions),
@@ -192,7 +193,6 @@ pub async fn execute_db_tool_command(db_path: PathBuf, cmd: DbToolCommand) -> an
         DbToolCommand::TableSummary(d) => {
             print_db_table_summary(d.store_name, d.epoch, db_path, &d.table_name)
         }
-        DbToolCommand::DuplicatesSummary => print_db_duplicates_summary(db_path),
         DbToolCommand::ListDBMetadata(d) => {
             print_table_metadata(d.store_name, d.epoch, db_path, &d.table_name)
         }
@@ -242,23 +242,16 @@ pub fn print_db_all_tables(db_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_db_duplicates_summary(db_path: PathBuf) -> anyhow::Result<()> {
-    let (total_count, duplicate_count, total_bytes, duplicated_bytes) =
-        duplicate_objects_summary(db_path)?;
-    println!(
-        "Total objects = {}, duplicated objects = {}, total bytes = {}, duplicated bytes = {}",
-        total_count, duplicate_count, total_bytes, duplicated_bytes
-    );
-    Ok(())
-}
-
 pub fn print_last_consensus_index(path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(tidehunter))]
     let epoch_tables = AuthorityEpochTables::open_tables_read_write(
         path.to_path_buf(),
         MetricConf::default(),
         None,
         None,
     );
+    #[cfg(tidehunter)]
+    let epoch_tables = AuthorityEpochTables::open_with_path(path);
     let last_index = epoch_tables.get_last_consensus_index()?;
     println!("Last consensus index is {:?}", last_index);
     Ok(())

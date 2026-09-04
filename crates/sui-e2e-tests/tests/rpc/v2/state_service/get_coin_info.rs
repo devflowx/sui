@@ -6,24 +6,29 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use sui_macros::sim_test;
 use sui_rpc::field::FieldMaskUtil;
+use sui_rpc::proto::sui::rpc::v2::GetCoinInfoRequest;
+use sui_rpc::proto::sui::rpc::v2::GetCoinInfoResponse;
 use sui_rpc::proto::sui::rpc::v2::coin_metadata::MetadataCapState;
 use sui_rpc::proto::sui::rpc::v2::coin_treasury::SupplyState;
 use sui_rpc::proto::sui::rpc::v2::regulated_coin_metadata::CoinRegulatedState;
 use sui_rpc::proto::sui::rpc::v2::state_service_client::StateServiceClient;
-use sui_rpc::proto::sui::rpc::v2::GetCoinInfoRequest;
-use sui_rpc::proto::sui::rpc::v2::GetCoinInfoResponse;
 use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::coin_registry::Currency;
+use sui_types::effects::TransactionEffectsAPI;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::SharedObjectMutability;
 use sui_types::transaction::{ObjectArg, TransactionData};
-use sui_types::{TypeTag, SUI_COIN_REGISTRY_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID};
+use sui_types::{SUI_COIN_REGISTRY_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID, TypeTag};
 use test_cluster::TestClusterBuilder;
 
 // SUI doesn't use the CoinRegistry - it was created before the CoinRegistry system existed and has
 // not been migrated.
 #[sim_test]
 async fn get_coin_info_sui() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -78,7 +83,10 @@ async fn get_coin_info_sui() {
 
 #[sim_test]
 async fn test_get_coin_info_registry_coin() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -232,7 +240,7 @@ async fn test_get_coin_info_registry_coin() {
         .obj(ObjectArg::SharedObject {
             id: currency_id,
             initial_shared_version,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -283,7 +291,10 @@ async fn test_get_coin_info_registry_coin() {
 
 #[sim_test]
 async fn test_get_coin_info_burnonly_coin() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -366,7 +377,7 @@ async fn test_get_coin_info_burnonly_coin() {
         .obj(ObjectArg::SharedObject {
             id: currency_id,
             initial_shared_version,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -422,7 +433,10 @@ async fn test_get_coin_info_burnonly_coin() {
 
 #[sim_test]
 async fn test_get_coin_info_regulated_coin() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -472,7 +486,10 @@ async fn test_get_coin_info_regulated_coin() {
 
 #[sim_test]
 async fn test_get_coin_info_non_otw_coin() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -554,7 +571,10 @@ async fn test_get_coin_info_non_otw_coin() {
 
 #[sim_test]
 async fn test_get_coin_info_legacy_coin() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
 
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
@@ -916,7 +936,7 @@ async fn publish_non_otw_coin(
         .obj(ObjectArg::SharedObject {
             id: SUI_COIN_REGISTRY_OBJECT_ID,
             initial_shared_version: registry_initial_version,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -943,24 +963,23 @@ async fn publish_non_otw_coin(
     let create_tx = test_cluster.sign_and_execute_transaction(&tx_data).await;
 
     // Get treasury cap and metadata cap from created objects
-    use sui_json_rpc_types::SuiTransactionBlockEffectsAPI;
-    let effects = create_tx.effects.as_ref().unwrap();
+    let effects = create_tx.effects;
 
     let mut treasury_cap = None;
     let mut metadata_cap = None;
 
     for o in effects.created() {
         let obj = test_cluster
-            .get_object_from_fullnode_store(&o.reference.object_id)
+            .get_object_from_fullnode_store(&o.0.0)
             .await
             .unwrap();
 
         if let Some(type_) = obj.type_() {
             let type_str = type_.to_string();
             if type_str.contains("TreasuryCap") {
-                treasury_cap = Some(o.reference.object_id);
+                treasury_cap = Some(obj.id());
             } else if type_str.contains("MetadataCap") {
-                metadata_cap = Some(o.reference.object_id);
+                metadata_cap = Some(obj.id());
             }
         }
     }
@@ -1082,7 +1101,7 @@ async fn finalize_registration(
         .obj(ObjectArg::SharedObject {
             id: SUI_COIN_REGISTRY_OBJECT_ID,
             initial_shared_version: registry_initial_version,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -1116,14 +1135,17 @@ async fn finalize_registration(
     let signed_tx = test_cluster.wallet.sign_transaction(&tx_data).await;
 
     // Execute the finalize_registration transaction and wait for checkpoint
-    let mut client = sui_rpc::client::v2::Client::new(test_cluster.rpc_url().to_owned()).unwrap();
+    let mut client = sui_rpc::Client::new(test_cluster.rpc_url().to_owned()).unwrap();
 
     let _finalize_tx = super::super::execute_transaction(&mut client, &signed_tx).await;
 }
 
 #[sim_test]
 async fn test_invalid_coin_type() {
-    let test_cluster = TestClusterBuilder::new().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut grpc_client = get_grpc_client(&test_cluster).await;
 
     // Test with malformed coin type

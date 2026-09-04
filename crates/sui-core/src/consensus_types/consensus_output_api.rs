@@ -1,12 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use std::{cmp::Ordering, fmt::Display};
 
-use consensus_core::{BlockAPI, CommitDigest, VerifiedBlock};
+use std::{collections::BTreeSet, fmt::Display};
+
+use consensus_core::{BlockAPI, CommitRef, VerifiedBlock};
 use consensus_types::block::{BlockRef, TransactionIndex};
-use sui_protocol_config::ProtocolConfig;
+use fastcrypto::hash::HashFunction as _;
+use itertools::Itertools as _;
 use sui_types::{
-    digests::ConsensusCommitDigest,
+    digests::Digest,
     messages_consensus::{AuthorityIndex, ConsensusTransaction},
 };
 
@@ -20,7 +22,9 @@ pub(crate) struct ParsedTransaction {
 }
 
 pub(crate) trait ConsensusCommitAPI: Display {
-    fn reputation_score_sorted_desc(&self) -> Option<Vec<(AuthorityIndex, u64)>>;
+    /// Returns the ref of consensus output.
+    fn commit_ref(&self) -> CommitRef;
+
     fn leader_round(&self) -> u64;
     fn leader_author_index(&self) -> AuthorityIndex;
 
@@ -33,22 +37,14 @@ pub(crate) trait ConsensusCommitAPI: Display {
     /// Returns all accepted and rejected transactions per block in the commit in deterministic order.
     fn transactions(&self) -> Vec<(BlockRef, Vec<ParsedTransaction>)>;
 
-    /// Returns the digest of consensus output.
-    fn consensus_digest(&self, protocol_config: &ProtocolConfig) -> ConsensusCommitDigest;
+    /// Returns a debug string of all rejected transactions.
+    fn rejected_transactions_digest(&self) -> Digest;
+    fn rejected_transactions_debug_string(&self) -> String;
 }
 
 impl ConsensusCommitAPI for consensus_core::CommittedSubDag {
-    fn reputation_score_sorted_desc(&self) -> Option<Vec<(AuthorityIndex, u64)>> {
-        if !self.reputation_scores_desc.is_empty() {
-            Some(
-                self.reputation_scores_desc
-                    .iter()
-                    .map(|(id, score)| (id.value() as AuthorityIndex, *score))
-                    .collect(),
-            )
-        } else {
-            None
-        }
+    fn commit_ref(&self) -> CommitRef {
+        self.commit_ref
     }
 
     fn leader_round(&self) -> u64 {
@@ -85,15 +81,28 @@ impl ConsensusCommitAPI for consensus_core::CommittedSubDag {
             .collect()
     }
 
-    fn consensus_digest(&self, protocol_config: &ProtocolConfig) -> ConsensusCommitDigest {
-        if protocol_config.mysticeti_use_committed_subdag_digest() {
-            // We port CommitDigest, a consensus space object, into ConsensusCommitDigest, a sui-core space object.
-            // We assume they always have the same format.
-            static_assertions::assert_eq_size!(ConsensusCommitDigest, CommitDigest);
-            ConsensusCommitDigest::new(self.commit_ref.digest.into_inner())
-        } else {
-            ConsensusCommitDigest::default()
-        }
+    fn rejected_transactions_digest(&self) -> Digest {
+        let mut hasher = sui_types::crypto::DefaultHash::new();
+        bcs::serialize_into(&mut hasher, &self.rejected_transactions_by_block).unwrap();
+        hasher.finalize().digest.into()
+    }
+
+    fn rejected_transactions_debug_string(&self) -> String {
+        let str = self
+            .rejected_transactions_by_block
+            .iter()
+            .map(|(block_ref, rejected_transactions)| {
+                format!(
+                    "{block_ref}: [{}]",
+                    rejected_transactions
+                        .iter()
+                        .map(|tx| tx.to_string())
+                        .join(",")
+                )
+            })
+            .join(", ");
+        let digest = self.rejected_transactions_digest();
+        format!("({digest}): [{str}]")
     }
 }
 
@@ -104,7 +113,7 @@ pub(crate) fn parse_block_transactions(
     let round = block.round();
     let authority = block.author().value() as AuthorityIndex;
 
-    let mut rejected_idx = 0;
+    let rejected_transaction_indices = BTreeSet::from_iter(rejected_transactions.iter().cloned());
     block
         .transactions()
         .iter().enumerate()
@@ -115,22 +124,8 @@ pub(crate) fn parse_block_transactions(
                     panic!("Failed to deserialize sequenced consensus transaction(this should not happen) {err} from {authority} at {round}");
                 },
             };
-            let rejected = if rejected_idx < rejected_transactions.len() {
-                match (index as TransactionIndex).cmp(&rejected_transactions[rejected_idx]) {
-                    Ordering::Less => {
-                        false
-                    },
-                    Ordering::Equal => {
-                        rejected_idx += 1;
-                        true
-                    },
-                    Ordering::Greater => {
-                        panic!("Rejected transaction indices are not in order. Block {block:?}, rejected transactions: {rejected_transactions:?}");
-                    },
-                }
-            } else {
-                false
-            };
+            // System transactions are always accepted; only user transactions can be rejected.
+            let rejected = transaction.is_user_transaction() && rejected_transaction_indices.contains(&(index as TransactionIndex));
             ParsedTransaction {
                 transaction,
                 rejected,

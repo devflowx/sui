@@ -360,9 +360,19 @@ impl ToDoc for Fields {
 
 impl ToDoc for ModuleId {
     fn to_doc(&self) -> Doc {
-        use Doc as D;
         let ModuleId { address, name } = self;
-        D::text(format!("{address}::{name}"))
+        let address = if let Some(stripped) = address.strip_prefix("0x") {
+            if stripped.is_empty() {
+                "0x0".to_string()
+            } else {
+                // remove all leading zeros
+                let stripped = stripped.trim_start_matches('0');
+                format!("0x{stripped}")
+            }
+        } else {
+            format!("{address}")
+        };
+        Doc::text(format!("{address}::{name}"))
     }
 }
 
@@ -374,7 +384,11 @@ impl ToDoc for Datatype {
             name,
             type_arguments,
         } = self;
-        let targs = to_list(type_arguments, D::text(",").concat(D::space()));
+        let targs = if type_arguments.is_empty() {
+            D::nil()
+        } else {
+            D::angles(to_list(type_arguments, D::text(",").concat(D::space())).group())
+        };
         module
             .to_doc()
             .concat(D::text("::"))

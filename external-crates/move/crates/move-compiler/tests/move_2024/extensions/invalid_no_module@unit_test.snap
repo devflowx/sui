@@ -5,10 +5,12 @@ info:
   edition: 2024.alpha
   lint: false
 ---
-error[E02004]: invalid 'module' declaration
+error[EC02004]: invalid 'module' declaration
   ┌─ tests/move_2024/extensions/invalid_no_module.move:6:1
   │  
 6 │ ╭ extend module a::n {
 7 │ │     fun g(): u64 { 24 }
 8 │ │ }
   │ ╰─^ Cannot extend unknown module 'a::n'
+  │  
+  = Module extensions must correspond to a previously defined module

@@ -5,21 +5,21 @@ use std::{collections::BTreeMap, iter::Peekable};
 
 use move_core_types::parsing::{
     address::{NumericalAddress, ParsedAddress},
-    parser::{parse_u128, parse_u16, parse_u256, parse_u32, parse_u64, parse_u8},
-    types::{ParsedFqName, ParsedModuleId, ParsedStructType, ParsedType},
+    parser::{parse_u8, parse_u16, parse_u32, parse_u64, parse_u128, parse_u256},
+    types::{ParsedDatatype, ParsedFqName, ParsedModuleId, ParsedType},
 };
-use sui_types::{base_types::ObjectID, Identifier};
+use sui_types::{Identifier, base_types::ObjectID};
 
 use crate::{
     client_ptb::{
-        ast::{all_keywords, COMMANDS},
+        ast::{COMMANDS, all_keywords},
         builder::{display_did_you_mean, find_did_you_means},
     },
     err, error, sp,
 };
 
 use super::{
-    ast::{self as A, is_keyword, Argument, ModuleAccess, ParsedPTBCommand, ParsedProgram},
+    ast::{self as A, Argument, ModuleAccess, ParsedPTBCommand, ParsedProgram, is_keyword},
     error::{PTBError, PTBResult, Span, Spanned},
     lexer::Lexer,
     token::{Lexeme, Token},
@@ -555,7 +555,7 @@ impl<'a, I: Iterator<Item = &'a str>> ProgramParser<'a, I> {
 
                 let sp!(_, L(T::LAngle, _)) = self.peek() else {
                     let sp = sp.widen(fun_sp);
-                    break 'fq sp.wrap(ParsedType::Struct(ParsedStructType {
+                    break 'fq sp.wrap(ParsedType::Datatype(ParsedDatatype {
                         fq_name,
                         type_args: vec![],
                     }));
@@ -564,7 +564,7 @@ impl<'a, I: Iterator<Item = &'a str>> ProgramParser<'a, I> {
                 let sp!(tys_sp, type_args) = self.parse_type_args()?;
 
                 let sp = sp.widen(tys_sp);
-                sp.wrap(ParsedType::Struct(ParsedStructType { fq_name, type_args }))
+                sp.wrap(ParsedType::Datatype(ParsedDatatype { fq_name, type_args }))
             }
 
             unexpected => error!(

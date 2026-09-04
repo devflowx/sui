@@ -6,9 +6,10 @@ use crate::{
     PreCompiledProgramInfo, diag,
     diagnostics::{
         Diagnostic, DiagnosticReporter, Diagnostics,
-        warning_filters::{
-            FILTER_DEPRECATED, FILTER_UNUSED_STRUCT_FIELD, WarningFilters, WarningFiltersBuilder,
-            WarningFiltersTable,
+        codes::{DIAGNOSTIC_FILTER_WILDCARD, DiagnosticsID},
+        filter::{
+            FILTER_DEPRECATED, FILTER_UNUSED_STRUCT_FIELD, FilterKind, FilterScope,
+            dependency_drop_filter_scope,
         },
     },
     editions::{self, Edition, FeatureGate, Flavor},
@@ -57,7 +58,7 @@ use move_symbol_pool::Symbol;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     iter::IntoIterator,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use super::ast::StdlibDefinitions;
@@ -89,10 +90,6 @@ pub(super) struct DefnContext<'env> {
 pub(super) struct Context<'env> {
     defn_context: DefnContext<'env>,
     address: Option<Address>,
-    warning_filters_table: Mutex<WarningFiltersTable>,
-    // Cached warning filters for all available prefixes. Used by non-source defs
-    // and dependency packages
-    all_filter_alls: WarningFilters,
     pub path_expander: Option<Box<dyn PathExpander>>,
 }
 
@@ -112,9 +109,6 @@ impl<'env> Context<'env> {
         module_members: UniqueMap<ModuleIdent, ModuleMembers>,
         address_conflicts: BTreeSet<Symbol>,
     ) -> Self {
-        let mut warning_filters_table = WarningFiltersTable::new();
-        let all_filter_alls = WarningFiltersBuilder::new_all_filter_alls(compilation_env);
-        let all_filter_alls = warning_filters_table.add(all_filter_alls);
         let reporter = compilation_env.diagnostic_reporter_at_top_level();
         let defn_context = DefnContext {
             env: compilation_env,
@@ -131,38 +125,23 @@ impl<'env> Context<'env> {
         Context {
             defn_context,
             address: None,
-            warning_filters_table: Mutex::new(warning_filters_table),
-            all_filter_alls,
             path_expander: None,
         }
     }
 
-    /// Hands back the warning filters table and any unused module extension.
-    fn finish(
-        self,
-    ) -> (
-        WarningFiltersTable,
-        BTreeMap<Address, BTreeMap<ModuleName, P::ModuleDefinition>>,
-    ) {
-        let Context {
-            defn_context,
-            warning_filters_table,
-            ..
-        } = self;
+    fn finish(self) -> BTreeMap<Address, BTreeMap<ModuleName, P::ModuleDefinition>> {
+        let Context { defn_context, .. } = self;
         let DefnContext {
             module_extensions, ..
         } = defn_context;
-        (
-            warning_filters_table.into_inner().unwrap(),
-            module_extensions,
-        )
+        module_extensions
     }
 
     fn env(&self) -> &CompilationEnv {
         self.defn_context.env
     }
 
-    pub(super) fn reporter(&self) -> &DiagnosticReporter {
+    pub(super) fn reporter(&self) -> &DiagnosticReporter<'_> {
         &self.defn_context.reporter
     }
 
@@ -171,7 +150,7 @@ impl<'env> Context<'env> {
     }
 
     fn cur_address(&self) -> &Address {
-        self.address.as_ref().unwrap()
+        self.address.as_ref().expect("Current address not set")
     }
 
     pub fn new_alias_map_builder(&mut self) -> AliasMapBuilder {
@@ -192,12 +171,20 @@ impl<'env> Context<'env> {
         let res = self
             .path_expander
             .as_mut()
-            .unwrap()
+            .expect("Path expander missing")
             .push_alias_scope(loc, new_scope);
         match res {
             Err(diag) => self.add_diag(*diag),
             Ok(unnecessaries) => unnecessary_alias_errors(self, unnecessaries),
         }
+    }
+
+    // Push a number of macro lambda parameters onto the alias information in the path expander.
+    pub fn push_lambda_parameters<'a, I: IntoIterator<Item = &'a Name>>(&mut self, tparams: I) {
+        self.path_expander
+            .as_mut()
+            .expect("Cannot push lambda parameters without path expander")
+            .push_lambda_parameters(tparams.into_iter().collect::<Vec<_>>());
     }
 
     // Push a number of type parameters onto the alias information in the path expander.
@@ -207,14 +194,18 @@ impl<'env> Context<'env> {
     {
         self.path_expander
             .as_mut()
-            .unwrap()
+            .expect("Cannot push type parameters without path expander")
             .push_type_parameters(tparams.into_iter().collect::<Vec<_>>());
     }
 
     /// Pops the innermost alias information on the path expander and reports errors for aliases
     /// that were unused Marks implicit use funs as unused
     pub fn pop_alias_scope(&mut self, mut use_funs: Option<&mut E::UseFuns>) {
-        let AliasSet { modules, members } = self.path_expander.as_mut().unwrap().pop_alias_scope();
+        let AliasSet { modules, members } = self
+            .path_expander
+            .as_mut()
+            .expect("Cannot pop scope from empty path expander")
+            .pop_alias_scope();
         for alias in modules {
             unused_alias(self, "module", alias)
         }
@@ -249,7 +240,7 @@ impl<'env> Context<'env> {
             self,
             path_expander
                 .as_mut()
-                .unwrap()
+                .expect("Cannot expand external attribute value without path expander")
                 .name_access_chain_to_attribute_value(inner_context, attribute_value)
         )
     }
@@ -282,7 +273,7 @@ impl<'env> Context<'env> {
         } = self;
         path_expander
             .as_mut()
-            .unwrap()
+            .expect("Cannot expand module access without path expander")
             .name_access_chain_to_module_access(inner_context, access, chain)
     }
 
@@ -310,7 +301,7 @@ impl<'env> Context<'env> {
             self,
             path_expander
                 .as_mut()
-                .unwrap()
+                .expect("Cannot expand module ident without path expander")
                 .name_access_chain_to_module_ident(inner_context, chain)
         )
     }
@@ -323,7 +314,7 @@ impl<'env> Context<'env> {
         } = self;
         path_expander
             .as_mut()
-            .unwrap()
+            .expect("Cannot provide IDE autocomplete suggestion without path expander")
             .ide_autocomplete_suggestion(inner_context, loc)
     }
 
@@ -333,17 +324,7 @@ impl<'env> Context<'env> {
     }
 
     pub fn spec_deprecated_diag(&mut self, loc: Loc, is_error: bool) -> Diagnostic {
-        diag!(
-            if is_error {
-                Uncategorized::DeprecatedSpecItem
-            } else {
-                Uncategorized::DeprecatedWillBeRemoved
-            },
-            (
-                loc,
-                "Specification blocks are deprecated and are no longer used"
-            )
-        )
+        crate::shared::spec_deprecated_diag(loc, is_error)
     }
 
     pub fn add_diag(&self, diag: Diagnostic) {
@@ -365,7 +346,7 @@ impl<'env> Context<'env> {
         self.defn_context.add_ide_annotation(loc, info);
     }
 
-    pub fn push_warning_filter_scope(&mut self, filters: WarningFilters) {
+    pub fn push_warning_filter_scope(&mut self, filters: FilterScope) {
         self.defn_context.push_warning_filter_scope(filters)
     }
 
@@ -381,10 +362,18 @@ impl<'env> Context<'env> {
     pub fn set_module_extensions(&mut self, exts: Vec<(OptAddr, PkgDef)>) {
         for (addr, module) in exts {
             let Some(addr) = addr else {
-                self.add_diag(diag!(
+                let mut diag = diag!(
                     Declarations::InvalidAddress,
-                    (module.def.name.loc(), "Module extension address is invalid")
-                ));
+                    (
+                        module.def.name.loc(),
+                        "Could not determine the address for this module extension"
+                    )
+                );
+                diag.add_note(
+                    "Module extensions must be defined for a previously-defined \
+                    address and module, as '<address>::<module>'",
+                );
+                self.add_diag(diag);
                 continue;
             };
             let P::PackageDefinition {
@@ -417,12 +406,41 @@ impl<'env> Context<'env> {
                 .module_extensions
                 .entry(addr.value)
                 .or_default();
-            if let Some(entry) = addr.insert(name, def) {
-                self.add_diag(diag!(
+
+            if let Some(entry) = addr.get(&name) {
+                let overlapping_modes = entry.modes().intersect(&def.modes());
+                let entry_loc = entry.loc;
+                ice_assert!(
+                    self.reporter(),
+                    !overlapping_modes.is_empty(),
+                    loc,
+                    "Module extension being added has no modes in common with existing extension"
+                );
+                let modes = if overlapping_modes.len() > 1 {
+                    "modes"
+                } else {
+                    "mode"
+                };
+                let overlap_modes_str = overlapping_modes
+                    .iter()
+                    .map(|(_, m)| format!("'{}'", m))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg = format!(
+                    "Duplicate module extension declaration with overlapping {modes} {overlap_modes_str}"
+                );
+                let mut diag = diag!(
                     Declarations::DuplicateItem,
-                    (loc, "Duplicate module extension declaration"),
-                    (entry.loc, "Previous declaration here")
-                ));
+                    (loc, msg),
+                    (entry_loc, "Previous module extension is here")
+                );
+                diag.add_note(
+                    "Module extensions must be unique per address, module name, and mode",
+                );
+                diag.add_note("Consider combining these module extensions");
+                self.add_diag(diag);
+            } else {
+                addr.insert(name, def);
             };
         }
     }
@@ -456,7 +474,7 @@ impl DefnContext<'_> {
         self.reporter.add_ide_annotation(loc, info);
     }
 
-    pub(super) fn push_warning_filter_scope(&mut self, filters: WarningFilters) {
+    pub(super) fn push_warning_filter_scope(&mut self, filters: FilterScope) {
         self.reporter.push_warning_filter_scope(filters)
     }
 
@@ -485,6 +503,14 @@ fn unnecessary_alias_error(context: &mut Context, unnecessary: UnnecessaryAlias)
                 false,
                 "ICE cannot manually make type param aliases. \
                 We do not have nested TypeParam scopes"
+            );
+            return;
+        }
+        AliasEntry::LambdaParam(_) => {
+            debug_assert!(
+                false,
+                "ICE cannot manually make lambda param aliases. \
+                We do not have nested LambdaParam scopes"
             );
             return;
         }
@@ -576,9 +602,9 @@ fn default_aliases(context: &mut Context) -> AliasMapBuilder {
         );
     }
     // if sui is defined and the current package is in Sui mode, add implicit sui aliases
-    if sui_address.is_some() && context.env().package_config(current_package).flavor == Flavor::Sui
+    if let Some(sui_address) = sui_address
+        && context.env().package_config(current_package).flavor == Flavor::Sui
     {
-        let sui_address = sui_address.unwrap();
         modules.extend(
             IMPLICIT_SUI_MODULES
                 .iter()
@@ -595,7 +621,9 @@ fn default_aliases(context: &mut Context) -> AliasMapBuilder {
     for (addr, module) in modules {
         let alias = sp(loc, module);
         let mident = sp(loc, ModuleIdent_::new(addr, ModuleName(sp(loc, module))));
-        builder.add_implicit_module_alias(alias, mident).unwrap();
+        builder
+            .add_implicit_module_alias(alias, mident)
+            .expect("Failed to add module alias to builder");
     }
     for (addr, module, member, kind) in members {
         let alias = sp(loc, member);
@@ -603,7 +631,7 @@ fn default_aliases(context: &mut Context) -> AliasMapBuilder {
         let name = sp(loc, member);
         builder
             .add_implicit_member_alias(alias, mident, name, kind)
-            .unwrap();
+            .expect("Failed to add module alias to builder");
     }
     builder
 }
@@ -732,10 +760,10 @@ pub fn program(
     // Merge the library modules into the source modules, checking for duplicates
 
     for (mident, module) in lib_module_map {
-        if let Err((mident, old_loc)) = source_module_map.add(mident, module) {
-            if !context.env().sources_shadow_deps() {
-                duplicate_module_error(context, &source_module_map, mident, old_loc)
-            }
+        if let Err((mident, old_loc)) = source_module_map.add(mident, module)
+            && !context.env().sources_shadow_deps()
+        {
+            duplicate_module_error(context, &source_module_map, mident, old_loc)
         }
     }
     let module_map = source_module_map;
@@ -745,26 +773,30 @@ pub fn program(
 
     // Finish up context, and report any unused extensions
 
-    let (warning_filters_table, module_extensions) = ctxt.finish();
+    let module_extensions = ctxt.finish();
 
     for (addr, pkg) in module_extensions {
+        if matches!(addr, Address::NamedUnassigned(_)) {
+            // If the address is not known (NamedUnassigned), an error was already reported
+            // during address resolution or module definition. No need to report again here.
+            continue;
+        }
         for (name, ext) in pkg {
+            let mut diag = diag!(
+                Declarations::InvalidModule,
+                (
+                    ext.loc,
+                    format!("Cannot extend unknown module '{addr}::{name}'")
+                )
+            );
+            diag.add_note("Module extensions must correspond to a previously defined module");
             compilation_env
                 .diagnostic_reporter_at_top_level()
-                .add_diag(diag!(
-                    Declarations::InvalidModule,
-                    (
-                        ext.loc,
-                        format!("Cannot extend unknown module '{addr}::{name}'")
-                    )
-                ));
+                .add_diag(diag);
         }
     }
 
-    let warning_filters_table = Arc::new(warning_filters_table);
-
     E::Program {
-        warning_filters_table,
         modules: module_map,
     }
 }
@@ -930,12 +962,13 @@ fn into_modules_and_extenions(
                 }
                 let addr = top_level_address_(
                     &mut context.defn_context,
-                    na_map,
+                    na_map.clone(),
                     /* suggest_declaration */ false,
                     addr,
                 );
 
-                modules
+                context.defn_context.named_address_mapping = Some(na_map);
+                let modules = modules
                     .into_iter()
                     .map(|mut def| {
                         let module_addr = Some(check_module_address(context, loc, addr, &mut def));
@@ -947,7 +980,9 @@ fn into_modules_and_extenions(
                         };
                         (module_addr, def)
                     })
-                    .collect()
+                    .collect();
+                context.defn_context.named_address_mapping = None;
+                modules
             }
         }
     }
@@ -969,7 +1004,10 @@ pub(super) fn top_level_address(
 ) -> Address {
     top_level_address_(
         context,
-        context.named_address_mapping.clone().unwrap(),
+        context
+            .named_address_mapping
+            .clone()
+            .expect("Name address map missing when resolving top-level address"),
         suggest_declaration,
         ln,
     )
@@ -1020,7 +1058,10 @@ pub(super) fn top_level_address_opt(
     ln: P::LeadingNameAccess,
 ) -> Option<Address> {
     let name_res = check_valid_address_name(&context.reporter, &ln);
-    let named_address_mapping = context.named_address_mapping.as_ref().unwrap();
+    let named_address_mapping = context
+        .named_address_mapping
+        .as_ref()
+        .expect("Name address map missing when optionally resolving top-level address");
     let sp!(loc, ln_) = ln;
     match ln_ {
         P::LeadingNameAccess_::AnonymousAddress(bytes) => {
@@ -1044,7 +1085,11 @@ pub(super) fn top_level_address_opt(
 }
 
 fn maybe_make_well_known_address(context: &mut Context, loc: Loc, name: Symbol) -> Option<Address> {
-    let named_address_mapping = context.defn_context.named_address_mapping.as_ref().unwrap();
+    let named_address_mapping = context
+        .defn_context
+        .named_address_mapping
+        .as_ref()
+        .expect("Name address map missing for well-known address resolution");
     let addr = named_address_mapping.get(&name).copied()?;
     Some(make_address(
         &mut context.defn_context,
@@ -1146,7 +1191,9 @@ fn duplicate_module_error(
     mident: ModuleIdent,
     old_loc: Loc,
 ) {
-    let old_mident = module_map.get_key(&mident).unwrap();
+    let old_mident = module_map
+        .get_key(&mident)
+        .expect("Old module ident missing");
     let dup_msg = format!("Duplicate definition for module '{}'", mident);
     let prev_msg = format!("Module previously defined here, with '{}'", old_mident);
     context.add_diag(diag!(
@@ -1170,7 +1217,8 @@ fn module_(
         is_spec_module: _,
         is_extension,
         name,
-        mut members,
+        name_loc,
+        members,
         definition_mode: _,
     } = mdef;
     if is_extension {
@@ -1181,7 +1229,7 @@ fn module_(
     }
     let attributes = expand_attributes(context, AttributePosition::Module, attributes);
     let warning_filter = module_warning_filter(context, package_name, &attributes);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     assert!(context.address.is_none());
     assert!(address.is_none());
     set_module_address(context, &name, module_address);
@@ -1195,7 +1243,6 @@ fn module_(
         context.add_diag(diag!(Declarations::InvalidName, (name.loc(), msg)));
     }
 
-    let name_loc = name.0.loc;
     let current_module = sp(name_loc, ModuleIdent_::new(*context.cur_address(), name));
 
     // [NOTE: MOD-EXT] Extensions are currently injected directly into the original module before any
@@ -1212,10 +1259,12 @@ fn module_(
 
     let cur_addr = *context.cur_address();
 
+    let mut members = members.into_iter().map(|m| (false, m)).collect::<Vec<_>>();
+
     if let Some(extension) =
         context.get_module_extension_opt(&cur_addr, &current_module.value.module)
     {
-        members.extend(extension.members);
+        members.extend(extension.members.into_iter().map(|m| (true, m)));
         extension_attributes(context, extension.attributes);
     }
 
@@ -1224,12 +1273,13 @@ fn module_(
     module_self_aliases(&mut new_scope, &current_module);
     let members = members
         .into_iter()
-        .filter_map(|member| {
+        .filter_map(|(from_extension, member)| {
             aliases_from_member(
                 context,
                 &mut new_scope,
                 &mut use_funs_builder,
                 &current_module,
+                from_extension,
                 member,
             )
         })
@@ -1267,13 +1317,17 @@ fn module_(
         }
     }
     let mut use_funs = use_funs(context, use_funs_builder);
-    check_visibility_modifiers(context, &functions, &friends, package_name);
+    check_visibility_modifiers(context, &functions, &constants, &friends, package_name);
 
     let stdlib_definitions = stdlib_definitions(context, loc);
 
     context.pop_alias_scope(Some(&mut use_funs));
 
-    let named_address_map = context.defn_context.named_address_mapping.clone().unwrap();
+    let named_address_map = context
+        .defn_context
+        .named_address_mapping
+        .clone()
+        .expect("Named address map missing when building module definition");
     let target_kind = context.defn_context.target_kind;
     let def = E::ModuleDefinition {
         named_address_map,
@@ -1298,6 +1352,7 @@ fn module_(
 fn check_visibility_modifiers(
     context: &mut Context,
     functions: &UniqueMap<FunctionName, E::Function>,
+    constants: &UniqueMap<ConstantName, E::Constant>,
     friends: &UniqueMap<ModuleIdent, E::Friend>,
     package_name: Option<Symbol>,
 ) {
@@ -1345,6 +1400,7 @@ fn check_visibility_modifiers(
     // mark conflicting friend usage
     let mut friend_usage = friends.iter().next().map(|(_, _, friend)| friend.loc);
     let mut public_package_usage = None;
+
     for (_, _, function) in functions {
         match function.visibility {
             E::Visibility::Friend(loc) if friend_usage.is_none() => {
@@ -1358,8 +1414,60 @@ fn check_visibility_modifiers(
         }
     }
 
+    for (_, _, constant) in constants {
+        // error constants are encoded against their defining module's tables, so they cannot be
+        // given any visibility
+        if let Some(error_attr) = constant
+            .attributes
+            .get_(&known_attributes::AttributeKind_::Error)
+            && !matches!(constant.visibility, E::Visibility::Internal)
+        {
+            use known_attributes::ErrorAttribute as ErrAttr;
+
+            let Some(vis_loc) = constant.visibility.loc() else {
+                context.add_diag(ice!((
+                    constant.loc,
+                    "ICE: Non-internal visibility for error constant must have a loc"
+                )));
+                continue;
+            };
+
+            let msg = format!(
+                "Invalid constant declaration. '#[{attr}]' constants may only be used internal \
+                 to their module, and may not be declared '{vis}'",
+                attr = ErrAttr::ERROR,
+                vis = constant.visibility,
+            );
+
+            let attr_msg = format!("Declared as '#[{}]' here", ErrAttr::ERROR);
+
+            context.add_diag(diag!(
+                Declarations::InvalidVisibilityModifier,
+                (vis_loc, msg),
+                (error_attr.loc, attr_msg)
+            ));
+        }
+
+        match constant.visibility {
+            E::Visibility::Package(loc) => {
+                context.check_feature(package_name, FeatureGate::CrossModuleConstants, loc);
+                public_package_usage = Some(loc);
+            }
+            E::Visibility::Internal => (),
+            E::Visibility::Public(loc) | E::Visibility::Friend(loc) => {
+                let msg = format!(
+                    "Invalid constant declaration. Constants may only be internal or '{}'",
+                    E::Visibility::PACKAGE,
+                );
+                context.add_diag(diag!(Declarations::InvalidVisibilityModifier, (loc, msg)));
+            }
+        }
+    }
+
     // Emit any errors.
-    if public_package_usage.is_some() && friend_usage.is_some() {
+    if let Some(public_package_usage) = public_package_usage
+        && let Some(friend_usage) = friend_usage
+    {
         let friend_error_msg = format!(
             "Cannot define 'friend' modules and use '{}' visibility in the same module",
             E::Visibility::PACKAGE
@@ -1369,10 +1477,7 @@ fn check_visibility_modifiers(
             context.add_diag(diag!(
                 Declarations::InvalidVisibilityModifier,
                 (friend.loc, friend_error_msg.clone()),
-                (
-                    public_package_usage.unwrap(),
-                    package_definition_msg.clone()
-                )
+                (public_package_usage, package_definition_msg.clone())
             ));
         }
         let package_error_msg = format!(
@@ -1385,16 +1490,27 @@ fn check_visibility_modifiers(
             E::Visibility::FRIEND_IDENT,
             E::Visibility::PACKAGE_IDENT
         );
+
+        for (_, _, constant) in constants {
+            // Erroring on `friend` here is odd since we disallow it above, but why not?
+            let (E::Visibility::Package(loc) | E::Visibility::Friend(loc)) = constant.visibility
+            else {
+                continue;
+            };
+            context.add_diag(diag!(
+                Declarations::InvalidVisibilityModifier,
+                (loc, package_error_msg.clone()),
+                (friend_usage, friend_error_msg.clone())
+            ));
+        }
+
         for (_, _, function) in functions {
             match function.visibility {
                 E::Visibility::Friend(loc) => {
                     context.add_diag(diag!(
                         Declarations::InvalidVisibilityModifier,
                         (loc, friend_error_msg.clone()),
-                        (
-                            public_package_usage.unwrap(),
-                            package_definition_msg.clone()
-                        )
+                        (public_package_usage, package_definition_msg.clone())
                     ));
                 }
                 E::Visibility::Package(loc) => {
@@ -1402,7 +1518,7 @@ fn check_visibility_modifiers(
                         Declarations::InvalidVisibilityModifier,
                         (loc, package_error_msg.clone()),
                         (
-                            friend_usage.unwrap(),
+                            friend_usage,
                             &format!("'{}' visibility used here", E::Visibility::FRIEND_IDENT)
                         )
                     ));
@@ -1420,10 +1536,20 @@ fn extension_attributes(context: &mut Context<'_>, attributes: Vec<Spanned<P::At
                 attr.value,
                 P::Attribute_::Mode { .. } | P::Attribute_::External { .. }
             ) {
-                context.add_diag(diag!(
+                let mut diag = diag!(
                     Attributes::ValueWarning,
-                    (attr.loc, "Non-'mode' attributes on module extensions are not supported and will be ignored")
-                ));
+                    (
+                        attr.loc,
+                        format!(
+                            "Ignoring non-'mode' attribute '{}' on module extension",
+                            attr.value.attribute_name()
+                        )
+                    )
+                );
+                diag.add_note(
+                    "Only '#[mode(...)]' and '#[test_only]' are supported on module extensions",
+                );
+                context.add_diag(diag);
             }
         }
     }
@@ -1475,8 +1601,7 @@ fn module_warning_filter(
     context: &mut Context,
     package: Option<Symbol>,
     attributes: &E::Attributes,
-) -> WarningFilters {
-    let mut filters = warning_filter_(context, attributes);
+) -> FilterScope {
     let is_dep = !matches!(
         context.defn_context.target_kind,
         P::TargetKind::Source { .. }
@@ -1485,72 +1610,99 @@ fn module_warning_filter(
         context.env().package_config(pkg).is_dependency
     };
     if is_dep {
-        // For dependencies (non source defs or package deps), we check the filters for errors
-        // but then throw them away and actually ignore _all_ warnings
-        context.all_filter_alls
+        // For dependencies, check attributes for errors, then drop everything.
+        let _ = warning_filter_(context, attributes);
+        dependency_drop_filter_scope()
     } else {
+        let mut overrides = warning_filter_(context, attributes);
         let config = context.env().package_config(package);
-        filters.union(&config.warning_filter);
-        context
-            .warning_filters_table
-            .get_mut()
-            .unwrap()
-            .add(filters)
+        for (id, o) in config.warning_filter.filter_entries() {
+            overrides.entry(id).or_insert(o);
+        }
+        FilterScope::new(overrides)
     }
 }
 
-fn struct_warning_filter(context: &mut Context, attributes: &E::Attributes) -> WarningFilters {
-    let mut wf = warning_filter_(context, attributes);
-    // If a struct is marked as deprecated, do not report unused fields in it.
+fn insert_implicit_allows(
+    overrides: &mut BTreeMap<DiagnosticsID, Spanned<FilterKind>>,
+    ids: Vec<DiagnosticsID>,
+) {
+    for id in ids {
+        overrides
+            .entry(id)
+            .or_insert(sp(Loc::invalid(), FilterKind::Allow));
+    }
+}
+
+fn struct_warning_filter(context: &mut Context, attributes: &E::Attributes) -> FilterScope {
+    let mut overrides = warning_filter_(context, attributes);
     if attributes.contains_key_(&AttributeKind_::Deprecation) {
         let none: Option<Symbol> = None;
-        let new_filters = context.env().filter_from_str(none, FILTER_DEPRECATED);
-        wf.add_all(new_filters);
-        let new_filters = context
-            .env()
-            .filter_from_str(none, FILTER_UNUSED_STRUCT_FIELD);
-        wf.add_all(new_filters);
+        insert_implicit_allows(
+            &mut overrides,
+            context.env().filter_from_str(none, FILTER_DEPRECATED),
+        );
+        insert_implicit_allows(
+            &mut overrides,
+            context
+                .env()
+                .filter_from_str(none, FILTER_UNUSED_STRUCT_FIELD),
+        );
     }
-    context.warning_filters_table.get_mut().unwrap().add(wf)
+    FilterScope::new(overrides)
 }
 
-fn function_warning_filter(context: &mut Context, attributes: &E::Attributes) -> WarningFilters {
-    let mut wf = warning_filter_(context, attributes);
-    // If a function is marked as deprecated, do not report deprecations used within it.
+fn function_warning_filter(context: &mut Context, attributes: &E::Attributes) -> FilterScope {
+    let mut overrides = warning_filter_(context, attributes);
     if attributes.contains_key_(&AttributeKind_::Deprecation) {
         let none: Option<Symbol> = None;
-        let new_filters = context.env().filter_from_str(none, FILTER_DEPRECATED);
-        wf.add_all(new_filters);
+        insert_implicit_allows(
+            &mut overrides,
+            context.env().filter_from_str(none, FILTER_DEPRECATED),
+        );
     }
-    context.warning_filters_table.get_mut().unwrap().add(wf)
+    FilterScope::new(overrides)
 }
 
-fn warning_filter(context: &mut Context, attributes: &E::Attributes) -> WarningFilters {
-    let wf = warning_filter_(context, attributes);
-    context.warning_filters_table.get_mut().unwrap().add(wf)
+fn warning_filter(context: &mut Context, attributes: &E::Attributes) -> FilterScope {
+    FilterScope::new(warning_filter_(context, attributes))
 }
 
-/// Finds the warning filters from the #[allow(_)] attribute and the deprecated #[lint_allow(_)]
-/// attribute.
-fn warning_filter_(context: &Context, attributes: &E::Attributes) -> WarningFiltersBuilder {
-    let mut warning_filters = WarningFiltersBuilder::new_for_source();
-    // Attributes are guaranteedto be sets by now, and everything was flattened during parsing.
-    if let Some(lint_allow) = attributes.get_(&known_attributes::AttributeKind_::LintAllow) {
-        let KnownAttribute::Diagnostic(DiagnosticAttribute::LintAllow { allow_set }) =
-            &lint_allow.value
-        else {
-            context.add_diag(ice!((
-                lint_allow.loc,
-                format!(
-                    "Expected diagnostics based on kind, but found {}",
-                    lint_allow.value.attribute_kind()
-                )
-            )));
-            return WarningFiltersBuilder::new_for_source();
-        };
+fn get_diagnostic_attribute<'a>(
+    context: &Context,
+    attributes: &'a E::Attributes,
+    kind: known_attributes::AttributeKind_,
+) -> Option<&'a DiagnosticAttribute> {
+    let attr = attributes.get_(&kind)?;
+    if let KnownAttribute::Diagnostic(ref diag) = attr.value {
+        Some(diag)
+    } else {
+        context.add_diag(ice!((
+            attr.loc,
+            format!(
+                "Expected diagnostics based on kind, but found {}",
+                attr.value.attribute_kind()
+            )
+        )));
+        None
+    }
+}
 
+fn warning_filter_(
+    context: &Context,
+    attributes: &E::Attributes,
+) -> BTreeMap<DiagnosticsID, Spanned<FilterKind>> {
+    let mut filter_entries = BTreeMap::new();
+
+    if let Some(DiagnosticAttribute::LintAllow {
+        allow_set: lint_allow,
+    }) = get_diagnostic_attribute(
+        context,
+        attributes,
+        known_attributes::AttributeKind_::LintAllow,
+    ) {
         let prefix = Some(DiagnosticAttribute::LINT_SYMBOL);
-        for name in allow_set {
+        for name in lint_allow {
             let filters = context.env().filter_from_str(prefix, name.value);
             if filters.is_empty() {
                 let msg = format!(
@@ -1561,39 +1713,145 @@ fn warning_filter_(context: &Context, attributes: &E::Attributes) -> WarningFilt
                 context.add_diag(diag!(Attributes::ValueWarning, (name.loc, msg)));
                 continue;
             };
-            warning_filters.add_all(filters);
+            insert_implicit_allows(&mut filter_entries, filters);
         }
-    };
+    }
 
-    if let Some(allow) = attributes.get_(&known_attributes::AttributeKind_::Allow) {
-        let KnownAttribute::Diagnostic(DiagnosticAttribute::Allow { allow_set }) = &allow.value
-        else {
-            context.add_diag(ice!((
-                allow.loc,
-                format!(
-                    "Expected diagnostics based on kind, but found {}",
-                    allow.value.attribute_kind()
-                )
-            )));
-            return WarningFiltersBuilder::new_for_source();
-        };
+    if let Some(DiagnosticAttribute::Allow { allow_set }) =
+        get_diagnostic_attribute(context, attributes, known_attributes::AttributeKind_::Allow)
+    {
+        add_filter_entries(context, &mut filter_entries, FilterKind::Allow, allow_set);
+    }
 
-        for (prefix, name) in allow_set {
+    if let Some(DiagnosticAttribute::Warn { warn_set }) =
+        get_diagnostic_attribute(context, attributes, known_attributes::AttributeKind_::Warn)
+    {
+        add_filter_entries(context, &mut filter_entries, FilterKind::Warn, warn_set);
+    }
+
+    if let Some(DiagnosticAttribute::Deny { deny_set }) =
+        get_diagnostic_attribute(context, attributes, known_attributes::AttributeKind_::Deny)
+    {
+        add_filter_entries(context, &mut filter_entries, FilterKind::Deny, deny_set);
+    }
+
+    if let Some(DiagnosticAttribute::Expect { expect_set }) = get_diagnostic_attribute(
+        context,
+        attributes,
+        known_attributes::AttributeKind_::Expect,
+    ) {
+        let mut expect_set = expect_set.clone();
+        expect_set.retain(|(prefix, name)| {
             let prefix = prefix.map(|sym| sym.value);
-            let sp!(name_loc, name) = *name;
-            let filters = context.env().filter_from_str(prefix, name);
-            if filters.is_empty() {
+            let filters = context.env().filter_from_str(prefix, name.value);
+            let is_wildcard = filters.iter().any(|id| {
+                id.category == DIAGNOSTIC_FILTER_WILDCARD || id.code == DIAGNOSTIC_FILTER_WILDCARD
+            });
+            if is_wildcard {
+                let attr_str = format_allow_attr(prefix, name.value);
                 let msg = format!(
-                    "Unknown warning filter '{}'",
-                    format_allow_attr(prefix, name)
+                    "'{attr_str}' matches multiple diagnostics, \
+                     but 'expect' may only be used for individual diagnostics"
                 );
-                context.add_diag(diag!(Attributes::ValueWarning, (name_loc, msg)));
-                continue;
-            };
-            warning_filters.add_all(filters);
+                let mut diag = diag!(Attributes::ValueWarning, (name.loc, msg));
+                diag.add_note(format!("Use '#[allow({attr_str})]' instead"));
+                context.add_diag(diag);
+            }
+            !is_wildcard
+        });
+        add_filter_entries(
+            context,
+            &mut filter_entries,
+            FilterKind::Expect,
+            &expect_set,
+        );
+    }
+
+    filter_entries
+}
+
+fn add_filter_entries(
+    context: &Context<'_>,
+    filter_entries: &mut BTreeMap<DiagnosticsID, Spanned<FilterKind>>,
+    filter_kind: FilterKind,
+    filter_set: &BTreeSet<(Option<Spanned<Symbol>>, Spanned<Symbol>)>,
+) {
+    for (prefix, name) in filter_set {
+        let prefix = prefix.map(|sym| sym.value);
+        let sp!(name_loc, name) = *name;
+        let filters = context.env().filter_from_str(prefix, name);
+        if filters.is_empty() {
+            let msg = format!(
+                "Unknown diagnostic filter '{}'",
+                format_allow_attr(prefix, name)
+            );
+            context.add_diag(diag!(Attributes::ValueWarning, (name_loc, msg)));
+            continue;
+        };
+        for id in filters {
+            use std::collections::btree_map::Entry;
+            match filter_entries.entry(id) {
+                Entry::Vacant(e) => {
+                    e.insert(sp(name_loc, filter_kind));
+                }
+                Entry::Occupied(e) if e.get().value == filter_kind => {
+                    // Same-kind overlap. Textual duplicates within one attribute
+                    // (`#[allow(unused, unused)]`) are rejected by the parser, so this
+                    // branch is reachable only via implicit-allow insertion (e.g.
+                    // `#[lint_allow]`) overlapping with a user-written filter, or two
+                    // distinct filter names that expand to overlapping ids. If the
+                    // existing entry has a real loc, both insertions came from
+                    // user-written attributes — that should be unreachable.
+                    let prev_loc = e.get().loc;
+                    debug_assert!(
+                        prev_loc == Loc::invalid(),
+                        "ICE within-attribute same-kind duplicate reached add_filter_entries; \
+                         parser dedup should have caught it"
+                    );
+                }
+                Entry::Occupied(mut e) => {
+                    let sp!(prev_loc, prev_kind) = *e.get();
+                    emit_diagnostic_filter_conflict(context, prefix, name, name_loc, prev_loc);
+                    let winner = FilterKind::resolve_conflict(prev_kind, filter_kind);
+                    let winner_loc = if winner == filter_kind {
+                        name_loc
+                    } else {
+                        prev_loc
+                    };
+                    e.insert(sp(winner_loc, winner));
+                }
+            }
         }
+    }
+}
+
+fn emit_diagnostic_filter_conflict(
+    context: &Context<'_>,
+    prefix: Option<Symbol>,
+    name: Symbol,
+    name_loc: Loc,
+    prev_loc: Loc,
+) {
+    let filter_name = format_allow_attr(prefix, name);
+    let (fst_loc, snd_loc) = if prev_loc > name_loc {
+        (prev_loc, name_loc)
+    } else {
+        (name_loc, prev_loc)
     };
-    warning_filters
+    context.add_diag(diag!(
+        Attributes::AmbiguousAttributeValue,
+        (
+            snd_loc,
+            format!(
+                "Conflicting filter for '{filter_name}' \
+                 specified in the same attribute"
+            )
+        ),
+        (
+            fst_loc,
+            format!("Conflicting filter for '{filter_name}' specified here")
+        )
+    ));
 }
 
 //**************************************************************************************************
@@ -1731,6 +1989,7 @@ fn aliases_from_member(
     acc: &mut AliasMapBuilder,
     use_funs: &mut UseFunsBuilder,
     current_module: &ModuleIdent,
+    from_extension: bool,
     member: P::ModuleMember,
 ) -> Option<P::ModuleMember> {
     macro_rules! check_name_and_add_implicit_alias {
@@ -1742,7 +2001,11 @@ fn aliases_from_member(
                     n.clone(),
                     $kind,
                 ) {
-                    duplicate_module_member(context, loc, n)
+                    if from_extension {
+                        extension_duplicate_module_member(context, loc, n)
+                    } else {
+                        duplicate_module_member(context, loc, n)
+                    }
                 }
             }
         }};
@@ -1750,7 +2013,7 @@ fn aliases_from_member(
 
     match member {
         P::ModuleMember::Use(u) => {
-            use_(context, acc, use_funs, u);
+            use_(context, acc, use_funs, from_extension, u);
             None
         }
         f @ P::ModuleMember::Friend(_) => {
@@ -1785,7 +2048,15 @@ fn uses(context: &mut Context, uses: Vec<P::UseDecl>) -> (AliasMapBuilder, UseFu
     let mut new_scope = context.new_alias_map_builder();
     let mut use_funs = UseFunsBuilder::new();
     for u in uses {
-        use_(context, &mut new_scope, &mut use_funs, u);
+        // This function is only called when handling expressions, so we elide extension
+        // information for the purposes of error messages.
+        use_(
+            context,
+            &mut new_scope,
+            &mut use_funs,
+            /* from_extension */ false,
+            u,
+        );
     }
     (new_scope, use_funs)
 }
@@ -1794,6 +2065,7 @@ fn use_(
     context: &mut Context,
     acc: &mut AliasMapBuilder,
     use_funs: &mut UseFunsBuilder,
+    from_extension: bool,
     u: P::UseDecl,
 ) {
     let P::UseDecl {
@@ -1807,11 +2079,27 @@ fn use_(
         P::Use::NestedModuleUses(address, use_decls) => {
             for (module, use_) in use_decls {
                 let mident = sp(module.loc(), P::ModuleIdent_ { address, module });
-                module_use(context, acc, use_funs, mident, &attributes, use_);
+                module_use(
+                    context,
+                    acc,
+                    use_funs,
+                    mident,
+                    from_extension,
+                    &attributes,
+                    use_,
+                );
             }
         }
         P::Use::ModuleUse(mident, use_) => {
-            module_use(context, acc, use_funs, mident, &attributes, use_);
+            module_use(
+                context,
+                acc,
+                use_funs,
+                mident,
+                from_extension,
+                &attributes,
+                use_,
+            );
         }
         P::Use::Fun {
             visibility,
@@ -1859,6 +2147,7 @@ fn module_use(
     acc: &mut AliasMapBuilder,
     use_funs: &mut UseFunsBuilder,
     in_mident: P::ModuleIdent,
+    from_extension: bool,
     attributes: &E::Attributes,
     muse: P::ModuleUse,
 ) {
@@ -1880,7 +2169,11 @@ fn module_use(
             }
 
             if let Err(old_loc) = acc.add_module_alias($alias.clone(), $ident) {
-                duplicate_module_alias(context, old_loc, $alias)
+                if from_extension {
+                    extension_duplicate_module_alias(context, old_loc, $alias)
+                } else {
+                    duplicate_module_alias(context, old_loc, $alias)
+                }
             }
         }};
     }
@@ -1958,7 +2251,11 @@ fn module_use(
                         Some(alias) => alias,
                     };
                 if let Err(old_loc) = acc.add_member_alias(alias, mident, member, member_kind) {
-                    duplicate_module_member(context, old_loc, alias)
+                    if from_extension {
+                        extension_duplicate_module_member(context, old_loc, alias)
+                    } else {
+                        duplicate_module_member(context, old_loc, alias)
+                    }
                 }
                 if matches!(member_kind, ModuleMemberKind::Function) {
                     // remove any previously declared alias to keep in sync with the member alias
@@ -2057,26 +2354,54 @@ fn explicit_use_fun(
 
 fn duplicate_module_alias(context: &mut Context, old_loc: Loc, alias: Name) {
     let msg = format!(
-        "Duplicate module alias '{}'. Module aliases must be unique within a given namespace",
+        "Duplicate alias '{}'. Module aliases must be unique within a given namespace",
         alias
     );
     context.add_diag(diag!(
         Declarations::DuplicateItem,
         (alias.loc, msg),
-        (old_loc, "Alias previously defined here"),
+        (old_loc, "Module member or alias previously defined here"),
     ));
 }
 
 fn duplicate_module_member(context: &mut Context, old_loc: Loc, alias: Name) {
     let msg = format!(
-        "Duplicate module member or alias '{}'. Top level names in a namespace must be unique",
+        "Duplicate module member '{}'. Top level names in a namespace must be unique",
         alias
     );
     context.add_diag(diag!(
         Declarations::DuplicateItem,
         (alias.loc, msg),
-        (old_loc, "Alias previously defined here"),
+        (old_loc, "Module member or alias previously defined here"),
     ));
+}
+
+fn extension_duplicate_module_alias(context: &mut Context, old_loc: Loc, alias: Name) {
+    let msg = format!(
+        "Module extension defines alias '{}', which shadows previous definition",
+        alias
+    );
+    let mut diag = diag!(
+        Declarations::DuplicateItem,
+        (alias.loc, msg),
+        (old_loc, "Module member or alias previously defined here"),
+    );
+    diag.add_note("Top level names in a namespace must be unique");
+    context.add_diag(diag);
+}
+
+fn extension_duplicate_module_member(context: &mut Context, old_loc: Loc, alias: Name) {
+    let msg = format!(
+        "Module extension defines member '{}', which shadows previous definition",
+        alias
+    );
+    let mut diag = diag!(
+        Declarations::DuplicateItem,
+        (alias.loc, msg),
+        (old_loc, "Module member or alias previously defined here"),
+    );
+    diag.add_note("Top level names in a namespace must be unique");
+    context.add_diag(diag);
 }
 
 fn unused_alias(context: &mut Context, _kind: &str, alias: Name) {
@@ -2138,7 +2463,7 @@ fn struct_def_(
     } = pstruct;
     let attributes = expand_attributes(context, AttributePosition::Struct, attributes);
     let warning_filter = struct_warning_filter(context, &attributes);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let type_parameters = datatype_type_parameters(context, pty_params);
     context.push_type_parameters(type_parameters.iter().map(|tp| &tp.name));
     let abilities = ability_set(context, "modifier", abilities_vec);
@@ -2225,7 +2550,7 @@ fn enum_def_(
     } = penum;
     let attributes = expand_attributes(context, AttributePosition::Enum, attributes);
     let warning_filter = warning_filter(context, &attributes);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let type_parameters = datatype_type_parameters(context, pty_params);
     context.push_type_parameters(type_parameters.iter().map(|tp| &tp.name));
     let abilities = ability_set(context, "modifier", abilities_vec);
@@ -2408,13 +2733,14 @@ fn constant_(
         doc,
         attributes: pattributes,
         loc,
+        visibility: pvisibility,
         name,
         signature: psignature,
         value: pvalue,
     } = pconstant;
     let attributes = expand_attributes(context, AttributePosition::Constant, pattributes);
     let warning_filter = warning_filter(context, &attributes);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let signature = type_(context, psignature);
     let value = *exp(context, Box::new(pvalue));
     let constant = E::Constant {
@@ -2423,6 +2749,7 @@ fn constant_(
         index,
         attributes,
         loc,
+        visibility: visibility(pvisibility),
         signature,
         value,
     };
@@ -2465,7 +2792,7 @@ fn function_(
     } = pfunction;
     let attributes = expand_attributes(context, AttributePosition::Function, pattributes);
     let warning_filter = function_warning_filter(context, &attributes);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     if let (Some(entry_loc), Some(macro_loc)) = (entry, macro_) {
         let e_msg = format!(
             "Invalid function declaration. \
@@ -2495,9 +2822,11 @@ fn function_(
         let current_package = context.current_package();
         context.check_feature(current_package, FeatureGate::MacroFuns, macro_loc);
     }
+
     let visibility = visibility(pvisibility);
     let signature = function_signature(context, macro_, psignature);
     let body = function_body(context, pbody);
+
     if let Some((m, use_funs_builder)) = module_and_use_funs {
         let implicit = E::ImplicitUseFunCandidate {
             loc: name.loc(),
@@ -2522,6 +2851,7 @@ fn function_(
         signature,
         body,
     };
+    context.pop_alias_scope(None);
     context.pop_alias_scope(None);
     context.pop_warning_filter_scope();
     (name, fdef)
@@ -2552,6 +2882,10 @@ fn function_signature(
         .into_iter()
         .map(|(pmut, v, t)| (mutability(context, v.loc(), pmut), v, type_(context, t)))
         .collect::<Vec<_>>();
+    context.push_lambda_parameters(parameters.iter().filter_map(|(_, v, t)| match &t.value {
+        E::Type_::Fun(_, _) => Some(&v.0),
+        _ => None,
+    }));
     for (_, v, _) in &parameters {
         check_valid_function_parameter_name(context.reporter(), is_macro, v)
     }
@@ -2685,10 +3019,10 @@ fn sequence(context: &mut Context, loc: Loc, seq: P::Sequence) -> E::Sequence {
             return None;
         }
         let seq_item = items.pop_front().unwrap();
-        if let E::SequenceItem_::Seq(exp) = &seq_item.value {
-            if exp.value == E::Exp_::UnresolvedError {
-                return Some(exp.clone());
-            }
+        if let E::SequenceItem_::Seq(exp) = &seq_item.value
+            && exp.value == E::Exp_::UnresolvedError
+        {
+            return Some(exp.clone());
         }
         items.push_front(seq_item);
         None
@@ -2932,10 +3266,6 @@ fn exp(context: &mut Context, pe: Box<P::Exp>) -> Box<E::Exp> {
         PE::Continue(name) => EE::Continue(name),
         PE::Dereference(pe) => EE::Dereference(exp(context, pe)),
         PE::UnaryExp(op, pe) => EE::UnaryExp(op, exp(context, pe)),
-        PE::BinopExp(_pl, op, _pr) if op.value.is_spec_only() => {
-            context.spec_deprecated(loc, /* is_error */ true);
-            EE::UnresolvedError
-        }
         e_ @ PE::BinopExp(..) => {
             process_binops!(
                 (P::BinOp, Loc),
@@ -3426,16 +3756,11 @@ fn match_pattern(context: &mut Context, sp!(loc, pat_): P::MatchPattern) -> E::M
                             (mloc, msg),
                             (head_ctor_name.loc, nmsg)
                         ));
-                        error_pattern!()
-                    } else {
-                        sp(
-                            loc,
-                            EP::ModuleAccessName(
-                                head_ctor_name,
-                                optional_sp_types(context, pts_opt),
-                            ),
-                        )
                     }
+                    sp(
+                        loc,
+                        EP::ModuleAccessName(head_ctor_name, optional_sp_types(context, pts_opt)),
+                    )
                 }
             }
         }

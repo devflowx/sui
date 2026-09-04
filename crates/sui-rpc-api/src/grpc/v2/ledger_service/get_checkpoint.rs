@@ -1,24 +1,29 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::CheckpointNotFoundError;
 use crate::ErrorReason;
 use crate::RpcError;
 use crate::RpcService;
+use crate::error::CheckpointNotFoundError;
+use mysten_common::ZipDebugEqIteratorExt;
 use prost_types::FieldMask;
 use sui_rpc::field::FieldMaskTree;
 use sui_rpc::field::FieldMaskUtil;
 use sui_rpc::merge::Merge;
 use sui_rpc::proto::google::rpc::bad_request::FieldViolation;
-use sui_rpc::proto::sui::rpc::v2::get_checkpoint_request::CheckpointId;
 use sui_rpc::proto::sui::rpc::v2::Checkpoint;
+use sui_rpc::proto::sui::rpc::v2::Event;
 use sui_rpc::proto::sui::rpc::v2::ExecutedTransaction;
 use sui_rpc::proto::sui::rpc::v2::GetCheckpointRequest;
 use sui_rpc::proto::sui::rpc::v2::GetCheckpointResponse;
 use sui_rpc::proto::sui::rpc::v2::ObjectSet;
+use sui_rpc::proto::sui::rpc::v2::TransactionEvents;
+use sui_rpc::proto::sui::rpc::v2::get_checkpoint_request::CheckpointId;
 use sui_sdk_types::Digest;
+use sui_types::balance_change::derive_balance_changes_2;
+use sui_types::full_checkpoint_content::ObjectSet as TypesObjectSet;
 
-pub const READ_MASK_DEFAULT: &str = "sequence_number,digest";
+pub const READ_MASK_DEFAULT: &str = crate::read_mask_defaults::CHECKPOINT;
 
 #[tracing::instrument(skip(service))]
 pub fn get_checkpoint(
@@ -65,6 +70,17 @@ pub fn get_checkpoint(
     let sequence_number = summary.sequence_number;
     let timestamp_ms = summary.timestamp_ms;
 
+    let latest_checkpoint = service
+        .reader
+        .inner()
+        .get_latest_checkpoint()?
+        .sequence_number;
+    let lowest_available_checkpoint = service.reader.get_lowest_available_checkpoint()?;
+
+    if !(lowest_available_checkpoint..=latest_checkpoint).contains(&sequence_number) {
+        return Err(CheckpointNotFoundError::sequence_number(sequence_number).into());
+    }
+
     let mut checkpoint = Checkpoint::default();
 
     checkpoint.merge(summary, &read_mask);
@@ -105,25 +121,25 @@ pub fn get_checkpoint(
             }
 
             if let Some(submask) = read_mask.subtree(Checkpoint::TRANSACTIONS_FIELD.name) {
+                // Share a single JSON-rendering budget across every event in
+                // every transaction in the checkpoint. Without this, an
+                // unauthenticated `GetCheckpoint` with a permissive `read_mask`
+                // multiplies one input checkpoint into thousands of per-event
+                // renders, each with its own `max_json_move_value_size` budget.
+                let mut json_budget = service.config.max_json_move_value_response_size();
                 checkpoint.transactions = checkpoint_data
                     .transactions
                     .into_iter()
                     .map(|t| {
-                        let balance_changes = submask
-                            .contains(ExecutedTransaction::BALANCE_CHANGES_FIELD)
-                            .then(|| {
-                                service
-                                    .reader
-                                    .get_transaction_info(&t.transaction.digest())
-                                    .map(|info| {
-                                        info.balance_changes
-                                            .into_iter()
-                                            .map(sui_rpc::proto::sui::rpc::v2::BalanceChange::from)
-                                            .collect::<Vec<_>>()
-                                    })
-                            })
-                            .flatten()
-                            .unwrap_or_default();
+                        let balance_changes =
+                            if submask.contains(ExecutedTransaction::BALANCE_CHANGES_FIELD) {
+                                derive_balance_changes_2(&t.effects, &checkpoint_data.object_set)
+                                    .into_iter()
+                                    .map(Into::into)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                         let mut transaction = ExecutedTransaction::merge_from(&t, &submask);
                         transaction.checkpoint = submask
                             .contains(ExecutedTransaction::CHECKPOINT_FIELD)
@@ -132,6 +148,29 @@ pub fn get_checkpoint(
                             .contains(ExecutedTransaction::TIMESTAMP_FIELD)
                             .then(|| sui_rpc::proto::timestamp_ms_to_proto(timestamp_ms));
                         transaction.balance_changes = balance_changes;
+
+                        if let Some(events_mask) =
+                            submask.subtree(ExecutedTransaction::EVENTS_FIELD.name)
+                            && let Some(event_mask) =
+                                events_mask.subtree(TransactionEvents::EVENTS_FIELD.name)
+                            && event_mask.contains(Event::JSON_FIELD.name)
+                            && let Some(events) = transaction.events.as_mut()
+                            && let Some(sdk_events) = &t.events
+                        {
+                            for (message, event) in
+                                events.events.iter_mut().zip_debug_eq(&sdk_events.data)
+                            {
+                                message.json = service
+                                    .render_json_with_budget(
+                                        &event.type_,
+                                        &event.contents,
+                                        &TypesObjectSet::default(),
+                                        &mut json_budget,
+                                    )
+                                    .map(Box::new);
+                            }
+                        }
+
                         transaction
                     })
                     .collect();

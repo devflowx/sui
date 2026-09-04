@@ -13,25 +13,33 @@ use move_binary_format::{
         FieldHandleIndex, FunctionDefinitionIndex, FunctionHandleIndex, StructDefinitionIndex,
         TableIndex,
     },
+    partial_vm_error_with_debug_message, safe_assert,
 };
 use move_core_types::vm_status::StatusCode;
+use move_vm_config::verifier::VerifierConfig;
 
 pub struct InstructionConsistency<'a> {
+    config: &'a VerifierConfig,
     module: &'a CompiledModule,
     current_function: Option<FunctionDefinitionIndex>,
 }
 
 impl<'a> InstructionConsistency<'a> {
-    pub fn verify_module(module: &'a CompiledModule) -> VMResult<()> {
-        Self::verify_module_impl(module).map_err(|e| e.finish(Location::Module(module.self_id())))
+    pub fn verify_module(config: &'a VerifierConfig, module: &'a CompiledModule) -> VMResult<()> {
+        Self::verify_module_impl(config, module)
+            .map_err(|e| e.finish(Location::Module(module.self_id())))
     }
 
-    fn verify_module_impl(module: &'a CompiledModule) -> PartialVMResult<()> {
+    fn verify_module_impl(
+        config: &'a VerifierConfig,
+        module: &'a CompiledModule,
+    ) -> PartialVMResult<()> {
         for (idx, func_def) in module.function_defs().iter().enumerate() {
             match &func_def.code {
                 None => (),
                 Some(code) => {
                     let checker = Self {
+                        config,
                         module,
                         current_function: Some(FunctionDefinitionIndex(idx as TableIndex)),
                     };
@@ -83,45 +91,57 @@ impl<'a> InstructionConsistency<'a> {
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 MutBorrowGlobalDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     self.check_struct_type_op(offset, *idx, /* generic */ false)?;
                 }
                 MutBorrowGlobalGenericDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     let struct_inst = self.module.struct_instantiation_at(*idx);
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 ImmBorrowGlobalDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     self.check_struct_type_op(offset, *idx, /* generic */ false)?;
                 }
                 ImmBorrowGlobalGenericDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     let struct_inst = self.module.struct_instantiation_at(*idx);
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 ExistsDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     self.check_struct_type_op(offset, *idx, /* generic */ false)?;
                 }
                 ExistsGenericDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     let struct_inst = self.module.struct_instantiation_at(*idx);
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 MoveFromDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     self.check_struct_type_op(offset, *idx, /* generic */ false)?;
                 }
                 MoveFromGenericDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     let struct_inst = self.module.struct_instantiation_at(*idx);
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 MoveToDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     self.check_struct_type_op(offset, *idx, /* generic */ false)?;
                 }
                 MoveToGenericDeprecated(idx) => {
+                    safe_assert!(!self.config.deprecate_global_storage_ops);
                     let struct_inst = self.module.struct_instantiation_at(*idx);
                     self.check_struct_type_op(offset, struct_inst.def, /* generic */ true)?;
                 }
                 VecPack(_, num) | VecUnpack(_, num) => {
                     if *num > u16::MAX as u64 {
-                        return Err(PartialVMError::new(StatusCode::CONSTRAINT_NOT_SATISFIED)
-                            .at_code_offset(self.current_function(), offset as CodeOffset)
-                            .with_message("VecPack/VecUnpack argument out of range".to_string()));
+                        return Err(partial_vm_error_with_debug_message!(
+                            CONSTRAINT_NOT_SATISFIED,
+                            "VecPack/VecUnpack argument out of range".to_string()
+                        )
+                        .at_code_offset(self.current_function(), offset as CodeOffset));
                     }
                 }
 

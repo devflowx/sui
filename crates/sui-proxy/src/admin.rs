@@ -10,29 +10,30 @@ use crate::peers::{AllowedPeer, SuiNodeProvider};
 use crate::var;
 use anyhow::Error;
 use anyhow::Result;
-use axum::{extract::DefaultBodyLimit, middleware, routing::post, Extension, Router};
+use axum::{
+    Extension, Router, extract::DefaultBodyLimit, http::StatusCode, middleware, routing::post,
+};
 use fastcrypto::ed25519::{Ed25519KeyPair, Ed25519PublicKey};
 use fastcrypto::traits::{KeyPair, ToFromBytes};
-use std::fs;
-use std::io::BufReader;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use sui_tls::SUI_VALIDATOR_SERVER_NAME;
 use sui_tls::{
-    rustls::ServerConfig, AllowAll, ClientCertVerifier, SelfSignedCertificate, TlsAcceptor,
+    AllowAll, ClientCertVerifier, SelfSignedCertificate, TlsAcceptor, rustls::ServerConfig,
 };
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::{
+    LatencyUnit,
     timeout::TimeoutLayer,
     trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
-    LatencyUnit,
 };
-use tracing::{info, Level};
+use tracing::{Level, info};
 
 /// Configure our graceful shutdown scenarios
-pub async fn shutdown_signal(h: axum_server::Handle) {
+pub async fn shutdown_signal(h: axum_server::Handle<SocketAddr>) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -117,9 +118,10 @@ pub fn app(
         // Enforce on all routes.
         // If the request does not complete within the specified timeout it will be aborted
         // and a 408 Request Timeout response will be sent.
-        .layer(TimeoutLayer::new(Duration::from_secs(
-            timeout_secs.unwrap_or(20),
-        )))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(timeout_secs.unwrap_or(20)),
+        ))
         .layer(Extension(relay))
         .layer(Extension(labels))
         .layer(Extension(client))
@@ -146,19 +148,22 @@ pub async fn server(
     app: Router,
     acceptor: Option<TlsAcceptor>,
 ) -> std::io::Result<()> {
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+
     // setup our graceful shutdown
     let handle = axum_server::Handle::new();
     // Spawn a task to gracefully shutdown server.
     tokio::spawn(shutdown_signal(handle.clone()));
 
     if let Some(verify_peers) = acceptor {
-        axum_server::Server::from_tcp(listener)
+        axum_server::Server::from_listener(listener)
             .acceptor(verify_peers)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
     } else {
-        axum_server::Server::from_tcp(listener)
+        axum_server::Server::from_listener(listener)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
@@ -179,35 +184,21 @@ pub fn generate_self_cert(hostname: String) -> CertKeyPair {
 }
 
 /// Load a certificate for use by the listening service
-fn load_certs(filename: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
-    let certfile = fs::File::open(filename)
-        .unwrap_or_else(|e| panic!("cannot open certificate file: {}; {}", filename, e));
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader)
+fn load_certs(filename: &str) -> Vec<CertificateDer<'static>> {
+    CertificateDer::pem_file_iter(filename)
+        .unwrap_or_else(|e| panic!("cannot open certificate file: {}; {}", filename, e))
         .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+        .unwrap_or_else(|e| panic!("cannot parse certificate file: {}; {}", filename, e))
 }
 
 /// Load a private key
-fn load_private_key(filename: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
-    let keyfile = fs::File::open(filename)
-        .unwrap_or_else(|e| panic!("cannot open private key file {}; {}", filename, e));
-    let mut reader = BufReader::new(keyfile);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return key.into(),
-            None => break,
-            _ => {}
-        }
-    }
-
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
+fn load_private_key(filename: &str) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::from_pem_file(filename).unwrap_or_else(|e| {
+        panic!(
+            "cannot load private key from {} (encrypted keys not supported): {}",
+            filename, e
+        )
+    })
 }
 
 /// load the static keys we'll use to allow external non-validator nodes to push metrics
@@ -255,6 +246,11 @@ pub fn create_server_cert_enforce_peer(
     dynamic_peers: DynamicPeerValidationConfig,
     static_peers: Option<StaticPeerValidationConfig>,
 ) -> Result<(ServerConfig, Option<SuiNodeProvider>), sui_tls::rustls::Error> {
+    // Capture before the cert/key destructure moves out the rest of the struct.
+    let hashi_object_id = dynamic_peers.hashi_object_id.clone();
+    let rpc_url = dynamic_peers.url.clone();
+    let poll_interval = dynamic_peers.interval;
+
     let (Some(certificate_path), Some(private_key_path)) =
         (dynamic_peers.certificate_file, dynamic_peers.private_key)
     else {
@@ -265,7 +261,7 @@ pub fn create_server_cert_enforce_peer(
     let static_peers = load_static_peers(static_peers).map_err(|e| {
         sui_tls::rustls::Error::General(format!("unable to load static pub keys: {}", e))
     })?;
-    let allower = SuiNodeProvider::new(dynamic_peers.url, dynamic_peers.interval, static_peers);
+    let allower = SuiNodeProvider::new(rpc_url, poll_interval, static_peers, hashi_object_id);
     allower.poll_peer_list();
     let c = ClientCertVerifier::new(allower.clone(), SUI_VALIDATOR_SERVER_NAME.to_string())
         .rustls_server_config(

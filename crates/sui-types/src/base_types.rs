@@ -2,14 +2,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::accumulator_root::extract_balance_type_from_field;
-use crate::accumulator_root::is_balance_accumulator_field;
+use crate::MOVE_STDLIB_ADDRESS;
+use crate::MoveTypeTagTrait;
+use crate::MoveTypeTagTraitGeneric;
+use crate::SUI_CLOCK_OBJECT_ID;
+use crate::SUI_FRAMEWORK_ADDRESS;
+use crate::SUI_SYSTEM_ADDRESS;
+use crate::accumulator_root::accumulator_value_balance_type_maybe;
 use crate::balance::Balance;
+use crate::coin::COIN_MODULE_NAME;
+use crate::coin::COIN_STRUCT_NAME;
 use crate::coin::Coin;
 use crate::coin::CoinMetadata;
 use crate::coin::TreasuryCap;
-use crate::coin::COIN_MODULE_NAME;
-use crate::coin::COIN_STRUCT_NAME;
 use crate::coin_registry::Currency;
 pub use crate::committee::EpochId;
 use crate::crypto::{
@@ -22,40 +27,35 @@ use crate::dynamic_field::{DYNAMIC_FIELD_FIELD_STRUCT_NAME, DYNAMIC_FIELD_MODULE
 use crate::effects::TransactionEffects;
 use crate::effects::TransactionEffectsAPI;
 use crate::epoch_data::EpochData;
-use crate::error::ExecutionErrorKind;
 use crate::error::SuiError;
+use crate::error::SuiErrorKind;
 use crate::error::{ExecutionError, SuiResult};
-use crate::gas_coin::GasCoin;
+use crate::execution_status::ExecutionErrorKind;
 use crate::gas_coin::GAS;
-use crate::governance::StakedSui;
+use crate::gas_coin::GasCoin;
 use crate::governance::STAKED_SUI_STRUCT_NAME;
 use crate::governance::STAKING_POOL_MODULE_NAME;
+use crate::governance::StakedSui;
 use crate::id::RESOLVED_SUI_ID;
 use crate::messages_checkpoint::CheckpointTimestamp;
 use crate::multisig::MultiSigPublicKey;
 use crate::object::{Object, Owner};
 use crate::parse_sui_struct_tag;
 use crate::signature::GenericSignature;
+use crate::sui_serde::Readable;
 use crate::sui_serde::to_custom_deser_error;
 use crate::sui_serde::to_sui_struct_tag_string;
-use crate::sui_serde::Readable;
 use crate::transaction::Transaction;
 use crate::transaction::VerifiedTransaction;
 use crate::zk_login_authenticator::ZkLoginAuthenticator;
-use crate::MoveTypeTagTrait;
-use crate::MoveTypeTagTraitGeneric;
-use crate::MOVE_STDLIB_ADDRESS;
-use crate::SUI_CLOCK_OBJECT_ID;
-use crate::SUI_FRAMEWORK_ADDRESS;
-use crate::SUI_SYSTEM_ADDRESS;
 use anyhow::anyhow;
 use fastcrypto::encoding::decode_bytes_hex;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::hash::HashFunction;
 use fastcrypto::traits::AllowedRng;
 use fastcrypto_zkp::bn254::zk_login::ZkLoginInputs;
-use move_binary_format::file_format::SignatureToken;
 use move_binary_format::CompiledModule;
+use move_binary_format::file_format::SignatureToken;
 use move_bytecode_utils::resolve_struct;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::annotated_value as A;
@@ -66,15 +66,16 @@ use move_core_types::language_storage::StructTag;
 use move_core_types::language_storage::TypeTag;
 use rand::Rng;
 use schemars::JsonSchema;
-use serde::ser::Error;
-use serde::ser::SerializeSeq;
 use serde::Deserializer;
 use serde::Serializer;
+use serde::ser::Error;
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use serde_with::DeserializeAs;
 use serde_with::SerializeAs;
+use serde_with::serde_as;
 use shared_crypto::intent::HashingIntentScope;
+use std::borrow::Cow;
 use std::cmp::max;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
@@ -226,6 +227,37 @@ impl FullObjectRef {
 /// based on the object ID and start version.
 pub type ConsensusObjectSequenceKey = (ObjectID, SequenceNumber);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusObjectVersion {
+    pub initial_shared_version: SequenceNumber,
+    pub version: SequenceNumber,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemObjectVersions {
+    accumulator_version: Option<ConsensusObjectVersion>,
+}
+
+impl SystemObjectVersions {
+    pub fn new(accumulator_version: Option<ConsensusObjectVersion>) -> Self {
+        Self {
+            accumulator_version,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
+
+    pub fn get(&self, object_id: &ObjectID) -> Option<ConsensusObjectVersion> {
+        if *object_id == crate::SUI_ACCUMULATOR_ROOT_OBJECT_ID {
+            self.accumulator_version
+        } else {
+            panic!("{object_id} is not an implicitly read system object")
+        }
+    }
+}
+
 /// Wrapper around StructTag with a space-efficient representation for common types like coins
 /// The StructTag for a gas coin is 84 bytes, so using 1 byte instead is a win.
 /// The inner representation is private to prevent incorrectly constructing an `Other` instead of
@@ -308,18 +340,24 @@ impl MoveObjectType {
         }
     }
 
-    pub fn type_params(&self) -> Vec<TypeTag> {
+    pub fn type_params(&self) -> Vec<Cow<'_, TypeTag>> {
         match &self.0 {
-            MoveObjectType_::GasCoin => vec![GAS::type_tag()],
+            MoveObjectType_::GasCoin => vec![Cow::Owned(GAS::type_tag())],
             MoveObjectType_::StakedSui => vec![],
-            MoveObjectType_::Coin(inner) => vec![inner.clone()],
+            MoveObjectType_::Coin(inner) => vec![Cow::Borrowed(inner)],
             MoveObjectType_::SuiBalanceAccumulatorField => {
                 Self::balance_accumulator_field_type_params(GAS::type_tag())
+                    .into_iter()
+                    .map(Cow::Owned)
+                    .collect()
             }
             MoveObjectType_::BalanceAccumulatorField(inner) => {
                 Self::balance_accumulator_field_type_params(inner.clone())
+                    .into_iter()
+                    .map(Cow::Owned)
+                    .collect()
             }
-            MoveObjectType_::Other(s) => s.type_params.clone(),
+            MoveObjectType_::Other(s) => s.type_params.iter().map(Cow::Borrowed).collect(),
         }
     }
 
@@ -496,9 +534,7 @@ impl MoveObjectType {
                 false
             }
             MoveObjectType_::SuiBalanceAccumulatorField
-            | MoveObjectType_::BalanceAccumulatorField(_) => {
-                true // These are dynamic fields
-            }
+            | MoveObjectType_::BalanceAccumulatorField(_) => true, // These are dynamic fields
             MoveObjectType_::Other(s) => DynamicFieldInfo::is_dynamic_field(s),
         }
     }
@@ -506,10 +542,11 @@ impl MoveObjectType {
     pub fn try_extract_field_name(&self, type_: &DynamicFieldType) -> SuiResult<TypeTag> {
         match &self.0 {
             MoveObjectType_::GasCoin | MoveObjectType_::StakedSui | MoveObjectType_::Coin(_) => {
-                Err(SuiError::ObjectDeserializationError {
+                Err(SuiErrorKind::ObjectDeserializationError {
                     error: "Error extracting dynamic object name from specialized object type"
                         .to_string(),
-                })
+                }
+                .into())
             }
             MoveObjectType_::SuiBalanceAccumulatorField
             | MoveObjectType_::BalanceAccumulatorField(_) => {
@@ -523,10 +560,11 @@ impl MoveObjectType {
     pub fn try_extract_field_value(&self) -> SuiResult<TypeTag> {
         match &self.0 {
             MoveObjectType_::GasCoin | MoveObjectType_::StakedSui | MoveObjectType_::Coin(_) => {
-                Err(SuiError::ObjectDeserializationError {
+                Err(SuiErrorKind::ObjectDeserializationError {
                     error: "Error extracting dynamic object value from specialized object type"
                         .to_string(),
-                })
+                }
+                .into())
             }
             MoveObjectType_::SuiBalanceAccumulatorField
             | MoveObjectType_::BalanceAccumulatorField(_) => {
@@ -544,17 +582,13 @@ impl MoveObjectType {
             MoveObjectType_::Coin(inner) => {
                 Coin::is_coin(s) && s.type_params.len() == 1 && inner == &s.type_params[0]
             }
-            MoveObjectType_::SuiBalanceAccumulatorField => {
-                is_balance_accumulator_field(s)
-                    && extract_balance_type_from_field(s)
-                        .map(|t| GAS::is_gas_type(&t))
-                        .unwrap_or(false)
-            }
+            MoveObjectType_::SuiBalanceAccumulatorField => accumulator_value_balance_type_maybe(s)
+                .map(|t| GAS::is_gas_type(&t))
+                .unwrap_or(false),
             MoveObjectType_::BalanceAccumulatorField(inner) => {
-                is_balance_accumulator_field(s)
-                    && extract_balance_type_from_field(s)
-                        .map(|t| &t == inner)
-                        .unwrap_or(false)
+                accumulator_value_balance_type_maybe(s)
+                    .map(|t| &t == inner)
+                    .unwrap_or(false)
             }
             MoveObjectType_::Other(o) => s == o,
         }
@@ -602,15 +636,11 @@ impl From<StructTag> for MoveObjectType {
             MoveObjectType_::Coin(s.type_params.pop().unwrap())
         } else if StakedSui::is_staked_sui(&s) {
             MoveObjectType_::StakedSui
-        } else if is_balance_accumulator_field(&s) {
-            if let Some(balance_type) = extract_balance_type_from_field(&s) {
-                if GAS::is_gas_type(&balance_type) {
-                    MoveObjectType_::SuiBalanceAccumulatorField
-                } else {
-                    MoveObjectType_::BalanceAccumulatorField(balance_type)
-                }
+        } else if let Some(balance_type) = accumulator_value_balance_type_maybe(&s) {
+            if GAS::is_gas_type(&balance_type) {
+                MoveObjectType_::SuiBalanceAccumulatorField
             } else {
-                MoveObjectType_::Other(s)
+                MoveObjectType_::BalanceAccumulatorField(balance_type)
             }
         } else {
             MoveObjectType_::Other(s)
@@ -813,7 +843,7 @@ impl SuiAddress {
     }
 
     pub fn generate<R: rand::RngCore + rand::CryptoRng>(mut rng: R) -> Self {
-        let buf: [u8; SUI_ADDRESS_LENGTH] = rng.gen();
+        let buf: [u8; SUI_ADDRESS_LENGTH] = rng.r#gen();
         Self(buf)
     }
 
@@ -848,7 +878,7 @@ impl SuiAddress {
     /// Parse a SuiAddress from a byte array or buffer.
     pub fn from_bytes<T: AsRef<[u8]>>(bytes: T) -> Result<Self, SuiError> {
         <[u8; SUI_ADDRESS_LENGTH]>::try_from(bytes.as_ref())
-            .map_err(|_| SuiError::InvalidAddress)
+            .map_err(|_| SuiErrorKind::InvalidAddress.into())
             .map(SuiAddress)
     }
 
@@ -974,7 +1004,7 @@ impl TryFrom<&GenericSignature> for SuiAddress {
                 let scheme = sig.scheme();
                 let pub_key_bytes = sig.public_key_bytes();
                 let pub_key = PublicKey::try_from_bytes(scheme, pub_key_bytes).map_err(|_| {
-                    SuiError::InvalidSignature {
+                    SuiErrorKind::InvalidSignature {
                         error: "Cannot parse pubkey".to_string(),
                     }
                 })?;
@@ -983,7 +1013,7 @@ impl TryFrom<&GenericSignature> for SuiAddress {
             GenericSignature::MultiSig(ms) => Ok(ms.get_pk().into()),
             GenericSignature::MultiSigLegacy(ms) => {
                 Ok(crate::multisig::MultiSig::try_from(ms.clone())
-                    .map_err(|_| SuiError::InvalidSignature {
+                    .map_err(|_| SuiErrorKind::InvalidSignature {
                         error: "Invalid legacy multisig".to_string(),
                     })?
                     .get_pk()
@@ -1117,6 +1147,14 @@ pub const RESOLVED_UTF8_STR: (&AccountAddress, &IdentStr, &IdentStr) = (
     STD_UTF8_STRUCT_NAME,
 );
 
+pub const STD_TYPE_NAME_MODULE_NAME: &IdentStr = ident_str!("type_name");
+pub const STD_TYPE_NAME_STRUCT_NAME: &IdentStr = ident_str!("TypeName");
+pub const RESOLVED_STD_TYPE_NAME: (&AccountAddress, &IdentStr, &IdentStr) = (
+    &MOVE_STDLIB_ADDRESS,
+    STD_TYPE_NAME_MODULE_NAME,
+    STD_TYPE_NAME_STRUCT_NAME,
+);
+
 pub const TX_CONTEXT_MODULE_NAME: &IdentStr = ident_str!("tx_context");
 pub const TX_CONTEXT_STRUCT_NAME: &IdentStr = ident_str!("TxContext");
 pub const RESOLVED_TX_CONTEXT: (&AccountAddress, &IdentStr, &IdentStr) = (
@@ -1124,6 +1162,13 @@ pub const RESOLVED_TX_CONTEXT: (&AccountAddress, &IdentStr, &IdentStr) = (
     TX_CONTEXT_MODULE_NAME,
     TX_CONTEXT_STRUCT_NAME,
 );
+
+pub const URL_MODULE_NAME: &IdentStr = ident_str!("url");
+pub const URL_STRUCT_NAME: &IdentStr = ident_str!("Url");
+
+pub const VEC_MAP_MODULE_NAME: &IdentStr = ident_str!("vec_map");
+pub const VEC_MAP_STRUCT_NAME: &IdentStr = ident_str!("VecMap");
+pub const VEC_MAP_ENTRY_STRUCT_NAME: &IdentStr = ident_str!("Entry");
 
 pub fn move_ascii_str_layout() -> A::MoveStructLayout {
     A::MoveStructLayout {
@@ -1151,6 +1196,36 @@ pub fn move_utf8_str_layout() -> A::MoveStructLayout {
         fields: vec![A::MoveFieldLayout::new(
             ident_str!("bytes").into(),
             A::MoveTypeLayout::Vector(Box::new(A::MoveTypeLayout::U8)),
+        )],
+    }
+}
+
+pub fn url_layout() -> A::MoveStructLayout {
+    A::MoveStructLayout {
+        type_: StructTag {
+            address: SUI_FRAMEWORK_ADDRESS,
+            module: URL_MODULE_NAME.to_owned(),
+            name: URL_STRUCT_NAME.to_owned(),
+            type_params: vec![],
+        },
+        fields: vec![A::MoveFieldLayout::new(
+            ident_str!("url").to_owned(),
+            A::MoveTypeLayout::Struct(Box::new(move_ascii_str_layout())),
+        )],
+    }
+}
+
+pub fn type_name_layout() -> A::MoveStructLayout {
+    A::MoveStructLayout {
+        type_: StructTag {
+            address: MOVE_STDLIB_ADDRESS,
+            module: STD_TYPE_NAME_MODULE_NAME.to_owned(),
+            name: STD_TYPE_NAME_STRUCT_NAME.to_owned(),
+            type_params: vec![],
+        },
+        fields: vec![A::MoveFieldLayout::new(
+            ident_str!("name").into(),
+            A::MoveTypeLayout::Struct(Box::new(move_ascii_str_layout())),
         )],
     }
 }
@@ -1194,7 +1269,7 @@ impl From<&TxContext> for MoveLegacyTxContext {
 // This struct is not related to Move and can evolve as needed/required.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TxContext {
-    /// Signer/sender of the transaction
+    /// Sender of the transaction
     sender: AccountAddress,
     /// Digest of the current transaction
     digest: Vec<u8>,
@@ -1536,7 +1611,7 @@ impl ObjectID {
     where
         R: AllowedRng,
     {
-        let buf: [u8; Self::LENGTH] = rng.gen();
+        let buf: [u8; Self::LENGTH] = rng.r#gen();
         ObjectID::new(buf)
     }
 
@@ -1562,6 +1637,11 @@ impl ObjectID {
         let mut bytes = [0u8; Self::LENGTH];
         bytes[Self::LENGTH - 1] = byte;
         ObjectID::new(bytes)
+    }
+
+    /// System objects have IDs that fit in the last 8 bytes (24 leading zero bytes).
+    pub fn is_system_object(&self) -> bool {
+        self.0.as_ref()[..24] == [0u8; 24]
     }
 
     /// Convert from hex string to ObjectID where the string is prefixed with 0x
@@ -1668,6 +1748,10 @@ impl ObjectID {
 
     pub fn is_clock(&self) -> bool {
         *self == SUI_CLOCK_OBJECT_ID
+    }
+
+    pub fn is_implicitly_read_system_object(&self) -> bool {
+        crate::IMPLICITLY_READ_SYSTEM_OBJECTS.contains(self)
     }
 }
 

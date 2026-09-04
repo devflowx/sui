@@ -26,13 +26,13 @@ module test::m {
 
     public fun b(ctx: &mut TxContext): B {
         let mut b = B { id: object::new(ctx) };
-        field::add(&mut b.id, KEY, 0);
+        field::add(&mut b.id, KEY, 0u64);
         b
 
     }
 
     public fun bump(b: &mut B) {
-        let f = field::borrow_mut(&mut b.id, KEY);
+        let f = field::borrow_mut<_, u64>(&mut b.id, KEY);
         *f = *f + 1;
     }
 
@@ -66,35 +66,35 @@ module test::m {
 //> 0: test::m::b();
 //> TransferObjects([Result(0)], Input(0))
 
-//# view-object 4,0
+//# view-object 4,1
 
-//# programmable --sender P2 --inputs object(4,1)
+//# programmable --sender P2 --inputs object(4,0)
 //> 0: test::m::bump(Input(0));
 
-//# view-object 4,0
+//# view-object 4,1
 
 // Append object B to object A. And ensure that when we later read the dynamic
 // field of object B, we get the most recent version.
 
-//# programmable --sender P2 --inputs object(2,0)@2 object(4,1)@3 1 --dev-inspect
+//# programmable --sender P2 --inputs object(2,0)@2 object(4,0)@3 1 --dev-inspect
 //> 0: test::m::append(Input(0), Input(1));
 //> 1: test::m::check(Input(0), Input(2));
 
 // checking that with version 3 we get the other value, then flip them to ensure
 // they abort
 
-//# programmable --sender P2 --inputs object(2,0)@2 object(4,1)@2 0 --dev-inspect
+//# programmable --sender P2 --inputs object(2,0)@2 object(4,0)@2 0 --dev-inspect
 //> 0: test::m::append(Input(0), Input(1));
 //> 1: test::m::check(Input(0), Input(2));
 
 // @2 with value 1 aborts
 
-//# programmable --sender P2 --inputs object(2,0)@2 object(4,1)@2 1 --dev-inspect
+//# programmable --sender P2 --inputs object(2,0)@2 object(4,0)@2 1 --dev-inspect
 //> 0: test::m::append(Input(0), Input(1));
 //> 1: test::m::check(Input(0), Input(2));
 
 // @3 with value 0 aborts
 
-//# programmable --sender P2 --inputs object(2,0)@2 object(4,1)@3 0 --dev-inspect
+//# programmable --sender P2 --inputs object(2,0)@2 object(4,0)@3 0 --dev-inspect
 //> 0: test::m::append(Input(0), Input(1));
 //> 1: test::m::check(Input(0), Input(2));

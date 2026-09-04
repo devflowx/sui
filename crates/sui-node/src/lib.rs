@@ -7,95 +7,103 @@ use anemo_tower::callback::CallbackLayer;
 use anemo_tower::trace::DefaultMakeSpan;
 use anemo_tower::trace::DefaultOnFailure;
 use anemo_tower::trace::TraceLayer;
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
 use futures::future::BoxFuture;
-use mysten_common::debug_fatal;
+use mysten_common::in_test_configuration;
 use prometheus::Registry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(msim)]
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-use sui_core::authority::authority_store_tables::{
-    AuthorityPerpetualTablesOptions, AuthorityPrunerTables,
+use sui_core::admission_queue::{
+    AdmissionQueueContext, AdmissionQueueManager, AdmissionQueueMetrics,
 };
+use sui_core::authority::ExecutionEnv;
+use sui_core::authority::authority_store_tables::AuthorityPerpetualTablesOptions;
 use sui_core::authority::backpressure::BackpressureManager;
 use sui_core::authority::epoch_start_configuration::EpochFlag;
 use sui_core::authority::execution_time_estimator::ExecutionTimeObserver;
-use sui_core::authority::shared_object_version_manager::Schedulable;
-use sui_core::authority::ExecutionEnv;
-use sui_core::authority::RandomnessRoundReceiver;
 use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
+use sui_core::consensus_transaction_pool::TransactionPoolContext;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
+use sui_core::randomness_round_receiver::{RandomnessRoundReceiver, RandomnessRoundReceiverHandle};
+use sui_network::endpoint_manager::{AddressSource, EndpointId};
 use sui_network::validator::server::SUI_TLS_SERVER_NAME;
 use sui_types::full_checkpoint_content::Checkpoint;
+use sui_types::node_role::NodeRole;
 
-use sui_core::execution_scheduler::SchedulingSource;
 use sui_core::global_state_hasher::GlobalStateHashMetrics;
 use sui_core::storage::RestReadStore;
 use sui_json_rpc::bridge_api::BridgeReadApi;
 use sui_json_rpc_api::JsonRpcMetrics;
 use sui_network::randomness;
-use sui_rpc_api::subscription::SubscriptionService;
-use sui_rpc_api::RpcMetrics;
 use sui_rpc_api::ServerVersion;
+use sui_rpc_api::subscription::SubscriptionService;
 use sui_types::base_types::ConciseableName;
 use sui_types::crypto::RandomnessRound;
 use sui_types::digests::{
     ChainIdentifier, CheckpointDigest, TransactionDigest, TransactionEffectsDigest,
 };
-use sui_types::executable_transaction::VerifiedExecutableTransaction;
 use sui_types::messages_consensus::AuthorityCapabilitiesV2;
-use sui_types::messages_consensus::ConsensusTransactionKind;
 use sui_types::sui_system_state::SuiSystemState;
-use sui_types::transaction::VerifiedCertificate;
 use tap::tap::TapFallible;
 use tokio::sync::oneshot;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
+use tracing::{Instrument, error_span, info};
 use tracing::{debug, error, warn};
-use tracing::{error_span, info, Instrument};
+
+// Logs at debug level in test configuration, info level otherwise.
+// JWK logs cause significant volume in tests, but are insignificant in prod,
+// so we keep them at info
+macro_rules! jwk_log {
+    ($($arg:tt)+) => {
+        if in_test_configuration() {
+            debug!($($arg)+);
+        } else {
+            info!($($arg)+);
+        }
+    };
+}
 
 use fastcrypto_zkp::bn254::zk_login::JWK;
 pub use handle::SuiNodeHandle;
-use mysten_metrics::{spawn_monitored_task, RegistryService};
+use mysten_metrics::{RegistryService, spawn_monitored_task};
 use mysten_service::server_timing::server_timing_middleware;
 use sui_config::node::{DBCheckpointConfig, RunWithRange};
 use sui_config::node::{ForkCrashBehavior, ForkRecoveryConfig};
-use sui_config::node_config_metrics::NodeConfigMetrics;
+use sui_config::transaction_deny_config::TransactionDenyRules;
 use sui_config::{ConsensusConfig, NodeConfig};
 use sui_core::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::authority::epoch_start_configuration::EpochStartConfigTrait;
 use sui_core::authority::epoch_start_configuration::EpochStartConfiguration;
 use sui_core::authority::submitted_transaction_cache::SubmittedTransactionCacheMetrics;
-use sui_core::authority_aggregator::{AuthAggMetrics, AuthorityAggregator};
-use sui_core::authority_server::{ValidatorService, ValidatorServiceMetrics};
+use sui_core::authority_aggregator::AuthorityAggregator;
+use sui_core::authority_server::{UserSubmissionPath, ValidatorService, ValidatorServiceMetrics};
 use sui_core::checkpoints::checkpoint_executor::metrics::CheckpointExecutorMetrics;
 use sui_core::checkpoints::checkpoint_executor::{CheckpointExecutor, StopReason};
 use sui_core::checkpoints::{
-    CheckpointMetrics, CheckpointService, CheckpointStore, SendCheckpointToStateSync,
-    SubmitCheckpointToConsensus,
+    CheckpointMetrics, CheckpointOutput, CheckpointService, CheckpointStore, LogCheckpointOutput,
+    SendCheckpointToStateSync, SubmitCheckpointToConsensus,
 };
-use sui_core::consensus_adapter::{
-    CheckConnection, ConnectionMonitorStatus, ConsensusAdapter, ConsensusAdapterMetrics,
-};
+use sui_core::consensus_adapter::{ConsensusAdapter, ConsensusAdapterMetrics};
 use sui_core::consensus_manager::ConsensusManager;
-use sui_core::consensus_throughput_calculator::{
-    ConsensusThroughputCalculator, ConsensusThroughputProfiler, ThroughputProfileRanges,
-};
+use sui_core::consensus_throughput_calculator::ConsensusThroughputCalculator;
 use sui_core::consensus_validator::{SuiTxValidator, SuiTxValidatorMetrics};
 use sui_core::db_checkpoint_handler::DBCheckpointHandler;
 use sui_core::epoch::committee_store::CommitteeStore;
@@ -106,14 +114,16 @@ use sui_core::global_state_hasher::GlobalStateHasher;
 use sui_core::jsonrpc_index::IndexStore;
 use sui_core::module_cache_metrics::ResolverMetrics;
 use sui_core::overload_monitor::overload_monitor;
-use sui_core::rpc_index::RpcIndexStore;
+use sui_core::rpc_store_embed::EmbeddedRpcStore;
 use sui_core::signature_verifier::SignatureVerifierMetrics;
 use sui_core::storage::RocksDbStore;
+use sui_core::storage::RpcStoreReadStore;
 use sui_core::transaction_orchestrator::TransactionOrchestrator;
 use sui_core::{
     authority::{AuthorityState, AuthorityStore},
     authority_client::NetworkAuthorityClient,
 };
+use sui_json_rpc::JsonRpcServerBuilder;
 use sui_json_rpc::coin_api::CoinReadApi;
 use sui_json_rpc::governance_api::GovernanceReadApi;
 use sui_json_rpc::indexer_api::IndexerApi;
@@ -121,12 +131,11 @@ use sui_json_rpc::move_utils::MoveUtils;
 use sui_json_rpc::read_api::ReadApi;
 use sui_json_rpc::transaction_builder_api::TransactionBuilderApi;
 use sui_json_rpc::transaction_execution_api::TransactionExecutionApi;
-use sui_json_rpc::JsonRpcServerBuilder;
 use sui_macros::fail_point;
-use sui_macros::{fail_point_async, replay_log};
+use sui_macros::{fail_point_arg, fail_point_async, replay_log};
 use sui_network::api::ValidatorServer;
 use sui_network::discovery;
-use sui_network::discovery::TrustedPeerChangeEvent;
+use sui_network::endpoint_manager::EndpointManager;
 use sui_network::state_sync;
 use sui_network::validator::server::ServerBuilder;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
@@ -140,42 +149,49 @@ use sui_types::base_types::{AuthorityName, EpochId};
 use sui_types::committee::Committee;
 use sui_types::crypto::KeypairTraits;
 use sui_types::error::{SuiError, SuiResult};
-use sui_types::messages_consensus::{
-    check_total_jwk_size, AuthorityCapabilitiesV1, ConsensusTransaction,
-};
+use sui_types::messages_consensus::{ConsensusTransaction, check_total_jwk_size};
+use sui_types::storage::RpcStateReader;
+use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemState;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
-use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::supported_protocol_versions::SupportedProtocolVersions;
-use typed_store::rocks::default_db_options;
 use typed_store::DBMetrics;
+use typed_store::rocks::default_db_options;
 
 use crate::metrics::{GrpcMetrics, SuiNodeMetrics};
 
+pub mod address_prober;
 pub mod admin;
+pub mod db_shell;
 mod handle;
 pub mod metrics;
 
 pub struct ValidatorComponents {
-    validator_server_handle: SpawnOnce,
+    validator_server_handle: Option<SpawnOnce>,
     validator_overload_monitor_handle: Option<JoinHandle<()>>,
     consensus_manager: Arc<ConsensusManager>,
     consensus_store_pruner: ConsensusStorePruner,
     consensus_adapter: Arc<ConsensusAdapter>,
     checkpoint_metrics: Arc<CheckpointMetrics>,
     sui_tx_validator_metrics: Arc<SuiTxValidatorMetrics>,
+    admission_queue: Option<AdmissionQueueContext>,
+    transaction_pool_context: Option<Arc<TransactionPoolContext>>,
 }
+
 pub struct P2pComponents {
     p2p_network: Network,
     known_peers: HashMap<PeerId, String>,
     discovery_handle: discovery::Handle,
     state_sync_handle: state_sync::Handle,
     randomness_handle: randomness::Handle,
+    endpoint_manager: EndpointManager,
 }
 
 #[cfg(msim)]
 mod simulator {
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use sui_types::error::SuiErrorKind;
 
     use super::*;
     pub(super) struct SimState {
@@ -210,19 +226,21 @@ mod simulator {
             &OIDCProvider::Twitch,
             true,
         )
-        .map_err(|_| SuiError::JWKRetrievalError)
+        .map_err(|_| SuiErrorKind::JWKRetrievalError.into())
     }
 
-    thread_local! {
-        static JWK_INJECTOR: std::cell::RefCell<Arc<JwkInjector>> = std::cell::RefCell::new(Arc::new(default_fetch_jwks));
-    }
+    static JWK_INJECTOR: Mutex<Option<Arc<JwkInjector>>> = Mutex::new(None);
 
     pub(super) fn get_jwk_injector() -> Arc<JwkInjector> {
-        JWK_INJECTOR.with(|injector| injector.borrow().clone())
+        JWK_INJECTOR
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_fetch_jwks))
     }
 
     pub fn set_jwk_injector(injector: Arc<JwkInjector>) {
-        JWK_INJECTOR.with(|cell| *cell.borrow_mut() = injector);
+        *JWK_INJECTOR.lock().unwrap() = Some(injector);
     }
 }
 
@@ -230,12 +248,10 @@ mod simulator {
 pub use simulator::set_jwk_injector;
 #[cfg(msim)]
 use simulator::*;
-use sui_core::authority::authority_store_pruner::{ObjectsCompactionFilter, PrunerWatermarks};
+use sui_core::authority::authority_store_pruner::PrunerWatermarks;
 use sui_core::{
     consensus_handler::ConsensusHandlerInitializer, safe_client::SafeClientMetricsBase,
-    validator_tx_finalizer::ValidatorTxFinalizer,
 };
-use sui_types::execution_config_utils::to_binary_config;
 
 const DEFAULT_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -254,18 +270,20 @@ pub struct SuiNode {
     checkpoint_metrics: Arc<CheckpointMetrics>,
 
     _discovery: discovery::Handle,
-    _connection_monitor_handle: consensus_core::ConnectionMonitorHandle,
+    _connection_monitor_handle: mysten_network::anemo_connection_monitor::ConnectionMonitorHandle,
     state_sync_handle: state_sync::Handle,
     randomness_handle: randomness::Handle,
     checkpoint_store: Arc<CheckpointStore>,
     global_state_hasher: Mutex<Option<Arc<GlobalStateHasher>>>,
-    connection_monitor_status: Arc<ConnectionMonitorStatus>,
 
     /// Broadcast channel to send the starting system state for the next epoch.
     end_of_epoch_channel: broadcast::Sender<SuiSystemState>,
 
-    /// Broadcast channel to notify state-sync for new validator peers.
-    trusted_peer_change_tx: watch::Sender<TrustedPeerChangeEvent>,
+    /// EndpointManager for updating peer network addresses.
+    endpoint_manager: EndpointManager,
+
+    /// Handle to the discovery-shared address prober (`None` when disabled).
+    address_prober: Option<address_prober::Handle>,
 
     backpressure_manager: Arc<BackpressureManager>,
 
@@ -278,13 +296,28 @@ pub struct SuiNode {
     // Channel to allow signaling upstream to shutdown sui-node
     shutdown_channel_tx: broadcast::Sender<Option<RunWithRange>>,
 
+    /// Handle shared with RandomnessManager and the consensus layer.
+    randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
+
+    /// Per-epoch consensus transaction pool handoff, shared between the RPC
+    /// server and ConsensusManager (`Some` only in pull-based submission mode).
+    transaction_pool_context: Option<Arc<TransactionPoolContext>>,
+
+    consensus_adapter_metrics: OnceLock<ConsensusAdapterMetrics>,
+
     /// AuthorityAggregator of the network, created at start and beginning of each epoch.
     /// Use ArcSwap so that we could mutate it without taking mut reference.
     // TODO: Eventually we can make this auth aggregator a shared reference so that this
     // update will automatically propagate to other uses.
     auth_agg: Arc<ArcSwap<AuthorityAggregator<NetworkAuthorityClient>>>,
 
-    subscription_service_checkpoint_sender: Option<tokio::sync::mpsc::Sender<Checkpoint>>,
+    subscription_service_checkpoint_sender: Option<tokio::sync::broadcast::Sender<Arc<Checkpoint>>>,
+
+    /// The embedded `sui-rpc-store`, present when the node is a fullnode
+    /// with indexing enabled. Held for the node's lifetime so its tip
+    /// indexer keeps running (dropping it aborts the indexer). Exposed
+    /// through [`SuiNode::embedded_rpc_store`] for introspection.
+    embedded_rpc_store: Option<EmbeddedRpcStore>,
 }
 
 impl fmt::Debug for SuiNode {
@@ -395,7 +428,7 @@ impl SuiNode {
                     // just best-effort to reduce unneeded submissions.
                     let mut seen = HashSet::new();
                     loop {
-                        info!("fetching JWK for provider {:?}", p);
+                        jwk_log!("fetching JWK for provider {:?}", p);
                         metrics.jwk_requests.with_label_values(&[&provider_str]).inc();
                         match Self::fetch_jwks(authority, &p).await {
                             Err(e) => {
@@ -428,7 +461,7 @@ impl SuiNode {
                                 }
 
                                 for (id, jwk) in keys.into_iter() {
-                                    info!("Submitting JWK to consensus: {:?}", id);
+                                    jwk_log!("Submitting JWK to consensus: {:?}", id);
 
                                     let txn = ConsensusTransaction::new_jwk_fetched(authority, id, jwk);
                                     consensus_adapter.submit(txn, None, &epoch_store, None, None)
@@ -450,7 +483,11 @@ impl SuiNode {
         registry_service: RegistryService,
         server_version: ServerVersion,
     ) -> Result<Arc<SuiNode>> {
-        NodeConfigMetrics::new(&registry_service.default_registry()).record_metrics(&config);
+        // Fail fast on config errors before starting any node components.
+        if let Some(prober_config) = &config.address_prober {
+            prober_config.validate()?;
+        }
+
         let mut config = config.clone();
         if config.supported_protocol_versions.is_none() {
             info!(
@@ -461,16 +498,22 @@ impl SuiNode {
         }
 
         let run_with_range = config.run_with_range;
-        let is_validator = config.consensus_config().is_some();
-        let is_full_node = !is_validator;
         let prometheus_registry = registry_service.default_registry();
+        let node_role = config.intended_node_role();
 
         info!(node =? config.protocol_public_key(),
-            "Initializing sui-node listening on {}", config.network_address
+            "Initializing sui-node listening on {} with role {:?}", config.network_address, node_role
         );
 
         // Initialize metrics to track db usage before creating any stores
         DBMetrics::init(registry_service.clone());
+
+        // Build the Bulletproofs generators up front, so that the first range proof verification
+        // does not pay for it.
+        fastcrypto::bulletproofs::initialize_generators();
+
+        // Initialize db sync-to-disk setting from config (falls back to env var if not set)
+        typed_store::init_write_sync(config.enable_db_sync_to_disk);
 
         // Initialize Mysten metrics.
         mysten_metrics::init_metrics(&prometheus_registry);
@@ -481,7 +524,7 @@ impl SuiNode {
         let genesis = config.genesis()?.clone();
 
         let secret = Arc::pin(config.protocol_key_pair().copy());
-        let genesis_committee = genesis.committee()?;
+        let genesis_committee = genesis.committee();
         let committee_store = Arc::new(CommitteeStore::new(
             config.db_path().join("epochs"),
             &genesis_committee,
@@ -495,35 +538,48 @@ impl SuiNode {
         );
         let checkpoint_metrics = CheckpointMetrics::new(&registry_service.default_registry());
 
-        Self::check_and_recover_forks(
-            &checkpoint_store,
-            &checkpoint_metrics,
-            is_validator,
-            config.fork_recovery.as_ref(),
-        )
-        .await?;
+        #[allow(unused_mut)]
+        let mut build_version = server_version.version.to_string();
+        fail_point_arg!("override_binary_version", |version: std::sync::Arc<
+            std::sync::Mutex<String>,
+        >| {
+            #[cfg(msim)]
+            {
+                build_version = version.lock().unwrap().clone();
+            }
+        });
+        // Embedded in any fork marker this run records, so recovery can refuse to clear a fork
+        // under the same binary version that produced it.
+        checkpoint_store.set_binary_version(&build_version);
 
-        let mut pruner_db = None;
-        if config
-            .authority_store_pruning_config
-            .enable_compaction_filter
-        {
-            pruner_db = Some(Arc::new(AuthorityPrunerTables::open(
-                &config.db_path().join("store"),
-            )));
+        if node_role.runs_consensus() {
+            Self::check_and_recover_forks(
+                &checkpoint_store,
+                &checkpoint_metrics,
+                config.fork_recovery.as_ref(),
+                &build_version,
+            )
+            .await?;
         }
-        let compaction_filter = pruner_db
-            .clone()
-            .map(|db| ObjectsCompactionFilter::new(db, &prometheus_registry));
 
-        // By default, only enable write stall on validators for perpetual db.
-        let enable_write_stall = config.enable_db_write_stall.unwrap_or(is_validator);
+        // By default, only enable write stall on nodes that run consensus.
+        let enable_write_stall = config
+            .enable_db_write_stall
+            .unwrap_or(node_role.runs_consensus());
+        // The tidehunter objects compactor retains only the latest version per
+        // ObjectID and is mutually exclusive with the object pruner. Enable it
+        // for validators (which always disable the pruner), and also for any
+        // node configured with `num_epochs_to_retain = 0` — that aggressive
+        // setting is what the compactor replaces. The pruner is force-disabled
+        // in `AuthorityStorePruner::new` whenever this is true.
+        let enable_objects_compactor = node_role.is_validator()
+            || config.authority_store_pruning_config.num_epochs_to_retain == 0;
         let perpetual_tables_options = AuthorityPerpetualTablesOptions {
             enable_write_stall,
-            compaction_filter,
+            enable_objects_compactor,
         };
         let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(
-            &config.db_path().join("store"),
+            &config.db_store_path(),
             Some(perpetual_tables_options),
             Some(pruner_watermarks.epoch_id.clone()),
         ));
@@ -556,13 +612,11 @@ impl SuiNode {
 
         let auth_agg = {
             let safe_client_metrics_base = SafeClientMetricsBase::new(&prometheus_registry);
-            let auth_agg_metrics = Arc::new(AuthAggMetrics::new(&prometheus_registry));
             Arc::new(ArcSwap::new(Arc::new(
                 AuthorityAggregator::new_from_epoch_start_state(
                     epoch_start_configuration.epoch_start_state(),
                     &committee_store,
                     safe_client_metrics_base,
-                    auth_agg_metrics,
                 ),
             )))
         };
@@ -573,11 +627,25 @@ impl SuiNode {
             None => ChainIdentifier::from(*genesis.checkpoint().digest()).chain(),
         };
 
-        let epoch_options = default_db_options().optimize_db_for_write_throughput(4);
+        let highest_executed_checkpoint = checkpoint_store
+            .get_highest_executed_checkpoint_seq_number()
+            .expect("checkpoint store read cannot fail")
+            .unwrap_or(0);
+
+        let previous_epoch_last_checkpoint = if cur_epoch == 0 {
+            0
+        } else {
+            checkpoint_store
+                .get_epoch_last_checkpoint_seq_number(cur_epoch - 1)
+                .expect("checkpoint store read cannot fail")
+                .unwrap_or(highest_executed_checkpoint)
+        };
+
+        let epoch_options = default_db_options().optimize_db_for_write_throughput(4, false);
         let epoch_store = AuthorityPerEpochStore::new(
             config.protocol_public_key(),
             committee.clone(),
-            &config.db_path().join("store"),
+            &config.db_store_path(),
             Some(epoch_options.options),
             EpochMetrics::new(&registry_service.default_registry()),
             epoch_start_configuration,
@@ -587,13 +655,12 @@ impl SuiNode {
             signature_verifier_metrics,
             &config.expensive_safety_check_config,
             (chain_id, chain),
-            checkpoint_store
-                .get_highest_executed_checkpoint_seq_number()
-                .expect("checkpoint store read cannot fail")
-                .unwrap_or(0),
+            highest_executed_checkpoint,
+            previous_epoch_last_checkpoint,
             Arc::new(SubmittedTransactionCacheMetrics::new(
                 &registry_service.default_registry(),
             )),
+            config.fullnode_sync_mode,
         )?;
 
         info!("created epoch store");
@@ -642,8 +709,8 @@ impl SuiNode {
             checkpoint_store.clone(),
         );
 
-        let index_store = if is_full_node && config.enable_index_processing {
-            info!("creating index store");
+        let index_store = if node_role.is_fullnode() && config.enable_index_processing {
+            info!("creating jsonrpc index store");
             Some(Arc::new(IndexStore::new(
                 config.db_path().join("indexes"),
                 &prometheus_registry,
@@ -656,29 +723,43 @@ impl SuiNode {
             None
         };
 
-        let rpc_index = if is_full_node && config.rpc().is_some_and(|rpc| rpc.enable_indexing()) {
-            Some(Arc::new(
-                RpcIndexStore::new(
-                    &config.db_path(),
+        let chain_identifier = epoch_store.get_chain_identifier();
+
+        // The embedded `sui-rpc-store` is the node's index backend: when
+        // indexing is enabled it builds the derived-index and ledger-history
+        // column families (indexed independently of the authority store) and
+        // serves the index read paths from the embedded store. Raw chain data
+        // is still served from the perpetual store.
+        let mut embedded_rpc_store =
+            if node_role.is_fullnode() && config.rpc().is_some_and(|rpc| rpc.enable_indexing()) {
+                info!("creating embedded rpc-store");
+                // The embedded `sui-rpc-store` replaced the legacy `rpc-index`
+                // backend; remove its now-dead on-disk directory if a prior
+                // version left one behind.
+                remove_legacy_rpc_index_store(&config.db_path());
+                // The tip indexer pulls checkpoints from the node's local
+                // checkpoint / perpetual stores via a dedicated read handle.
+                let ingestion_source = RocksDbStore::new(
+                    cache_traits.clone(),
+                    committee_store.clone(),
+                    checkpoint_store.clone(),
+                );
+                let embedded_rpc_store = EmbeddedRpcStore::bootstrap(
+                    &config,
                     &store,
                     &checkpoint_store,
-                    &epoch_store,
-                    &cache_traits.backing_package_store,
-                    config.rpc().and_then(|c| c.index_initialization_config()),
+                    ingestion_source,
+                    chain_identifier,
+                    &prometheus_registry,
                 )
-                .await,
-            ))
-        } else {
-            None
-        };
-
-        let chain_identifier = epoch_store.get_chain_identifier();
+                .await?;
+                Some(embedded_rpc_store)
+            } else {
+                None
+            };
 
         info!("creating archive reader");
         // Create network
-        // TODO only configure validators as seed/preferred peers for validators and not for
-        // fullnodes once we've had a chance to re-work fullnode configuration generation.
-        let (trusted_peer_change_tx, trusted_peer_change_rx) = watch::channel(Default::default());
         let (randomness_tx, randomness_rx) = mpsc::channel(
             config
                 .p2p_config
@@ -693,23 +774,33 @@ impl SuiNode {
             discovery_handle,
             state_sync_handle,
             randomness_handle,
+            endpoint_manager,
         } = Self::create_p2p_network(
             &config,
             state_sync_store.clone(),
             chain_identifier,
-            trusted_peer_change_rx,
             randomness_tx,
             &prometheus_registry,
         )?;
 
-        // We must explicitly send this instead of relying on the initial value to trigger
-        // watch value change, so that state-sync is able to process it.
-        send_trusted_peer_change(
+        // Inject configured peer address overrides.
+        for peer in &config.p2p_config.peer_address_overrides {
+            endpoint_manager
+                .update_endpoint(
+                    EndpointId::P2p(peer.peer_id),
+                    AddressSource::Config,
+                    peer.addresses.clone(),
+                )
+                .expect("Updating peer address overrides should not fail");
+        }
+
+        // Send initial peer addresses to the p2p network.
+        update_peer_addresses(
             &config,
-            &trusted_peer_change_tx,
+            &endpoint_manager,
             epoch_store.epoch_start_state(),
-        )
-        .expect("Initial trusted peers must be set");
+            None,
+        );
 
         info!("start snapshot upload");
         // Start uploading state snapshot to remote store
@@ -739,14 +830,6 @@ impl SuiNode {
         }
 
         let authority_name = config.protocol_public_key();
-        let validator_tx_finalizer =
-            config
-                .enable_validator_tx_finalizer
-                .then_some(Arc::new(ValidatorTxFinalizer::new(
-                    auth_agg.clone(),
-                    authority_name,
-                    &prometheus_registry,
-                )));
 
         info!("create authority state");
         let state = AuthorityState::new(
@@ -758,15 +841,13 @@ impl SuiNode {
             epoch_store.clone(),
             committee_store.clone(),
             index_store.clone(),
-            rpc_index,
+            embedded_rpc_store.as_ref().map(|embedded| embedded.store()),
             checkpoint_store.clone(),
             &prometheus_registry,
             genesis.objects(),
             &db_checkpoint_config,
             config.clone(),
-            validator_tx_finalizer,
             chain_identifier,
-            pruner_db,
             config.policy_config.clone(),
             config.firewall_config.clone(),
             pruner_watermarks,
@@ -783,37 +864,21 @@ impl SuiNode {
                         sui_types::executable_transaction::CertificateProof::Checkpoint(0, 0),
                     ),
                 );
+            let _enter = span.enter();
             state
-                .try_execute_immediately(
-                    &transaction,
-                    ExecutionEnv::new().with_scheduling_source(SchedulingSource::NonFastPath),
-                    &epoch_store,
-                )
-                .instrument(span)
-                .await
+                .try_execute_immediately(&transaction, ExecutionEnv::new(), &epoch_store)
                 .unwrap();
         }
 
         // Start the loop that receives new randomness and generates transactions for it.
-        RandomnessRoundReceiver::spawn(state.clone(), randomness_rx);
-
-        if config
-            .expensive_safety_check_config
-            .enable_secondary_index_checks()
-        {
-            if let Some(indexes) = state.indexes.clone() {
-                sui_core::verify_indexes::verify_indexes(
-                    state.get_global_state_hash_store().as_ref(),
-                    indexes,
-                )
-                .expect("secondary indexes are inconsistent");
-            }
-        }
+        // The returned is long-lived (node lifetime).
+        let randomness_receiver_handle =
+            RandomnessRoundReceiver::spawn(state.clone(), randomness_rx);
 
         let (end_of_epoch_channel, end_of_epoch_receiver) =
             broadcast::channel(config.end_of_epoch_broadcast_channel_capacity);
 
-        let transaction_orchestrator = if is_full_node && run_with_range.is_none() {
+        let transaction_orchestrator = if node_role.is_fullnode() && run_with_range.is_none() {
             Some(Arc::new(TransactionOrchestrator::new_with_auth_aggregator(
                 auth_agg.load_full(),
                 state.clone(),
@@ -833,37 +898,41 @@ impl SuiNode {
             &config,
             &prometheus_registry,
             server_version,
+            node_role,
+            embedded_rpc_store.as_ref(),
         )
         .await?;
+
+        // Start the embedded rpc-store's tip indexer. It follows the tip
+        // via the checkpoint executor's broadcast stream and backfills
+        // any gap from the perpetual store. Spawned on a background task
+        // (see `spawn_indexer`) so node startup does not block on the
+        // first checkpoint, which the executor only produces after this
+        // function returns.
+        if let Some(embedded) = embedded_rpc_store.as_mut() {
+            embedded.spawn_indexer(
+                subscription_service_checkpoint_sender.clone(),
+                prometheus_registry.clone(),
+            );
+        }
 
         let global_state_hasher = Arc::new(GlobalStateHasher::new(
             cache_traits.global_state_hash_store.clone(),
             GlobalStateHashMetrics::new(&prometheus_registry),
         ));
 
-        let authority_names_to_peer_ids = epoch_store
-            .epoch_start_state()
-            .get_authority_names_to_peer_ids();
-
-        let network_connection_metrics = consensus_core::QuinnConnectionMetrics::new(
+        let network_connection_metrics = mysten_network::quinn_metrics::QuinnConnectionMetrics::new(
             "sui",
             &registry_service.default_registry(),
         );
 
-        let authority_names_to_peer_ids = ArcSwap::from_pointee(authority_names_to_peer_ids);
+        let connection_monitor_handle =
+            mysten_network::anemo_connection_monitor::AnemoConnectionMonitor::spawn(
+                p2p_network.downgrade(),
+                Arc::new(network_connection_metrics),
+                known_peers,
+            );
 
-        let connection_monitor_handle = consensus_core::AnemoConnectionMonitor::spawn(
-            p2p_network.downgrade(),
-            Arc::new(network_connection_metrics),
-            known_peers,
-        );
-
-        let connection_monitor_status = ConnectionMonitorStatus {
-            connection_statuses: connection_monitor_handle.connection_statuses(),
-            authority_names_to_peer_ids,
-        };
-
-        let connection_monitor_status = Arc::new(connection_monitor_status);
         let sui_node_metrics = Arc::new(SuiNodeMetrics::new(&registry_service.default_registry()));
 
         sui_node_metrics
@@ -873,33 +942,94 @@ impl SuiNode {
             .configured_max_protocol_version
             .set(config.supported_protocol_versions.unwrap().max.as_u64() as i64);
 
-        let validator_components = if state.is_validator(&epoch_store) {
-            let (components, _) = futures::join!(
-                Self::construct_validator_components(
-                    config.clone(),
-                    state.clone(),
-                    committee,
-                    epoch_store.clone(),
-                    checkpoint_store.clone(),
-                    state_sync_handle.clone(),
-                    randomness_handle.clone(),
-                    Arc::downgrade(&global_state_hasher),
-                    backpressure_manager.clone(),
-                    connection_monitor_status.clone(),
-                    &registry_service,
-                    sui_node_metrics.clone(),
-                    checkpoint_metrics.clone(),
-                ),
-                Self::reexecute_pending_consensus_certs(&epoch_store, &state,)
-            );
-            let mut components = components?;
+        let consensus_adapter_metrics = OnceLock::new();
+        let transaction_pool_context = config.consensus_transaction_pool.as_ref().map(|_| {
+            Arc::new(TransactionPoolContext::new(
+                Arc::new(AdmissionQueueMetrics::new(
+                    &registry_service.default_registry(),
+                )),
+                consensus_adapter_metrics
+                    .get_or_init(|| {
+                        ConsensusAdapterMetrics::new(&registry_service.default_registry())
+                    })
+                    .clone(),
+            ))
+        });
+        let node_role = epoch_store.node_role();
+        if !node_role.is_validator()
+            && let Some(context) = &transaction_pool_context
+        {
+            context.set_unavailable(epoch_store.epoch());
+        }
+        let validator_components = if node_role.runs_consensus() {
+            let mut components = Self::construct_validator_components(
+                config.clone(),
+                state.clone(),
+                committee,
+                epoch_store.clone(),
+                checkpoint_store.clone(),
+                state_sync_handle.clone(),
+                randomness_handle.clone(),
+                Arc::downgrade(&global_state_hasher),
+                backpressure_manager.clone(),
+                &registry_service,
+                transaction_pool_context.clone(),
+                &consensus_adapter_metrics,
+                sui_node_metrics.clone(),
+                checkpoint_metrics.clone(),
+                node_role,
+                randomness_receiver_handle.clone(),
+            )
+            .await?;
 
-            components.consensus_adapter.submit_recovered(&epoch_store);
+            if node_role.is_validator() {
+                components
+                    .consensus_adapter
+                    .recover_end_of_publish(&epoch_store);
 
-            // Start the gRPC server
-            components.validator_server_handle = components.validator_server_handle.start().await;
+                // Start the gRPC server
+                components.validator_server_handle = Some(
+                    components
+                        .validator_server_handle
+                        .take()
+                        .unwrap()
+                        .start()
+                        .await,
+                );
+
+                // Set the consensus address updater so that we can update the consensus peer addresses when requested.
+                endpoint_manager
+                    .set_consensus_address_updater(components.consensus_manager.clone());
+            } else {
+                info!("Starting node as Observer — connecting to configured peers");
+            }
 
             Some(components)
+        } else {
+            None
+        };
+
+        let address_prober = if Self::address_prober_enabled(&config) {
+            let handle = address_prober::Builder::new()
+                .config(config.address_prober.clone().unwrap_or_default())
+                .with_metrics(&prometheus_registry)
+                .build()
+                .start(
+                    p2p_network.clone(),
+                    discovery_handle.sender(),
+                    consensus_config::NetworkKeyPair::new(config.network_key_pair().copy()),
+                );
+            // Seed the current epoch if we are starting as a validator.
+            if node_role.is_validator()
+                && let Some(components) = &validator_components
+            {
+                handle.update_epoch(
+                    epoch_store.epoch(),
+                    epoch_store.epoch_start_state().get_consensus_committee(),
+                    components.consensus_manager.clone(),
+                );
+            }
+            Some(handle)
         } else {
             None
         };
@@ -924,9 +1054,9 @@ impl SuiNode {
             checkpoint_store,
             global_state_hasher: Mutex::new(Some(global_state_hasher)),
             end_of_epoch_channel,
-            connection_monitor_status,
-            trusted_peer_change_tx,
+            endpoint_manager,
             backpressure_manager,
+            address_prober,
 
             _db_checkpoint_handle: db_checkpoint_handle,
 
@@ -935,9 +1065,13 @@ impl SuiNode {
 
             _state_snapshot_uploader_handle: state_snapshot_handle,
             shutdown_channel_tx: shutdown_channel,
+            randomness_receiver_handle,
+            transaction_pool_context,
+            consensus_adapter_metrics,
 
             auth_agg,
             subscription_service_checkpoint_sender,
+            embedded_rpc_store,
         };
 
         info!("SuiNode started!");
@@ -1018,6 +1152,7 @@ impl SuiNode {
                 prometheus_registry,
                 checkpoint_store,
                 chain_identifier,
+                config.state_snapshot_write_config.archive_interval_epochs,
             )?;
             Ok(Some(snapshot_uploader.start()))
         } else {
@@ -1089,19 +1224,36 @@ impl SuiNode {
         config: &NodeConfig,
         state_sync_store: RocksDbStore,
         chain_identifier: ChainIdentifier,
-        trusted_peer_change_rx: watch::Receiver<TrustedPeerChangeEvent>,
         randomness_tx: mpsc::Sender<(EpochId, RandomnessRound, Vec<u8>)>,
         prometheus_registry: &Registry,
     ) -> Result<P2pComponents> {
-        let (state_sync, state_sync_server) = state_sync::Builder::new()
+        let mut p2p_config = config.p2p_config.clone();
+        {
+            let disc = p2p_config.discovery.get_or_insert_with(Default::default);
+            if disc.peer_addr_store_path.is_none() {
+                disc.peer_addr_store_path =
+                    Some(config.db_path().join("discovery_peer_cache.yaml"));
+            }
+        }
+        let mut discovery_builder = discovery::Builder::new().config(p2p_config.clone());
+        if let Some(consensus_config) = &config.consensus_config {
+            let effective_addr = consensus_config
+                .external_address
+                .as_ref()
+                .or(consensus_config.listen_address.as_ref());
+            if let Some(addr) = effective_addr {
+                discovery_builder = discovery_builder.consensus_external_address(addr.clone());
+            }
+        }
+        let (discovery, discovery_server, endpoint_manager) = discovery_builder.build();
+        let discovery_sender = discovery.sender();
+
+        let (state_sync, state_sync_router) = state_sync::Builder::new()
             .config(config.p2p_config.state_sync.clone().unwrap_or_default())
             .store(state_sync_store)
             .archive_config(config.archive_reader_config())
+            .discovery_sender(discovery_sender)
             .with_metrics(prometheus_registry)
-            .build();
-
-        let (discovery, discovery_server) = discovery::Builder::new(trusted_peer_change_rx)
-            .config(config.p2p_config.clone())
             .build();
 
         let discovery_config = config.p2p_config.discovery.clone().unwrap_or_default();
@@ -1125,13 +1277,16 @@ impl SuiNode {
         let p2p_network = {
             let routes = anemo::Router::new()
                 .add_rpc_service(discovery_server)
-                .add_rpc_service(state_sync_server);
+                .merge(state_sync_router);
             let routes = routes.merge(randomness_router);
 
             let inbound_network_metrics =
-                consensus_core::NetworkRouteMetrics::new("sui", "inbound", prometheus_registry);
-            let outbound_network_metrics =
-                consensus_core::NetworkRouteMetrics::new("sui", "outbound", prometheus_registry);
+                mysten_network::metrics::NetworkMetrics::new("sui", "inbound", prometheus_registry);
+            let outbound_network_metrics = mysten_network::metrics::NetworkMetrics::new(
+                "sui",
+                "outbound",
+                prometheus_registry,
+            );
 
             let service = ServiceBuilder::new()
                 .layer(
@@ -1140,7 +1295,7 @@ impl SuiNode {
                         .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
                 )
                 .layer(CallbackLayer::new(
-                    consensus_core::MetricsMakeCallbackHandler::new(
+                    mysten_network::metrics::MetricsMakeCallbackHandler::new(
                         Arc::new(inbound_network_metrics),
                         config.p2p_config.excessive_message_size(),
                     ),
@@ -1154,7 +1309,7 @@ impl SuiNode {
                         .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
                 )
                 .layer(CallbackLayer::new(
-                    consensus_core::MetricsMakeCallbackHandler::new(
+                    mysten_network::metrics::MetricsMakeCallbackHandler::new(
                         Arc::new(outbound_network_metrics),
                         config.p2p_config.excessive_message_size(),
                     ),
@@ -1162,9 +1317,12 @@ impl SuiNode {
                 .into_inner();
 
             let mut anemo_config = config.p2p_config.anemo_config.clone().unwrap_or_default();
-            // Set the max_frame_size to be 1 GB to work around the issue of there being too many
-            // staking events in the epoch change txn.
-            anemo_config.max_frame_size = Some(1 << 30);
+            // Inbound requests on this network are small (signatures, queries, summaries).
+            // Cap request frames at 1 MiB.
+            anemo_config.max_request_frame_size = Some(1 << 20);
+            // Responses can be larger (checkpoint contents).
+            // Cap response frames at 128 MiB.
+            anemo_config.max_response_frame_size = Some(128 << 20);
 
             // Set a higher default value for socket send/receive buffers if not already
             // configured.
@@ -1198,7 +1356,7 @@ impl SuiNode {
                 quic_config.crypto_buffer_size = Some(1 << 20);
             }
             if quic_config.max_idle_timeout_ms.is_none() {
-                quic_config.max_idle_timeout_ms = Some(30_000);
+                quic_config.max_idle_timeout_ms = Some(10_000);
             }
             if quic_config.keep_alive_interval_ms.is_none() {
                 quic_config.keep_alive_interval_ms = Some(5_000);
@@ -1232,6 +1390,7 @@ impl SuiNode {
             discovery_handle,
             state_sync_handle,
             randomness_handle,
+            endpoint_manager,
         })
     }
 
@@ -1245,33 +1404,41 @@ impl SuiNode {
         randomness_handle: randomness::Handle,
         global_state_hasher: Weak<GlobalStateHasher>,
         backpressure_manager: Arc<BackpressureManager>,
-        connection_monitor_status: Arc<ConnectionMonitorStatus>,
         registry_service: &RegistryService,
+        transaction_pool_context: Option<Arc<TransactionPoolContext>>,
+        consensus_adapter_metrics: &OnceLock<ConsensusAdapterMetrics>,
         sui_node_metrics: Arc<SuiNodeMetrics>,
         checkpoint_metrics: Arc<CheckpointMetrics>,
+        node_role: NodeRole,
+        randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
     ) -> Result<ValidatorComponents> {
         let mut config_clone = config.clone();
         let consensus_config = config_clone
             .consensus_config
             .as_mut()
-            .ok_or_else(|| anyhow!("Validator is missing consensus config"))?;
+            .ok_or_else(|| anyhow!("Node is missing consensus config"))?;
 
         let client = Arc::new(UpdatableConsensusClient::new());
+        let inflight_slot_freed_notify = Arc::new(tokio::sync::Notify::new());
         let consensus_adapter = Arc::new(Self::construct_consensus_adapter(
             &committee,
             consensus_config,
             state.name,
-            connection_monitor_status.clone(),
-            &registry_service.default_registry(),
-            epoch_store.protocol_config().clone(),
+            consensus_adapter_metrics
+                .get_or_init(|| ConsensusAdapterMetrics::new(&registry_service.default_registry()))
+                .clone(),
             client.clone(),
             checkpoint_store.clone(),
+            inflight_slot_freed_notify.clone(),
         ));
+
         let consensus_manager = Arc::new(ConsensusManager::new(
             &config,
             consensus_config,
             registry_service,
             client,
+            transaction_pool_context.clone(),
+            node_role,
         ));
 
         // This only gets started up once, not on every epoch. (Make call to remove every epoch.)
@@ -1285,20 +1452,29 @@ impl SuiNode {
         let sui_tx_validator_metrics =
             SuiTxValidatorMetrics::new(&registry_service.default_registry());
 
-        let validator_server_handle = Self::start_grpc_validator_service(
-            &config,
-            state.clone(),
-            consensus_adapter.clone(),
-            &registry_service.default_registry(),
-        )
-        .await?;
+        let (validator_server_handle, admission_queue) = if node_role.is_validator() {
+            let (handle, queue) = Self::start_grpc_validator_service(
+                &config,
+                state.clone(),
+                consensus_adapter.clone(),
+                epoch_store.clone(),
+                &registry_service.default_registry(),
+                inflight_slot_freed_notify,
+                transaction_pool_context.clone(),
+            )
+            .await?;
+            (Some(handle), queue)
+        } else {
+            (None, None)
+        };
 
         // Starts an overload monitor that monitors the execution of the authority.
         // Don't start the overload monitor when max_load_shedding_percentage is 0.
-        let validator_overload_monitor_handle = if config
-            .authority_overload_config
-            .max_load_shedding_percentage
-            > 0
+        let validator_overload_monitor_handle = if node_role.is_validator()
+            && config
+                .authority_overload_config
+                .max_load_shedding_percentage
+                > 0
         {
             let authority_state = Arc::downgrade(&state);
             let overload_config = config.authority_overload_config.clone();
@@ -1319,6 +1495,7 @@ impl SuiNode {
             epoch_store,
             state_sync_handle,
             randomness_handle,
+            randomness_receiver_handle,
             consensus_manager,
             consensus_store_pruner,
             global_state_hasher,
@@ -1328,8 +1505,42 @@ impl SuiNode {
             checkpoint_metrics,
             sui_node_metrics,
             sui_tx_validator_metrics,
+            admission_queue,
+            transaction_pool_context,
+            node_role,
         )
         .await
+    }
+
+    fn address_prober_enabled(config: &NodeConfig) -> bool {
+        let prober_enabled = config
+            .address_prober
+            .as_ref()
+            .map(|c| c.enabled())
+            .unwrap_or(true);
+        let v3_enabled = config
+            .p2p_config
+            .discovery
+            .as_ref()
+            .is_some_and(|d| d.use_get_known_peers_v3());
+        prober_enabled && v3_enabled
+    }
+
+    fn update_address_prober_epoch(
+        &self,
+        epoch_store: &AuthorityPerEpochStore,
+        consensus_manager: &Arc<ConsensusManager>,
+    ) {
+        if !epoch_store.is_validator() {
+            return;
+        }
+        if let Some(handle) = &self.address_prober {
+            handle.update_epoch(
+                epoch_store.epoch(),
+                epoch_store.epoch_start_state().get_consensus_committee(),
+                consensus_manager.clone(),
+            );
+        }
     }
 
     async fn start_epoch_specific_validator_components(
@@ -1340,15 +1551,19 @@ impl SuiNode {
         epoch_store: Arc<AuthorityPerEpochStore>,
         state_sync_handle: state_sync::Handle,
         randomness_handle: randomness::Handle,
+        randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
         consensus_manager: Arc<ConsensusManager>,
         consensus_store_pruner: ConsensusStorePruner,
         state_hasher: Weak<GlobalStateHasher>,
         backpressure_manager: Arc<BackpressureManager>,
-        validator_server_handle: SpawnOnce,
+        validator_server_handle: Option<SpawnOnce>,
         validator_overload_monitor_handle: Option<JoinHandle<()>>,
         checkpoint_metrics: Arc<CheckpointMetrics>,
         sui_node_metrics: Arc<SuiNodeMetrics>,
         sui_tx_validator_metrics: Arc<SuiTxValidatorMetrics>,
+        admission_queue: Option<AdmissionQueueContext>,
+        transaction_pool_context: Option<Arc<TransactionPoolContext>>,
+        node_role: NodeRole,
     ) -> Result<ValidatorComponents> {
         let checkpoint_service = Self::build_checkpoint_service(
             config,
@@ -1359,21 +1574,25 @@ impl SuiNode {
             state_sync_handle,
             state_hasher,
             checkpoint_metrics.clone(),
+            node_role,
         );
 
-        // create a new map that gets injected into both the consensus handler and the consensus adapter
-        // the consensus handler will write values forwarded from consensus, and the consensus adapter
-        // will read the values to make decisions about which validator submits a transaction to consensus
-        let low_scoring_authorities = Arc::new(ArcSwap::new(Arc::new(HashMap::new())));
+        // Clear the VSS public key from the previous epoch so any randomness round
+        // signatures buffer in the channel until the new DKG completes.
+        randomness_receiver_handle.clear_public_key();
 
-        consensus_adapter.swap_low_scoring_authorities(low_scoring_authorities.clone());
-
-        if epoch_store.randomness_state_enabled() {
+        if node_role.runs_consensus() && epoch_store.randomness_state_enabled() {
+            let authority_key_pair = if node_role.is_validator() {
+                Some(config.protocol_key_pair())
+            } else {
+                None
+            };
             let randomness_manager = RandomnessManager::try_new(
                 Arc::downgrade(&epoch_store),
                 Box::new(consensus_adapter.clone()),
                 randomness_handle,
-                config.protocol_key_pair(),
+                authority_key_pair,
+                randomness_receiver_handle.clone(),
             )
             .await;
             if let Some(randomness_manager) = randomness_manager {
@@ -1383,38 +1602,29 @@ impl SuiNode {
             }
         }
 
-        ExecutionTimeObserver::spawn(
-            epoch_store.clone(),
-            Box::new(consensus_adapter.clone()),
-            config
-                .execution_time_observer_config
-                .clone()
-                .unwrap_or_default(),
-        );
+        if node_role.is_validator() {
+            ExecutionTimeObserver::spawn(
+                epoch_store.clone(),
+                Box::new(consensus_adapter.clone()),
+                config
+                    .execution_time_observer_config
+                    .clone()
+                    .unwrap_or_default(),
+            );
+        }
 
         let throughput_calculator = Arc::new(ConsensusThroughputCalculator::new(
             None,
             state.metrics.clone(),
         ));
 
-        let throughput_profiler = Arc::new(ConsensusThroughputProfiler::new(
-            throughput_calculator.clone(),
-            None,
-            None,
-            state.metrics.clone(),
-            ThroughputProfileRanges::from_chain(epoch_store.get_chain_identifier()),
-        ));
-
-        consensus_adapter.swap_throughput_profiler(throughput_profiler);
-
         let consensus_handler_initializer = ConsensusHandlerInitializer::new(
             state.clone(),
             checkpoint_service.clone(),
             epoch_store.clone(),
-            consensus_adapter.clone(),
-            low_scoring_authorities,
             throughput_calculator,
             backpressure_manager,
+            config.congestion_log.clone(),
         );
 
         info!("Starting consensus manager asynchronously");
@@ -1425,7 +1635,7 @@ impl SuiNode {
             let epoch_store = epoch_store.clone();
             let sui_tx_validator = SuiTxValidator::new(
                 state.clone(),
-                consensus_adapter.clone(),
+                epoch_store.clone(),
                 checkpoint_service.clone(),
                 sui_tx_validator_metrics.clone(),
             );
@@ -1437,6 +1647,7 @@ impl SuiNode {
                         epoch_store,
                         consensus_handler_initializer,
                         sui_tx_validator,
+                        Some(randomness_receiver_handle),
                     )
                     .await;
             }
@@ -1453,7 +1664,7 @@ impl SuiNode {
             .spawn(epoch_store.clone(), replay_waiter)
             .await;
 
-        if epoch_store.authenticator_state_enabled() {
+        if node_role.is_validator() && epoch_store.authenticator_state_enabled() {
             Self::start_jwk_updater(
                 config,
                 sui_node_metrics,
@@ -1461,6 +1672,10 @@ impl SuiNode {
                 epoch_store.clone(),
                 consensus_adapter.clone(),
             );
+        }
+
+        if let Some(ctx) = &admission_queue {
+            ctx.rotate_for_epoch(epoch_store);
         }
 
         Ok(ValidatorComponents {
@@ -1471,6 +1686,8 @@ impl SuiNode {
             consensus_adapter,
             checkpoint_metrics,
             sui_tx_validator_metrics,
+            admission_queue,
+            transaction_pool_context,
         })
     }
 
@@ -1483,30 +1700,20 @@ impl SuiNode {
         state_sync_handle: state_sync::Handle,
         state_hasher: Weak<GlobalStateHasher>,
         checkpoint_metrics: Arc<CheckpointMetrics>,
+        node_role: NodeRole,
     ) -> Arc<CheckpointService> {
-        let epoch_start_timestamp_ms = epoch_store.epoch_start_state().epoch_start_timestamp_ms();
-        let epoch_duration_ms = epoch_store.epoch_start_state().epoch_duration_ms();
-
-        debug!(
-            "Starting checkpoint service with epoch start timestamp {}
-            and epoch duration {}",
-            epoch_start_timestamp_ms, epoch_duration_ms
-        );
-
-        let checkpoint_output = Box::new(SubmitCheckpointToConsensus {
-            sender: consensus_adapter,
-            signer: state.secret.clone(),
-            authority: config.protocol_public_key(),
-            next_reconfiguration_timestamp_ms: epoch_start_timestamp_ms
-                .checked_add(epoch_duration_ms)
-                .expect("Overflow calculating next_reconfiguration_timestamp_ms"),
-            metrics: checkpoint_metrics.clone(),
-        });
+        let checkpoint_output: Box<dyn CheckpointOutput> = if node_role.is_validator() {
+            Box::new(SubmitCheckpointToConsensus::new(
+                consensus_adapter,
+                state.secret.clone(),
+                config.protocol_public_key(),
+                checkpoint_metrics.clone(),
+            ))
+        } else {
+            Box::new(LogCheckpointOutput::new(checkpoint_metrics.clone()))
+        };
 
         let certified_checkpoint_output = SendCheckpointToStateSync::new(state_sync_handle);
-        let max_tx_per_checkpoint = max_tx_per_checkpoint(epoch_store.protocol_config());
-        let max_checkpoint_size_bytes =
-            epoch_store.protocol_config().max_checkpoint_size_bytes() as usize;
 
         CheckpointService::build(
             state.clone(),
@@ -1517,8 +1724,6 @@ impl SuiNode {
             checkpoint_output,
             Box::new(certified_checkpoint_output),
             checkpoint_metrics,
-            max_tx_per_checkpoint,
-            max_checkpoint_size_bytes,
         )
     }
 
@@ -1526,26 +1731,20 @@ impl SuiNode {
         committee: &Committee,
         consensus_config: &ConsensusConfig,
         authority: AuthorityName,
-        connection_monitor_status: Arc<ConnectionMonitorStatus>,
-        prometheus_registry: &Registry,
-        protocol_config: ProtocolConfig,
+        ca_metrics: ConsensusAdapterMetrics,
         consensus_client: Arc<dyn ConsensusClient>,
         checkpoint_store: Arc<CheckpointStore>,
+        inflight_slot_freed_notify: Arc<tokio::sync::Notify>,
     ) -> ConsensusAdapter {
-        let ca_metrics = ConsensusAdapterMetrics::new(prometheus_registry);
         // The consensus adapter allows the authority to send user certificates through consensus.
-
         ConsensusAdapter::new(
             consensus_client,
             checkpoint_store,
             authority,
-            connection_monitor_status,
             consensus_config.max_pending_transactions(),
             consensus_config.max_pending_transactions() * 2 / committee.num_members(),
-            consensus_config.max_submit_position,
-            consensus_config.submit_delay_step_override(),
             ca_metrics,
-            protocol_config,
+            inflight_slot_freed_notify,
         )
     }
 
@@ -1553,13 +1752,38 @@ impl SuiNode {
         config: &NodeConfig,
         state: Arc<AuthorityState>,
         consensus_adapter: Arc<ConsensusAdapter>,
+        epoch_store: Arc<AuthorityPerEpochStore>,
         prometheus_registry: &Registry,
-    ) -> Result<SpawnOnce> {
+        inflight_slot_freed_notify: Arc<tokio::sync::Notify>,
+        transaction_pool_context: Option<Arc<TransactionPoolContext>>,
+    ) -> Result<(SpawnOnce, Option<AdmissionQueueContext>)> {
+        let overload_config = &config.authority_overload_config;
+        let admission_queue =
+            if transaction_pool_context.is_none() && overload_config.admission_queue_enabled {
+                let manager = Arc::new(AdmissionQueueManager::new(
+                    consensus_adapter.clone(),
+                    Arc::new(AdmissionQueueMetrics::new(prometheus_registry)),
+                    overload_config.admission_queue_capacity_fraction,
+                    overload_config.admission_queue_failover_timeout,
+                    inflight_slot_freed_notify,
+                ));
+                Some(AdmissionQueueContext::spawn(manager, epoch_store))
+            } else {
+                None
+            };
+        let user_submission_path = if let Some(context) = transaction_pool_context {
+            UserSubmissionPath::Pool(context)
+        } else if let Some(context) = admission_queue.clone() {
+            UserSubmissionPath::AdmissionQueue(context)
+        } else {
+            UserSubmissionPath::Direct
+        };
         let validator_service = ValidatorService::new(
             state.clone(),
             consensus_adapter,
             Arc::new(ValidatorServiceMetrics::new(prometheus_registry)),
             config.policy_config.clone().map(|p| p.client_id_source),
+            user_submission_path,
         );
 
         let mut server_conf = mysten_network::config::Config::new();
@@ -1582,7 +1806,7 @@ impl SuiNode {
 
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        Ok(SpawnOnce::new(ready_rx, async move {
+        let spawn_once = SpawnOnce::new(ready_rx, async move {
             let server = server_builder
                 .bind(&network_address, Some(tls_config))
                 .await
@@ -1594,122 +1818,59 @@ impl SuiNode {
                 info!("Server stopped: {err}");
             }
             info!("Server stopped");
-        }))
-    }
-
-    /// Re-executes pending consensus certificates, which may not have been committed to disk
-    /// before the node restarted. This is necessary for the following reasons:
-    ///
-    /// 1. For any transaction for which we returned signed effects to a client, we must ensure
-    ///    that we have re-executed the transaction before we begin accepting grpc requests.
-    ///    Otherwise we would appear to have forgotten about the transaction.
-    /// 2. While this is running, we are concurrently waiting for all previously built checkpoints
-    ///    to be rebuilt. Since there may be dependencies in either direction (from checkpointed
-    ///    consensus transactions to pending consensus transactions, or vice versa), we must
-    ///    re-execute pending consensus transactions to ensure that both processes can complete.
-    /// 3. Also note that for any pending consensus transactions for which we wrote a signed effects
-    ///    digest to disk, we must re-execute using that digest as the expected effects digest,
-    ///    to ensure that we cannot arrive at different effects than what we previously signed.
-    async fn reexecute_pending_consensus_certs(
-        epoch_store: &Arc<AuthorityPerEpochStore>,
-        state: &Arc<AuthorityState>,
-    ) {
-        let mut pending_consensus_certificates = Vec::new();
-        let mut additional_certs = Vec::new();
-
-        for tx in epoch_store.get_all_pending_consensus_transactions() {
-            match tx.kind {
-                // Shared object txns cannot be re-executed at this point, because we must wait for
-                // consensus replay to assign shared object versions.
-                ConsensusTransactionKind::CertifiedTransaction(tx) if !tx.is_consensus_tx() => {
-                    let tx = *tx;
-                    // new_unchecked is safe because we never submit a transaction to consensus
-                    // without verifying it
-                    let tx = VerifiedExecutableTransaction::new_from_certificate(
-                        VerifiedCertificate::new_unchecked(tx),
-                    );
-                    // we only need to re-execute if we previously signed the effects (which indicates we
-                    // returned the effects to a client).
-                    if let Some(fx_digest) = epoch_store
-                        .get_signed_effects_digest(tx.digest())
-                        .expect("db error")
-                    {
-                        pending_consensus_certificates.push((
-                            Schedulable::Transaction(tx),
-                            ExecutionEnv::new().with_expected_effects_digest(fx_digest),
-                        ));
-                    } else {
-                        additional_certs.push((
-                            Schedulable::Transaction(tx),
-                            ExecutionEnv::new()
-                                .with_scheduling_source(SchedulingSource::NonFastPath),
-                        ));
-                    }
-                }
-                _ => (),
-            }
-        }
-
-        let digests = pending_consensus_certificates
-            .iter()
-            // unwrap_digest okay because only user certs are in pending_consensus_certificates
-            .map(|(tx, _)| *tx.key().unwrap_digest())
-            .collect::<Vec<_>>();
-
-        info!(
-            "reexecuting {} pending consensus certificates: {:?}",
-            digests.len(),
-            digests
-        );
-
-        state
-            .execution_scheduler()
-            .enqueue(pending_consensus_certificates, epoch_store);
-        state
-            .execution_scheduler()
-            .enqueue(additional_certs, epoch_store);
-
-        // If this times out, the validator will still almost certainly start up fine. But, it is
-        // possible that it may temporarily "forget" about transactions that it had previously
-        // executed. This could confuse clients in some circumstances. However, the transactions
-        // are still in pending_consensus_certificates, so we cannot lose any finality guarantees.
-        let timeout = if cfg!(msim) { 120 } else { 60 };
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            state
-                .get_transaction_cache_reader()
-                .notify_read_executed_effects_digests(
-                    "SuiNode::notify_read_executed_effects_digests",
-                    &digests,
-                ),
-        )
-        .await
-        .is_err()
-        {
-            // Log all the digests that were not executed to help debugging.
-            let executed_effects_digests = state
-                .get_transaction_cache_reader()
-                .multi_get_executed_effects_digests(&digests);
-            let pending_digests = digests
-                .iter()
-                .zip(executed_effects_digests.iter())
-                .filter_map(|(digest, executed_effects_digest)| {
-                    if executed_effects_digest.is_none() {
-                        Some(digest)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            debug_fatal!(
-                "Timed out waiting for effects digests to be executed: {:?}",
-                pending_digests
-            );
-        }
+        });
+        Ok((spawn_once, admission_queue))
     }
 
     pub fn state(&self) -> Arc<AuthorityState> {
         self.state.clone()
+    }
+
+    /// The embedded `sui-rpc-store` index backend, when the node is a
+    /// fullnode with indexing enabled. Exposes the startup bootstrap
+    /// decision and per-cohort watermarks for introspection (used by
+    /// tests to observe restore/resume behavior across restarts without
+    /// going through the RPC surface).
+    pub fn embedded_rpc_store(&self) -> Option<&EmbeddedRpcStore> {
+        self.embedded_rpc_store.as_ref()
+    }
+
+    #[cfg(any(test, msim))]
+    pub fn connection_monitor_handle_for_testing(
+        &self,
+    ) -> &mysten_network::anemo_connection_monitor::ConnectionMonitorHandle {
+        &self._connection_monitor_handle
+    }
+
+    #[cfg(any(test, msim))]
+    pub fn address_prober_metrics_for_testing(
+        &self,
+    ) -> std::sync::Arc<address_prober::AddressProberMetrics> {
+        self.address_prober
+            .as_ref()
+            .expect("address prober should be running in tests")
+            .metrics_for_testing()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn prometheus_metrics_for_testing(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.registry_service.default_registry().gather()
+    }
+
+    pub fn node_role(&self) -> NodeRole {
+        self.state.load_epoch_store_one_call_per_task().node_role()
+    }
+
+    /// Returns the validator's `ConsensusAdapter` if this node currently has validator
+    /// components running. The Arc is cloned out and the lock is released immediately
+    /// so callers never hold the `validator_components` mutex across consensus
+    /// submission.
+    pub async fn consensus_adapter(&self) -> Option<Arc<ConsensusAdapter>> {
+        self.validator_components
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| c.consensus_adapter.clone())
     }
 
     // Only used for testing because of how epoch store is loaded.
@@ -1721,15 +1882,27 @@ impl SuiNode {
         self.state.committee_store().clone()
     }
 
-    /*
-    pub fn clone_authority_store(&self) -> Arc<AuthorityStore> {
-        self.state.db()
+    pub fn clone_checkpoint_store(&self) -> Arc<CheckpointStore> {
+        self.checkpoint_store.clone()
     }
-    */
 
-    /// Clone an AuthorityAggregator currently used in this node's
-    /// QuorumDriver, if the node is a fullnode. After reconfig,
-    /// QuorumDriver builds a new AuthorityAggregator. The caller
+    pub fn clone_authority_store(&self) -> Arc<AuthorityStore> {
+        self.state.authority_store()
+    }
+
+    pub fn clone_consensus_store(
+        &self,
+    ) -> Option<Arc<consensus_core::storage::rocksdb_store::RocksDBStore>> {
+        self.validator_components
+            .try_lock()
+            .ok()?
+            .as_ref()?
+            .consensus_manager
+            .consensus_store()
+    }
+
+    /// Clone an AuthorityAggregator currently used in this node, if the node is a fullnode.
+    /// After reconfig, Transaction Driver builds a new AuthorityAggregator. The caller
     /// of this function will mostly likely want to call this again
     /// to get a fresh one.
     pub fn clone_authority_aggregator(
@@ -1754,6 +1927,12 @@ impl SuiNode {
     ) -> Result<()> {
         let checkpoint_executor_metrics =
             CheckpointExecutorMetrics::new(&self.registry_service.default_registry());
+
+        // Holds the startup-specific deny-config broadcast setting; consumed by the
+        // first iteration on which deny-config sharing is enabled in the protocol
+        // config. Subsequent iterations fall back to the epoch-change setting.
+        let mut broadcast_on_startup: Option<bool> =
+            Some(self.config.peer_deny_sync_config.broadcast_on_startup);
 
         loop {
             let mut hasher_guard = self.global_state_hasher.lock().await;
@@ -1783,38 +1962,51 @@ impl SuiNode {
                 .set(cur_epoch_store.protocol_config().version.as_u64() as i64);
 
             // Advertise capabilities to committee, if we are a validator.
-            if let Some(components) = &*self.validator_components.lock().await {
+            // FullNodes that state sync via consensus will also have validator components, by they are not supposed to submit any capabilities.
+            if let Some(components) = &*self.validator_components.lock().await
+                && cur_epoch_store.is_validator()
+            {
                 // TODO: without this sleep, the consensus message is not delivered reliably.
                 tokio::time::sleep(Duration::from_millis(1)).await;
 
                 let config = cur_epoch_store.protocol_config();
-                let binary_config = to_binary_config(config);
-                let transaction = if config.authority_capabilities_v2() {
-                    ConsensusTransaction::new_capability_notification_v2(
-                        AuthorityCapabilitiesV2::new(
-                            self.state.name,
-                            cur_epoch_store.get_chain_identifier().chain(),
-                            self.config
-                                .supported_protocol_versions
-                                .expect("Supported versions should be populated")
-                                // no need to send digests of versions less than the current version
-                                .truncate_below(config.version),
-                            self.state
-                                .get_available_system_packages(&binary_config)
-                                .await,
-                        ),
-                    )
-                } else {
-                    ConsensusTransaction::new_capability_notification(AuthorityCapabilitiesV1::new(
+                let mut supported_protocol_versions = self
+                    .config
+                    .supported_protocol_versions
+                    .expect("Supported versions should be populated")
+                    // no need to send digests of versions less than the current version
+                    .truncate_below(config.version);
+
+                while supported_protocol_versions.max > config.version {
+                    let proposed_protocol_config = ProtocolConfig::get_for_version(
+                        supported_protocol_versions.max,
+                        cur_epoch_store.get_chain(),
+                    );
+
+                    if proposed_protocol_config.enable_accumulators()
+                        && !epoch_store.accumulator_root_exists()
+                    {
+                        error!(
+                            "cannot upgrade to protocol version {:?} because accumulator root does not exist",
+                            supported_protocol_versions.max
+                        );
+                        supported_protocol_versions.max = supported_protocol_versions.max.prev();
+                    } else {
+                        break;
+                    }
+                }
+
+                let binary_config = config.binary_config(None);
+                let transaction = ConsensusTransaction::new_capability_notification_v2(
+                    AuthorityCapabilitiesV2::new(
                         self.state.name,
-                        self.config
-                            .supported_protocol_versions
-                            .expect("Supported versions should be populated"),
+                        cur_epoch_store.get_chain_identifier().chain(),
+                        supported_protocol_versions,
                         self.state
                             .get_available_system_packages(&binary_config)
                             .await,
-                    ))
-                };
+                    ),
+                );
                 info!(?transaction, "submitting capabilities to consensus");
                 components.consensus_adapter.submit(
                     transaction,
@@ -1823,6 +2015,40 @@ impl SuiNode {
                     None,
                     None,
                 )?;
+
+                // Reconcile our shared TransactionDenyConfig vote with the (possibly
+                // restart-edited) local config.
+                if cur_epoch_store
+                    .protocol_config()
+                    .share_transaction_deny_config_in_consensus()
+                {
+                    let sync_cfg = &self.config.peer_deny_sync_config;
+                    let is_startup = broadcast_on_startup.is_some();
+                    let should_broadcast = broadcast_on_startup
+                        .take()
+                        .unwrap_or(sync_cfg.broadcast_on_epoch_change);
+                    let manager = self.state.transaction_deny_config_manager();
+                    let publish = |rules: Option<TransactionDenyRules>| {
+                        if let Err(e) = manager.submit_broadcast(
+                            rules,
+                            &components.consensus_adapter,
+                            &cur_epoch_store,
+                        ) {
+                            warn!("Failed to broadcast transaction deny config: {e:?}");
+                        }
+                    };
+                    let action = deny_config_broadcast_payload(
+                        manager.local().rules(),
+                        should_broadcast,
+                        is_startup,
+                        manager.may_have_outstanding_broadcast(),
+                    );
+                    match action {
+                        DenyConfigBroadcastAction::Skip => {}
+                        DenyConfigBroadcastAction::Broadcast(rules) => publish(Some(rules)),
+                        DenyConfigBroadcastAction::Withdraw => publish(None),
+                    }
+                }
             }
 
             let stop_condition = checkpoint_executor.run_epoch(run_with_range).await;
@@ -1854,13 +2080,13 @@ impl SuiNode {
             #[cfg(not(msim))]
             debug_assert!(!latest_system_state.safe_mode());
 
-            if let Err(err) = self.end_of_epoch_channel.send(latest_system_state.clone()) {
-                if self.state.is_fullnode(&cur_epoch_store) {
-                    warn!(
-                        "Failed to send end of epoch notification to subscriber: {:?}",
-                        err
-                    );
-                }
+            if let Err(err) = self.end_of_epoch_channel.send(latest_system_state.clone())
+                && self.state.is_fullnode(&cur_epoch_store)
+            {
+                warn!(
+                    "Failed to send end of epoch notification to subscriber: {:?}",
+                    err
+                );
             }
 
             cur_epoch_store.record_is_safe_mode_metric(latest_system_state.safe_mode());
@@ -1883,21 +2109,13 @@ impl SuiNode {
 
             fail_point_async!("reconfig_delay");
 
-            // We save the connection monitor status map regardless of validator / fullnode status
-            // so that we don't need to restart the connection monitor every epoch.
-            // Update the mappings that will be used by the consensus adapter if it exists or is
-            // about to be created.
-            let authority_names_to_peer_ids =
-                new_epoch_start_state.get_authority_names_to_peer_ids();
-            self.connection_monitor_status
-                .update_mapping_for_epoch(authority_names_to_peer_ids);
-
             cur_epoch_store.record_epoch_reconfig_start_time_metric();
 
-            let _ = send_trusted_peer_change(
+            update_peer_addresses(
                 &self.config,
-                &self.trusted_peer_change_tx,
+                &self.endpoint_manager,
                 &new_epoch_start_state,
+                Some(cur_epoch_store.epoch_start_state()),
             );
 
             let mut validator_components_lock_guard = self.validator_components.lock().await;
@@ -1915,6 +2133,13 @@ impl SuiNode {
                 )
                 .await;
 
+            let new_role = new_epoch_store.node_role();
+            if !new_role.is_validator()
+                && let Some(context) = &self.transaction_pool_context
+            {
+                context.set_unavailable(next_epoch);
+            }
+
             let new_validator_components = if let Some(ValidatorComponents {
                 validator_server_handle,
                 validator_overload_monitor_handle,
@@ -1923,12 +2148,19 @@ impl SuiNode {
                 consensus_adapter,
                 checkpoint_metrics,
                 sui_tx_validator_metrics,
+                admission_queue,
+                transaction_pool_context,
             }) = validator_components_lock_guard.take()
             {
-                info!("Reconfiguring the validator.");
+                info!("Reconfiguring node (was running consensus).");
 
+                fail_point_async!("consensus_transaction_pool_reconfig_before_shutdown");
                 consensus_manager.shutdown().await;
                 info!("Consensus has shut down.");
+
+                if let Some(handle) = &self.address_prober {
+                    handle.leave_committee();
+                }
 
                 info!("Epoch store finished reconfiguration.");
 
@@ -1946,31 +2178,40 @@ impl SuiNode {
 
                 consensus_store_pruner.prune(next_epoch).await;
 
-                if self.state.is_validator(&new_epoch_store) {
-                    // Only restart consensus if this node is still a validator in the new epoch.
-                    Some(
-                        Self::start_epoch_specific_validator_components(
-                            &self.config,
-                            self.state.clone(),
-                            consensus_adapter,
-                            self.checkpoint_store.clone(),
-                            new_epoch_store.clone(),
-                            self.state_sync_handle.clone(),
-                            self.randomness_handle.clone(),
-                            consensus_manager,
-                            consensus_store_pruner,
-                            weak_hasher,
-                            self.backpressure_manager.clone(),
-                            validator_server_handle,
-                            validator_overload_monitor_handle,
-                            checkpoint_metrics,
-                            self.metrics.clone(),
-                            sui_tx_validator_metrics,
-                        )
-                        .await?,
+                if new_role.runs_consensus() {
+                    info!("Restarting consensus as {new_role}");
+                    let components = Self::start_epoch_specific_validator_components(
+                        &self.config,
+                        self.state.clone(),
+                        consensus_adapter,
+                        self.checkpoint_store.clone(),
+                        new_epoch_store.clone(),
+                        self.state_sync_handle.clone(),
+                        self.randomness_handle.clone(),
+                        self.randomness_receiver_handle.clone(),
+                        consensus_manager,
+                        consensus_store_pruner,
+                        weak_hasher,
+                        self.backpressure_manager.clone(),
+                        validator_server_handle,
+                        validator_overload_monitor_handle,
+                        checkpoint_metrics,
+                        self.metrics.clone(),
+                        sui_tx_validator_metrics,
+                        admission_queue,
+                        transaction_pool_context.clone(),
+                        new_role,
                     )
+                    .await?;
+                    self.update_address_prober_epoch(
+                        &new_epoch_store,
+                        &components.consensus_manager,
+                    );
+                    Some(components)
                 } else {
-                    info!("This node is no longer a validator after reconfiguration");
+                    info!(
+                        "This node has new role {new_role} and no longer runs consensus after reconfiguration"
+                    );
                     None
                 }
             } else {
@@ -1986,8 +2227,8 @@ impl SuiNode {
                 let weak_hasher = Arc::downgrade(&new_hasher);
                 *hasher_guard = Some(new_hasher);
 
-                if self.state.is_validator(&new_epoch_store) {
-                    info!("Promoting the node from fullnode to validator, starting grpc server");
+                if new_role.runs_consensus() {
+                    info!("Promoting node to {new_role}, starting consensus components");
 
                     let mut components = Self::construct_validator_components(
                         self.config.clone(),
@@ -1999,16 +2240,34 @@ impl SuiNode {
                         self.randomness_handle.clone(),
                         weak_hasher,
                         self.backpressure_manager.clone(),
-                        self.connection_monitor_status.clone(),
                         &self.registry_service,
+                        self.transaction_pool_context.clone(),
+                        &self.consensus_adapter_metrics,
                         self.metrics.clone(),
                         self.checkpoint_metrics.clone(),
+                        new_role,
+                        self.randomness_receiver_handle.clone(),
                     )
                     .await?;
 
-                    components.validator_server_handle =
-                        components.validator_server_handle.start().await;
+                    if new_role.is_validator() {
+                        components.validator_server_handle = Some(
+                            components
+                                .validator_server_handle
+                                .take()
+                                .unwrap()
+                                .start()
+                                .await,
+                        );
 
+                        self.endpoint_manager
+                            .set_consensus_address_updater(components.consensus_manager.clone());
+                    }
+
+                    self.update_address_prober_epoch(
+                        &new_epoch_store,
+                        &components.consensus_manager,
+                    );
                     Some(components)
                 } else {
                     None
@@ -2044,6 +2303,9 @@ impl SuiNode {
     async fn shutdown(&self) {
         if let Some(validator_components) = &*self.validator_components.lock().await {
             validator_components.consensus_manager.shutdown().await;
+        }
+        if let Some(context) = &self.transaction_pool_context {
+            context.set_unavailable(self.state.load_epoch_store_one_call_per_task().epoch());
         }
     }
 
@@ -2111,6 +2373,21 @@ impl SuiNode {
         self.randomness_handle.clone()
     }
 
+    pub fn state_sync_handle(&self) -> state_sync::Handle {
+        self.state_sync_handle.clone()
+    }
+
+    pub fn endpoint_manager(&self) -> &EndpointManager {
+        &self.endpoint_manager
+    }
+
+    pub async fn address_prober_report(&self) -> Option<address_prober::ProbeReport> {
+        match &self.address_prober {
+            Some(handle) => handle.probe_report().await,
+            None => None,
+        }
+    }
+
     /// Get a short prefix of a digest for metric labels
     fn get_digest_prefix(digest: impl std::fmt::Display) -> String {
         let digest_str = digest.to_string();
@@ -2127,22 +2404,28 @@ impl SuiNode {
     async fn check_and_recover_forks(
         checkpoint_store: &CheckpointStore,
         checkpoint_metrics: &CheckpointMetrics,
-        is_validator: bool,
         fork_recovery: Option<&ForkRecoveryConfig>,
+        build_version: &str,
     ) -> Result<()> {
-        // Fork detection and recovery is only relevant for validators
-        // Fullnodes should sync from validators and don't need fork checking
-        if !is_validator {
-            return Ok(());
-        }
-
-        // Try to recover from forks if recovery config is provided
+        // Manual recovery from operator-supplied overrides; runs regardless of fork_crash_behavior
+        // and only acts on the checkpoints / transactions explicitly listed in the config.
         if let Some(recovery) = fork_recovery {
             Self::try_recover_checkpoint_fork(checkpoint_store, recovery)?;
             Self::try_recover_transaction_fork(checkpoint_store, recovery)?;
         }
 
-        if let Some((checkpoint_seq, checkpoint_digest)) = checkpoint_store
+        let behavior = fork_recovery
+            .map(|fr| fr.fork_crash_behavior)
+            .unwrap_or_default();
+
+        match behavior {
+            ForkCrashBehavior::RecoverOncePerVersion => {
+                Self::try_recover_forks(checkpoint_store, checkpoint_metrics, build_version)?;
+            }
+            ForkCrashBehavior::AwaitForkRecovery | ForkCrashBehavior::ReturnError => {}
+        }
+
+        if let Some(fork_info) = checkpoint_store
             .get_checkpoint_fork_detected()
             .map_err(|e| {
                 error!("Failed to check for checkpoint fork: {:?}", e);
@@ -2150,14 +2433,14 @@ impl SuiNode {
             })?
         {
             Self::handle_checkpoint_fork(
-                checkpoint_seq,
-                checkpoint_digest,
+                fork_info.checkpoint_seq,
+                fork_info.checkpoint_digest,
                 checkpoint_metrics,
                 fork_recovery,
             )
             .await?;
         }
-        if let Some((tx_digest, expected_effects, actual_effects)) = checkpoint_store
+        if let Some(fork_info) = checkpoint_store
             .get_transaction_fork_detected()
             .map_err(|e| {
                 error!("Failed to check for transaction fork: {:?}", e);
@@ -2165,9 +2448,9 @@ impl SuiNode {
             })?
         {
             Self::handle_transaction_fork(
-                tx_digest,
-                expected_effects,
-                actual_effects,
+                fork_info.tx_digest,
+                fork_info.expected_effects_digest,
+                fork_info.actual_effects_digest,
                 checkpoint_metrics,
                 fork_recovery,
             )
@@ -2177,12 +2460,17 @@ impl SuiNode {
         Ok(())
     }
 
+    /// Manual recovery: for each `seq -> digest` override, if the locally computed checkpoint at
+    /// `seq` differs, clear locally computed checkpoints from `seq` (and the checkpoint fork marker)
+    /// so the node rebuilds toward the operator-specified digest.
     fn try_recover_checkpoint_fork(
         checkpoint_store: &CheckpointStore,
         recovery: &ForkRecoveryConfig,
     ) -> Result<()> {
-        // If configured overrides include a checkpoint whose locally computed digest mismatches,
-        // clear locally computed checkpoints from that sequence (inclusive).
+        if recovery.checkpoint_overrides.is_empty() {
+            return Ok(());
+        }
+
         for (seq, expected_digest_str) in &recovery.checkpoint_overrides {
             let Ok(expected_digest) = CheckpointDigest::from_str(expected_digest_str) else {
                 anyhow::bail!(
@@ -2211,22 +2499,24 @@ impl SuiNode {
             }
         }
 
-        if let Some((checkpoint_seq, checkpoint_digest)) =
-            checkpoint_store.get_checkpoint_fork_detected()?
+        if let Some(fork_info) = checkpoint_store.get_checkpoint_fork_detected()?
+            && recovery
+                .checkpoint_overrides
+                .contains_key(&fork_info.checkpoint_seq)
         {
-            if recovery.checkpoint_overrides.contains_key(&checkpoint_seq) {
-                info!(
-                    "Fork recovery enabled: clearing checkpoint fork at seq {} with digest {:?}",
-                    checkpoint_seq, checkpoint_digest
-                );
-                checkpoint_store
-                    .clear_checkpoint_fork_detected()
-                    .expect("Failed to clear checkpoint fork detected marker");
-            }
+            info!(
+                "Fork recovery enabled: clearing checkpoint fork at seq {} with digest {:?}",
+                fork_info.checkpoint_seq, fork_info.checkpoint_digest
+            );
+            checkpoint_store
+                .clear_checkpoint_fork_detected()
+                .expect("Failed to clear checkpoint fork detected marker");
         }
         Ok(())
     }
 
+    /// Manual recovery: if the forked transaction is listed in transaction_overrides, clear its fork
+    /// marker so the node proceeds on restart.
     fn try_recover_transaction_fork(
         checkpoint_store: &CheckpointStore,
         recovery: &ForkRecoveryConfig,
@@ -2235,20 +2525,125 @@ impl SuiNode {
             return Ok(());
         }
 
-        if let Some((tx_digest, _, _)) = checkpoint_store.get_transaction_fork_detected()? {
-            if recovery
+        if let Some(fork_info) = checkpoint_store.get_transaction_fork_detected()?
+            && recovery
                 .transaction_overrides
-                .contains_key(&tx_digest.to_string())
-            {
+                .contains_key(&fork_info.tx_digest.to_string())
+        {
+            info!(
+                "Fork recovery enabled: clearing transaction fork for tx {:?}",
+                fork_info.tx_digest
+            );
+            checkpoint_store
+                .clear_transaction_fork_detected()
+                .expect("Failed to clear transaction fork detected marker");
+        }
+        Ok(())
+    }
+
+    /// Auto-recovery: clear fork markers (the affected seq/tx is read from the markers) so the
+    /// node re-derives canonically. A marker is cleared only if both gates pass:
+    ///
+    /// - Version gate: the marker was recorded by a different binary version than the one now
+    ///   running. The binary that forked would deterministically fork again, so clearing under
+    ///   it would only add a second equivocation; the node hangs until a corrected binary is
+    ///   deployed.
+    /// - Certification gate: the marker records the certified checkpoint the node diverged
+    ///   from. Markers carry it only when detection compared against a certificate already
+    ///   durably persisted locally, so its presence proves the network certified the canonical
+    ///   outcome. Recovery is deliberate equivocation — the node may have already signed the
+    ///   forked result and will sign a different one after re-deriving — which is safe only
+    ///   under that proof: a quorum certificate is irrevocable (a conflicting certificate would
+    ///   require f+1 double-signers), so re-signing can no longer influence what finalizes.
+    ///   Self-divergence markers (the node disagreeing with its own prior result rather than a
+    ///   certificate) carry no certified reference and never pass; the node halts awaiting
+    ///   operator intervention.
+    fn try_recover_forks(
+        checkpoint_store: &CheckpointStore,
+        checkpoint_metrics: &CheckpointMetrics,
+        build_version: &str,
+    ) -> Result<()> {
+        if let Some(fork_info) = checkpoint_store.get_checkpoint_fork_detected()? {
+            if fork_info.binary_version == build_version {
+                error!(
+                    checkpoint_seq = fork_info.checkpoint_seq,
+                    build_version,
+                    "Fork recovery blocked: this binary version produced the checkpoint fork and \
+                     would fork again. Halting; deploy a corrected binary to recover."
+                );
+                checkpoint_metrics
+                    .fork_auto_recovery_awaiting_new_binary
+                    .set(1);
+            } else if fork_info.certified_checkpoint_digest.is_none() {
+                // The builder re-derived a previously computed checkpoint differently: the fork
+                // is against the node's own prior result, not a certified checkpoint, so there
+                // is no canonical outcome to converge toward.
+                error!(
+                    checkpoint_seq = fork_info.checkpoint_seq,
+                    checkpoint_digest = ?fork_info.checkpoint_digest,
+                    "Fork recovery blocked: the builder re-derived its own previous checkpoint \
+                     differently, so there is no certified checkpoint proving the canonical \
+                     outcome to converge toward. Halting awaiting operator intervention."
+                );
+                checkpoint_metrics
+                    .fork_auto_recovery_blocked_uncertified
+                    .set(1);
+            } else {
                 info!(
-                    "Fork recovery enabled: clearing transaction fork for tx {:?}",
-                    tx_digest
+                    checkpoint_seq = fork_info.checkpoint_seq,
+                    checkpoint_digest = ?fork_info.checkpoint_digest,
+                    forked_binary_version = ?fork_info.binary_version,
+                    build_version,
+                    "Fork recovery: clearing checkpoint fork and locally computed checkpoints \
+                     from the forked sequence so the builder rebuilds toward the certified \
+                     checkpoint"
                 );
                 checkpoint_store
-                    .clear_transaction_fork_detected()
-                    .expect("Failed to clear transaction fork detected marker");
+                    .clear_locally_computed_checkpoints_from(fork_info.checkpoint_seq)
+                    .context("Failed to clear locally computed checkpoints during fork recovery")?;
+                checkpoint_store.clear_checkpoint_fork_detected()?;
+                checkpoint_metrics.checkpoint_fork_auto_recovered.set(1);
             }
         }
+
+        if let Some(fork_info) = checkpoint_store.get_transaction_fork_detected()? {
+            if fork_info.binary_version == build_version {
+                error!(
+                    tx_digest = ?fork_info.tx_digest,
+                    build_version,
+                    "Fork recovery blocked: this binary version produced the transaction fork and \
+                     would fork again. Halting; deploy a corrected binary to recover."
+                );
+                checkpoint_metrics
+                    .fork_auto_recovery_awaiting_new_binary
+                    .set(1);
+            } else if fork_info.certified_checkpoint_seq.is_none() {
+                error!(
+                    tx_digest = ?fork_info.tx_digest,
+                    "Fork recovery blocked: the expected effects of the forked transaction did \
+                     not come from a certified checkpoint (they came from this validator's own \
+                     previously signed effects), so the network has not provably certified the \
+                     canonical outcome. Halting awaiting operator intervention."
+                );
+                checkpoint_metrics
+                    .fork_auto_recovery_blocked_uncertified
+                    .set(1);
+            } else {
+                info!(
+                    tx_digest = ?fork_info.tx_digest,
+                    expected_effects = ?fork_info.expected_effects_digest,
+                    actual_effects = ?fork_info.actual_effects_digest,
+                    certified_checkpoint_seq = ?fork_info.certified_checkpoint_seq,
+                    forked_binary_version = ?fork_info.binary_version,
+                    build_version,
+                    "Fork recovery: clearing transaction fork; re-execution will converge toward \
+                     the canonical certified effects"
+                );
+                checkpoint_store.clear_transaction_fork_detected()?;
+                checkpoint_metrics.transaction_fork_auto_recovered.set(1);
+            }
+        }
+
         Ok(())
     }
 
@@ -2279,7 +2674,7 @@ impl SuiNode {
             .unwrap_or_default();
 
         match behavior {
-            ForkCrashBehavior::AwaitForkRecovery => {
+            ForkCrashBehavior::AwaitForkRecovery | ForkCrashBehavior::RecoverOncePerVersion => {
                 error!(
                     checkpoint_seq = checkpoint_seq,
                     checkpoint_digest = ?checkpoint_digest,
@@ -2325,7 +2720,7 @@ impl SuiNode {
             .unwrap_or_default();
 
         match behavior {
-            ForkCrashBehavior::AwaitForkRecovery => {
+            ForkCrashBehavior::AwaitForkRecovery | ForkCrashBehavior::RecoverOncePerVersion => {
                 error!(
                     tx_digest = ?tx_digest,
                     expected_effects_digest = ?expected_effects_digest,
@@ -2344,7 +2739,9 @@ impl SuiNode {
                 );
                 Err(anyhow::anyhow!(
                     "Transaction fork detected! tx_digest: {:?}, expected_effects: {:?}, actual_effects: {:?}",
-                    tx_digest, expected_effects_digest, actual_effects_digest
+                    tx_digest,
+                    expected_effects_digest,
+                    actual_effects_digest
                 ))
             }
         }
@@ -2358,10 +2755,11 @@ impl SuiNode {
         provider: &OIDCProvider,
     ) -> SuiResult<Vec<(JwkId, JWK)>> {
         use fastcrypto_zkp::bn254::zk_login::fetch_jwks;
+        use sui_types::error::SuiErrorKind;
         let client = reqwest::Client::new();
         fetch_jwks(provider, &client, true)
             .await
-            .map_err(|_| SuiError::JWKRetrievalError)
+            .map_err(|_| SuiErrorKind::JWKRetrievalError.into())
     }
 }
 
@@ -2415,22 +2813,43 @@ impl SpawnOnce {
     }
 }
 
-/// Notify state-sync that a new list of trusted peers are now available.
-fn send_trusted_peer_change(
+/// Updates trusted peer addresses in the p2p network (for nodes configured as validators).
+/// When `prev_epoch_start_state` is provided, validators that are no longer in the committee
+/// have their Chain addresses cleared.
+fn update_peer_addresses(
     config: &NodeConfig,
-    sender: &watch::Sender<TrustedPeerChangeEvent>,
-    epoch_state_state: &EpochStartSystemState,
-) -> Result<(), watch::error::SendError<TrustedPeerChangeEvent>> {
-    sender
-        .send(TrustedPeerChangeEvent {
-            new_peers: epoch_state_state.get_validator_as_p2p_peers(config.protocol_public_key()),
+    endpoint_manager: &EndpointManager,
+    epoch_start_state: &EpochStartSystemState,
+    prev_epoch_start_state: Option<&EpochStartSystemState>,
+) {
+    if config.consensus_config().is_none() {
+        return;
+    }
+    let new_peers: HashSet<PeerId> = epoch_start_state
+        .get_validator_as_p2p_peers(config.protocol_public_key())
+        .into_iter()
+        .map(|(peer_id, address)| {
+            endpoint_manager
+                .update_endpoint(
+                    EndpointId::P2p(peer_id),
+                    AddressSource::Chain,
+                    vec![address],
+                )
+                .expect("Updating peer addresses should not fail");
+            peer_id
         })
-        .tap_err(|err| {
-            warn!(
-                "Failed to send validator peer information to state sync: {:?}",
-                err
-            );
-        })
+        .collect();
+
+    // Clear Chain addresses for validators that left the committee.
+    if let Some(prev) = prev_epoch_start_state {
+        for (peer_id, _) in prev.get_validator_as_p2p_peers(config.protocol_public_key()) {
+            if !new_peers.contains(&peer_id) {
+                endpoint_manager
+                    .update_endpoint(EndpointId::P2p(peer_id), AddressSource::Chain, vec![])
+                    .expect("Clearing peer addresses should not fail");
+            }
+        }
+    }
 }
 
 fn build_kv_store(
@@ -2478,6 +2897,108 @@ fn build_kv_store(
     )))
 }
 
+async fn build_json_rpc_router(
+    state: &Arc<AuthorityState>,
+    transaction_orchestrator: &Option<Arc<TransactionOrchestrator<NetworkAuthorityClient>>>,
+    config: &NodeConfig,
+    prometheus_registry: &Registry,
+) -> Result<axum::Router> {
+    let traffic_controller = state.traffic_controller.clone();
+    let mut server = JsonRpcServerBuilder::new(
+        env!("CARGO_PKG_VERSION"),
+        prometheus_registry,
+        traffic_controller,
+        config.policy_config.clone(),
+    );
+
+    let kv_store = build_kv_store(state, config, prometheus_registry)?;
+
+    let metrics = Arc::new(JsonRpcMetrics::new(prometheus_registry));
+    server.register_module(ReadApi::new(
+        state.clone(),
+        kv_store.clone(),
+        metrics.clone(),
+    ))?;
+    server.register_module(CoinReadApi::new(
+        state.clone(),
+        kv_store.clone(),
+        metrics.clone(),
+    ))?;
+
+    // if run_with_range is enabled we want to prevent any transactions
+    // run_with_range = None is normal operating conditions
+    if config.run_with_range.is_none() {
+        server.register_module(TransactionBuilderApi::new(state.clone()))?;
+    }
+    server.register_module(GovernanceReadApi::new(state.clone(), metrics.clone()))?;
+    server.register_module(BridgeReadApi::new(state.clone(), metrics.clone()))?;
+
+    if let Some(transaction_orchestrator) = transaction_orchestrator {
+        server.register_module(TransactionExecutionApi::new(
+            state.clone(),
+            transaction_orchestrator.clone(),
+            metrics.clone(),
+        ))?;
+    }
+
+    let name_service_config = if let (
+        Some(package_address),
+        Some(registry_id),
+        Some(reverse_registry_id),
+    ) = (
+        config.name_service_package_address,
+        config.name_service_registry_id,
+        config.name_service_reverse_registry_id,
+    ) {
+        sui_name_service::NameServiceConfig::new(package_address, registry_id, reverse_registry_id)
+    } else {
+        match state.get_chain_identifier().chain() {
+            Chain::Mainnet => sui_name_service::NameServiceConfig::mainnet(),
+            Chain::Testnet => sui_name_service::NameServiceConfig::testnet(),
+            Chain::Unknown => sui_name_service::NameServiceConfig::default(),
+        }
+    };
+
+    server.register_module(IndexerApi::new(
+        state.clone(),
+        ReadApi::new(state.clone(), kv_store.clone(), metrics.clone()),
+        kv_store,
+        name_service_config,
+        metrics,
+        config.indexer_max_subscriptions,
+    ))?;
+    server.register_module(MoveUtils::new(state.clone()))?;
+
+    let server_type = config.jsonrpc_server_type();
+
+    Ok(server.to_router(server_type).await?)
+}
+
+/// Remove the on-disk directory of the legacy `rpc-index` backend.
+///
+/// The embedded `sui-rpc-store` replaced the `RpcIndexStore` backend, which
+/// wrote to `<db_path>/rpc-index`; that data is now dead. Remove it on startup
+/// so a node upgraded from an older version does not leave it lingering and
+/// wasting disk. Best-effort: a node that never ran the legacy backend has
+/// nothing to remove, and a failure to remove stale data must not block
+/// startup.
+fn remove_legacy_rpc_index_store(db_path: &Path) {
+    let legacy_dir = db_path.join("rpc-index");
+    match std::fs::remove_dir_all(&legacy_dir) {
+        Ok(()) => info!(
+            "removed legacy rpc-index directory {}",
+            legacy_dir.display()
+        ),
+        // The common case: the node never ran the legacy backend, or it was
+        // already cleaned up on a prior startup.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            "failed to remove legacy rpc-index directory {}: {e:?}",
+            legacy_dir.display()
+        ),
+    }
+}
+
 async fn build_http_servers(
     state: Arc<AuthorityState>,
     store: RocksDbStore,
@@ -2485,105 +3006,91 @@ async fn build_http_servers(
     config: &NodeConfig,
     prometheus_registry: &Registry,
     server_version: ServerVersion,
-) -> Result<(HttpServers, Option<tokio::sync::mpsc::Sender<Checkpoint>>)> {
+    node_role: NodeRole,
+    embedded_rpc_store: Option<&EmbeddedRpcStore>,
+) -> Result<(
+    HttpServers,
+    Option<tokio::sync::broadcast::Sender<Arc<Checkpoint>>>,
+)> {
     // Validators do not expose these APIs
-    if config.consensus_config().is_some() {
+    if !node_role.is_fullnode() {
         return Ok((HttpServers::default(), None));
     }
 
+    info!("starting rpc service with config: {:?}", config.rpc);
+
     let mut router = axum::Router::new();
 
-    let json_rpc_router = {
-        let traffic_controller = state.traffic_controller.clone();
-        let mut server = JsonRpcServerBuilder::new(
-            env!("CARGO_PKG_VERSION"),
-            prometheus_registry,
-            traffic_controller,
-            config.policy_config.clone(),
+    // The JSON-RPC service can be disabled independently of the gRPC/REST
+    // service and of JSON-RPC indexing, so that a node can keep indexing
+    // without exposing the JSON-RPC endpoints.
+    if config.json_rpc_enabled() {
+        router = router.merge(
+            build_json_rpc_router(
+                &state,
+                transaction_orchestrator,
+                config,
+                prometheus_registry,
+            )
+            .await?,
         );
+    } else {
+        info!("json-rpc service is disabled");
+    }
 
-        let kv_store = build_kv_store(&state, config, prometheus_registry)?;
-
-        let metrics = Arc::new(JsonRpcMetrics::new(prometheus_registry));
-        server.register_module(ReadApi::new(
-            state.clone(),
-            kv_store.clone(),
-            metrics.clone(),
-        ))?;
-        server.register_module(CoinReadApi::new(
-            state.clone(),
-            kv_store.clone(),
-            metrics.clone(),
-        ))?;
-
-        // if run_with_range is enabled we want to prevent any transactions
-        // run_with_range = None is normal operating conditions
-        if config.run_with_range.is_none() {
-            server.register_module(TransactionBuilderApi::new(state.clone()))?;
-        }
-        server.register_module(GovernanceReadApi::new(state.clone(), metrics.clone()))?;
-        server.register_module(BridgeReadApi::new(state.clone(), metrics.clone()))?;
-
-        if let Some(transaction_orchestrator) = transaction_orchestrator {
-            server.register_module(TransactionExecutionApi::new(
-                state.clone(),
-                transaction_orchestrator.clone(),
-                metrics.clone(),
-            ))?;
-        }
-
-        let name_service_config =
-            if let (Some(package_address), Some(registry_id), Some(reverse_registry_id)) = (
-                config.name_service_package_address,
-                config.name_service_registry_id,
-                config.name_service_reverse_registry_id,
-            ) {
-                sui_name_service::NameServiceConfig::new(
-                    package_address,
-                    registry_id,
-                    reverse_registry_id,
-                )
-            } else {
-                match state.get_chain_identifier().chain() {
-                    Chain::Mainnet => sui_name_service::NameServiceConfig::mainnet(),
-                    Chain::Testnet => sui_name_service::NameServiceConfig::testnet(),
-                    Chain::Unknown => sui_name_service::NameServiceConfig::default(),
-                }
-            };
-
-        server.register_module(IndexerApi::new(
-            state.clone(),
-            ReadApi::new(state.clone(), kv_store.clone(), metrics.clone()),
-            kv_store,
-            name_service_config,
-            metrics,
-            config.indexer_max_subscriptions,
-        ))?;
-        server.register_module(MoveUtils::new(state.clone()))?;
-
-        let server_type = config.jsonrpc_server_type();
-
-        server.to_router(server_type).await?
-    };
-
-    router = router.merge(json_rpc_router);
-
+    // When the embedded rpc-store is active, gate checkpoint delivery on the
+    // index so a client that waits for a checkpoint can immediately read its
+    // indexed state (matching the legacy synchronously-committed index).
+    let indexed_checkpoint = embedded_rpc_store.map(|embedded| embedded.indexed_checkpoint_fn());
+    let subscription_watermark_interval = config
+        .rpc
+        .as_ref()
+        .and_then(|rpc| rpc.subscription_watermark_interval);
+    let subscription_max_subscribers = config
+        .rpc
+        .as_ref()
+        .and_then(|rpc| rpc.subscription_max_subscribers);
+    let subscription_shards = config.rpc.as_ref().and_then(|rpc| rpc.subscription_shards);
     let (subscription_service_checkpoint_sender, subscription_service_handle) =
-        SubscriptionService::build(prometheus_registry);
+        SubscriptionService::build(
+            prometheus_registry,
+            indexed_checkpoint,
+            subscription_watermark_interval,
+            subscription_max_subscribers,
+            subscription_shards,
+        );
     let rpc_router = {
-        let mut rpc_service =
-            sui_rpc_api::RpcService::new(Arc::new(RestReadStore::new(state.clone(), store)));
+        // Serve the index read paths from the embedded rpc-store when it
+        // is enabled. Raw chain data comes from the perpetual / checkpoint
+        // stores either way.
+        let reader: Arc<dyn RpcStateReader> = match embedded_rpc_store {
+            Some(embedded) => Arc::new(RpcStoreReadStore::new(
+                state.clone(),
+                store,
+                embedded.reader(),
+            )),
+            None => Arc::new(RestReadStore::new(state.clone(), store)),
+        };
+        let mut rpc_service = sui_rpc_api::RpcService::new(reader);
         rpc_service.with_server_version(server_version);
 
         if let Some(config) = config.rpc.clone() {
+            config.validate()?;
             rpc_service.with_config(config);
         }
 
-        rpc_service.with_metrics(RpcMetrics::new(prometheus_registry));
+        rpc_service.with_metrics(prometheus_registry);
         rpc_service.with_subscription_service(subscription_service_handle);
 
         if let Some(transaction_orchestrator) = transaction_orchestrator {
-            rpc_service.with_executor(transaction_orchestrator.clone())
+            rpc_service.with_executor(transaction_orchestrator.clone());
+            // The driver knows which validators this node has been submitting to successfully,
+            // which is what simulate names as a transaction's allowed proposers. Without a
+            // selector, simulate leaves transactions unrestricted.
+            if config.enable_simulate_allowed_proposers {
+                rpc_service
+                    .with_proposer_selector(transaction_orchestrator.transaction_driver().clone());
+            }
         }
 
         rpc_service.into_router().await
@@ -2603,18 +3110,38 @@ async fn build_http_servers(
             tower_http::cors::CorsLayer::new()
                 .allow_methods([http::Method::GET, http::Method::POST])
                 .allow_origin(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
+                .allow_headers(tower_http::cors::Any)
+                .expose_headers(tower_http::cors::Any),
         );
 
     router = router.merge(rpc_router).layer(layers);
+
+    // On top of sui-http's hardened defaults (bounded concurrent streams;
+    // transport keepalives stay disabled by default), bound connection
+    // lifetime: GOAWAY at the configured age and force-close after the grace
+    // period. The hard close is the only server-side mechanism that reclaims
+    // streams wedged behind HTTP/2 flow-control windows that a stalled peer
+    // never reopens, and connection age also bounds how long a vanished peer
+    // can pin connection state, which keepalives would otherwise detect.
+    let server_config = {
+        let rpc_config = config.rpc().cloned().unwrap_or_default();
+        let mut server_config = sui_http::Config::default()
+            .max_connection_age_grace(rpc_config.max_connection_age_grace());
+        if let Some(age) = rpc_config.max_connection_age() {
+            server_config = server_config.max_connection_age(age);
+        }
+        server_config
+    };
 
     let https = if let Some((tls_config, https_address)) = config
         .rpc()
         .and_then(|config| config.tls_config().map(|tls| (tls, config.https_address())))
     {
+        let tls_server_config = https_rustls_config(tls_config.cert(), tls_config.key())?;
         let https = sui_http::Builder::new()
-            .tls_single_cert(tls_config.cert(), tls_config.key())
-            .and_then(|builder| builder.serve(https_address, router.clone()))
+            .config(server_config.clone())
+            .tls_config(tls_server_config)
+            .serve(https_address, router.clone())
             .map_err(|e| anyhow::anyhow!(e))?;
 
         info!(
@@ -2629,6 +3156,7 @@ async fn build_http_servers(
     };
 
     let http = sui_http::Builder::new()
+        .config(server_config)
         .serve(&config.json_rpc_address, router)
         .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -2647,14 +3175,68 @@ async fn build_http_servers(
     ))
 }
 
-#[cfg(not(test))]
-fn max_tx_per_checkpoint(protocol_config: &ProtocolConfig) -> usize {
-    protocol_config.max_transactions_per_checkpoint() as usize
+/// Action to take with our deny-config network vote at a startup or epoch-change
+/// transition, after reconciling against the current local config.
+///
+/// An oversized local config can't go on the wire (the consensus validator would reject
+/// it), so it is treated as unshareable: on startup a stale prior vote is withdrawn
+/// rather than left to diverge from the local config.
+#[derive(Debug, PartialEq, Eq)]
+enum DenyConfigBroadcastAction {
+    /// Leave any existing on-network vote untouched.
+    Skip,
+    /// Publish these rules as our current vote.
+    Broadcast(TransactionDenyRules),
+    /// Publish a withdrawal of any prior vote.
+    Withdraw,
 }
 
-#[cfg(test)]
-fn max_tx_per_checkpoint(_: &ProtocolConfig) -> usize {
-    2
+fn deny_config_broadcast_payload(
+    local_rules: &TransactionDenyRules,
+    broadcast: bool,
+    is_startup: bool,
+    may_have_prior_broadcast: bool,
+) -> DenyConfigBroadcastAction {
+    let shareable = local_rules.is_empty() || local_rules.check_share_limits().is_ok();
+    if broadcast && shareable {
+        // An empty local config broadcasts a withdrawal.
+        if local_rules.is_empty() {
+            DenyConfigBroadcastAction::Withdraw
+        } else {
+            DenyConfigBroadcastAction::Broadcast(local_rules.clone())
+        }
+    } else if is_startup && may_have_prior_broadcast {
+        DenyConfigBroadcastAction::Withdraw
+    } else {
+        DenyConfigBroadcastAction::Skip
+    }
+}
+
+/// Builds the HTTPS RPC server's rustls config from PEM files, pinning the
+/// ring crypto provider.
+///
+/// `sui_http::Builder::tls_single_cert` resolves the provider from rustls
+/// crate features and panics at runtime when more than one provider feature is
+/// enabled in the final binary (e.g. `aws-lc-rs` is pulled in through
+/// `aws-config` in the `sui` CLI), so the provider is pinned explicitly here
+/// instead.
+fn https_rustls_config(cert: &str, key: &str) -> Result<sui_http::rustls::ServerConfig> {
+    use sui_http::rustls;
+    use sui_http::rustls::pki_types::pem::PemObject;
+
+    let certs = rustls::pki_types::CertificateDer::pem_file_iter(cert)
+        .with_context(|| format!("failed to read TLS certificate chain from {cert}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse TLS certificate chain from {cert}"))?;
+    let private_key = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+        .with_context(|| format!("failed to read TLS private key from {key}"))?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
+    .with_no_client_auth()
+    .with_single_cert(certs, private_key)?;
+    Ok(config)
 }
 
 #[derive(Default)]
@@ -2674,101 +3256,432 @@ mod tests {
     use sui_core::checkpoints::{CheckpointMetrics, CheckpointStore};
     use sui_types::digests::{CheckpointDigest, TransactionDigest, TransactionEffectsDigest};
 
+    #[test]
+    fn deny_config_broadcast_payload_decisions() {
+        let empty = TransactionDenyRules::default();
+        let populated = TransactionDenyRules {
+            package_publish_disabled: true,
+            ..Default::default()
+        };
+        let oversized = TransactionDenyRules {
+            zklogin_disabled_providers: std::iter::once(
+                "x".repeat(TransactionDenyRules::MAX_ZKLOGIN_PROVIDER_LENGTH + 1),
+            )
+            .collect(),
+            ..Default::default()
+        };
+
+        // broadcast=true: (re-)broadcast the current local config.
+        assert_eq!(
+            deny_config_broadcast_payload(&populated, true, true, false),
+            DenyConfigBroadcastAction::Broadcast(populated.clone()),
+        );
+        // broadcast=true with an empty local config: broadcast a withdrawal.
+        assert_eq!(
+            deny_config_broadcast_payload(&empty, true, true, false),
+            DenyConfigBroadcastAction::Withdraw,
+        );
+        // Not broadcasting, startup, prior vote -> withdraw it.
+        assert_eq!(
+            deny_config_broadcast_payload(&populated, false, true, true),
+            DenyConfigBroadcastAction::Withdraw,
+        );
+        // Not broadcasting, startup, no prior vote -> nothing.
+        assert_eq!(
+            deny_config_broadcast_payload(&populated, false, true, false),
+            DenyConfigBroadcastAction::Skip,
+        );
+        // Epoch change (not startup) without broadcast -> nothing, even with a prior vote.
+        assert_eq!(
+            deny_config_broadcast_payload(&populated, false, false, true),
+            DenyConfigBroadcastAction::Skip,
+        );
+        // An oversized local config is unshareable: broadcast=true falls back to
+        // withdrawing a prior vote instead of attempting an (oversized) broadcast.
+        assert_eq!(
+            deny_config_broadcast_payload(&oversized, true, true, true),
+            DenyConfigBroadcastAction::Withdraw,
+        );
+        assert_eq!(
+            deny_config_broadcast_payload(&oversized, true, true, false),
+            DenyConfigBroadcastAction::Skip,
+        );
+    }
+
+    // A present legacy `rpc-index` directory is removed, while its siblings
+    // (notably the still-used jsonrpc `indexes` store) are left untouched, and a
+    // missing directory is a no-op.
+    #[test]
+    fn removes_only_the_legacy_rpc_index_directory() {
+        let db = tempfile::tempdir().unwrap();
+        let legacy = db.path().join("rpc-index");
+        let sibling = db.path().join("indexes");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(legacy.join("CURRENT"), b"stale").unwrap();
+
+        remove_legacy_rpc_index_store(db.path());
+        assert!(
+            !legacy.exists(),
+            "legacy rpc-index directory should be gone"
+        );
+        assert!(sibling.exists(), "sibling stores must be left untouched");
+
+        // Idempotent: a second run (nothing to remove) does not error or touch
+        // the siblings.
+        remove_legacy_rpc_index_store(db.path());
+        assert!(!legacy.exists());
+        assert!(sibling.exists());
+    }
+
+    // Halt / ReturnError never clear markers; ReturnError surfaces the fork as a startup error.
     #[tokio::test]
-    async fn test_fork_error_and_recovery_both_paths() {
+    async fn test_return_error_does_not_recover() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+        let cfg = ForkRecoveryConfig {
+            transaction_overrides: Default::default(),
+            checkpoint_overrides: Default::default(),
+            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+        };
+
+        // Checkpoint fork.
+        checkpoint_store
+            .record_checkpoint_fork_detected(
+                42,
+                CheckpointDigest::random(),
+                Some(CheckpointDigest::random()),
+            )
+            .unwrap();
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            Some(&cfg),
+            "v1",
+        )
+        .await;
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("Checkpoint fork detected")
+        );
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+        checkpoint_store.clear_checkpoint_fork_detected().unwrap();
+
+        // Transaction fork.
+        checkpoint_store
+            .record_transaction_fork_detected(
+                TransactionDigest::random(),
+                TransactionEffectsDigest::random(),
+                TransactionEffectsDigest::random(),
+                Some(1),
+            )
+            .unwrap();
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            Some(&cfg),
+            "v1",
+        )
+        .await;
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("Transaction fork detected")
+        );
+    }
+
+    // A fork marker carrying the currently running binary version is never cleared — the binary
+    // that forked would deterministically fork again — so the node hangs until a corrected
+    // binary (different version) runs recovery.
+    #[tokio::test]
+    async fn test_same_binary_version_does_not_recover() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+        let seq = 7;
+        // The fork is recorded by binary "v1", against a certified checkpoint.
+        checkpoint_store.set_binary_version("v1");
+        checkpoint_store
+            .record_checkpoint_fork_detected(
+                seq,
+                CheckpointDigest::random(),
+                Some(CheckpointDigest::random()),
+            )
+            .unwrap();
+
+        // Restarting the same binary: recovery refused despite certification.
+        SuiNode::try_recover_forks(&checkpoint_store, &checkpoint_metrics, "v1").unwrap();
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            checkpoint_metrics
+                .fork_auto_recovery_awaiting_new_binary
+                .get(),
+            1
+        );
+        assert_eq!(checkpoint_metrics.checkpoint_fork_auto_recovered.get(), 0);
+
+        // Corrected binary (new version): recovers.
+        SuiNode::try_recover_forks(&checkpoint_store, &checkpoint_metrics, "v2").unwrap();
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(checkpoint_metrics.checkpoint_fork_auto_recovered.get(), 1);
+    }
+
+    // The default behavior (RecoverOncePerVersion) recovers with no fork-recovery config present.
+    #[tokio::test]
+    async fn test_default_recovers() {
         let checkpoint_store = CheckpointStore::new_for_tests();
         let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
 
-        // ---------- Checkpoint fork path ----------
-        let seq_num = 42;
-        let digest = CheckpointDigest::random();
+        let tx_digest = TransactionDigest::random();
+        // The fork was recorded by binary "v1"; its expected effects came from certified
+        // checkpoint 3, so recovery under "v2" is permitted.
+        checkpoint_store.set_binary_version("v1");
         checkpoint_store
-            .record_checkpoint_fork_detected(seq_num, digest)
+            .record_transaction_fork_detected(
+                tx_digest,
+                TransactionEffectsDigest::random(),
+                TransactionEffectsDigest::random(),
+                Some(3),
+            )
             .unwrap();
 
-        let fork_recovery = ForkRecoveryConfig {
-            transaction_overrides: Default::default(),
-            checkpoint_overrides: Default::default(),
-            fork_crash_behavior: ForkCrashBehavior::ReturnError,
-        };
+        let r =
+            SuiNode::check_and_recover_forks(&checkpoint_store, &checkpoint_metrics, None, "v2")
+                .await;
+        assert!(r.is_ok());
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(checkpoint_metrics.transaction_fork_auto_recovered.get(), 1);
+    }
 
-        let r = SuiNode::check_and_recover_forks(
-            &checkpoint_store,
-            &checkpoint_metrics,
-            true,
-            Some(&fork_recovery),
-        )
-        .await;
-        assert!(r.is_err());
-        assert!(r
-            .unwrap_err()
-            .to_string()
-            .contains("Checkpoint fork detected"));
+    // checkpoint_overrides clears only the checkpoint fork marker (when the forked seq is listed); it
+    // is decoupled from the transaction fork marker, which is cleared by transaction_overrides.
+    #[tokio::test]
+    async fn test_checkpoint_overrides_clear_checkpoint_marker_only() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let seq = 9;
 
+        checkpoint_store
+            .record_checkpoint_fork_detected(
+                seq,
+                CheckpointDigest::random(),
+                Some(CheckpointDigest::random()),
+            )
+            .unwrap();
+        checkpoint_store
+            .record_transaction_fork_detected(
+                TransactionDigest::random(),
+                TransactionEffectsDigest::random(),
+                TransactionEffectsDigest::random(),
+                None,
+            )
+            .unwrap();
+
+        // No overrides: both markers are left intact.
+        SuiNode::try_recover_checkpoint_fork(&checkpoint_store, &ForkRecoveryConfig::default())
+            .unwrap();
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+
+        // Override for the forked seq: clears the checkpoint marker but leaves the transaction marker.
         let mut checkpoint_overrides = BTreeMap::new();
-        checkpoint_overrides.insert(seq_num, digest.to_string());
-        let fork_recovery_with_override = ForkRecoveryConfig {
+        checkpoint_overrides.insert(seq, CheckpointDigest::random().to_string());
+        let cfg = ForkRecoveryConfig {
             transaction_overrides: Default::default(),
             checkpoint_overrides,
-            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+            fork_crash_behavior: ForkCrashBehavior::AwaitForkRecovery,
         };
-        let r = SuiNode::check_and_recover_forks(
-            &checkpoint_store,
-            &checkpoint_metrics,
-            true,
-            Some(&fork_recovery_with_override),
-        )
-        .await;
-        assert!(r.is_ok());
-        assert!(checkpoint_store
-            .get_checkpoint_fork_detected()
-            .unwrap()
-            .is_none());
+        SuiNode::try_recover_checkpoint_fork(&checkpoint_store, &cfg).unwrap();
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_some(),
+            "checkpoint_overrides must not touch the transaction fork marker"
+        );
+    }
 
-        // ---------- Transaction fork path ----------
+    // transaction_overrides clears the transaction fork marker when the forked tx is listed.
+    #[tokio::test]
+    async fn test_transaction_overrides_clear_transaction_marker() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
         let tx_digest = TransactionDigest::random();
-        let expected_effects = TransactionEffectsDigest::random();
-        let actual_effects = TransactionEffectsDigest::random();
         checkpoint_store
-            .record_transaction_fork_detected(tx_digest, expected_effects, actual_effects)
+            .record_transaction_fork_detected(
+                tx_digest,
+                TransactionEffectsDigest::random(),
+                TransactionEffectsDigest::random(),
+                None,
+            )
             .unwrap();
 
-        let fork_recovery = ForkRecoveryConfig {
-            transaction_overrides: Default::default(),
-            checkpoint_overrides: Default::default(),
-            fork_crash_behavior: ForkCrashBehavior::ReturnError,
-        };
-        let r = SuiNode::check_and_recover_forks(
-            &checkpoint_store,
-            &checkpoint_metrics,
-            true,
-            Some(&fork_recovery),
-        )
-        .await;
-        assert!(r.is_err());
-        assert!(r
-            .unwrap_err()
-            .to_string()
-            .contains("Transaction fork detected"));
-
+        // Unrelated override: marker stays.
         let mut transaction_overrides = BTreeMap::new();
-        transaction_overrides.insert(tx_digest.to_string(), actual_effects.to_string());
-        let fork_recovery_with_override = ForkRecoveryConfig {
+        transaction_overrides.insert(TransactionDigest::random().to_string(), String::new());
+        let cfg = ForkRecoveryConfig {
             transaction_overrides,
             checkpoint_overrides: Default::default(),
-            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+            fork_crash_behavior: ForkCrashBehavior::AwaitForkRecovery,
         };
-        let r = SuiNode::check_and_recover_forks(
-            &checkpoint_store,
-            &checkpoint_metrics,
-            true,
-            Some(&fork_recovery_with_override),
-        )
-        .await;
-        assert!(r.is_ok());
-        assert!(checkpoint_store
-            .get_transaction_fork_detected()
-            .unwrap()
-            .is_none());
+        SuiNode::try_recover_transaction_fork(&checkpoint_store, &cfg).unwrap();
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+
+        // Override for the forked tx: marker cleared.
+        let mut transaction_overrides = BTreeMap::new();
+        transaction_overrides.insert(tx_digest.to_string(), String::new());
+        let cfg = ForkRecoveryConfig {
+            transaction_overrides,
+            checkpoint_overrides: Default::default(),
+            fork_crash_behavior: ForkCrashBehavior::AwaitForkRecovery,
+        };
+        SuiNode::try_recover_transaction_fork(&checkpoint_store, &cfg).unwrap();
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Under RecoverOncePerVersion, a checkpoint override clears the fork via the manual path
+    // even when the auto path would refuse (here: the fork was recorded by the currently running
+    // binary version and the sequence is not certified).
+    #[tokio::test]
+    async fn test_override_clears_fork_auto_recovery_refuses() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+        let seq = 5;
+        checkpoint_store.set_binary_version("v1");
+        checkpoint_store
+            .record_checkpoint_fork_detected(
+                seq,
+                CheckpointDigest::random(),
+                Some(CheckpointDigest::random()),
+            )
+            .unwrap();
+
+        let mut checkpoint_overrides = BTreeMap::new();
+        checkpoint_overrides.insert(seq, CheckpointDigest::random().to_string());
+        let cfg = ForkRecoveryConfig {
+            transaction_overrides: Default::default(),
+            checkpoint_overrides,
+            fork_crash_behavior: ForkCrashBehavior::RecoverOncePerVersion,
+        };
+
+        SuiNode::check_and_recover_forks(&checkpoint_store, &checkpoint_metrics, Some(&cfg), "v1")
+            .await
+            .unwrap();
+
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // A self-divergence checkpoint fork (the builder re-derived its own previous checkpoint
+    // differently; no certified digest in the marker) is never auto-recovered, even under a new
+    // binary version, because neither result is proven canonical. It requires operator
+    // overrides.
+    #[tokio::test]
+    async fn test_self_divergence_checkpoint_fork_blocks_recovery() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+        let seq = 17;
+        checkpoint_store.set_binary_version("v1");
+        checkpoint_store
+            .record_checkpoint_fork_detected(seq, CheckpointDigest::random(), None)
+            .unwrap();
+
+        SuiNode::try_recover_forks(&checkpoint_store, &checkpoint_metrics, "v2").unwrap();
+
+        assert!(
+            checkpoint_store
+                .get_checkpoint_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            checkpoint_metrics
+                .fork_auto_recovery_blocked_uncertified
+                .get(),
+            1
+        );
+        assert_eq!(checkpoint_metrics.checkpoint_fork_auto_recovered.get(), 0);
+    }
+
+    // A transaction fork whose expected effects did not come from a certified checkpoint (i.e.
+    // they came from this validator's own previously signed effects) is never auto-recovered,
+    // even on a new binary version.
+    #[tokio::test]
+    async fn test_uncertified_transaction_fork_blocks_recovery() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+        checkpoint_store.set_binary_version("v1");
+        checkpoint_store
+            .record_transaction_fork_detected(
+                TransactionDigest::random(),
+                TransactionEffectsDigest::random(),
+                TransactionEffectsDigest::random(),
+                None,
+            )
+            .unwrap();
+
+        SuiNode::try_recover_forks(&checkpoint_store, &checkpoint_metrics, "v2").unwrap();
+        SuiNode::try_recover_forks(&checkpoint_store, &checkpoint_metrics, "v3").unwrap();
+
+        assert!(
+            checkpoint_store
+                .get_transaction_fork_detected()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            checkpoint_metrics
+                .fork_auto_recovery_blocked_uncertified
+                .get(),
+            1
+        );
     }
 }

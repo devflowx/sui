@@ -11,11 +11,12 @@ use fastcrypto_tbls::{
     tbls::ThresholdBls,
     types::{ShareIndex, ThresholdBls12381MinSig},
 };
+use mysten_common::ZipDebugEqIteratorExt;
 use mysten_metrics::spawn_monitored_task;
 use mysten_network::anemo_ext::NetworkExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map::BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet, btree_map::BTreeMap},
     ops::Bound,
     sync::Arc,
     time::{self, Duration},
@@ -156,7 +157,7 @@ impl Handle {
 
     // For testing.
     pub fn new_stub() -> Self {
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(100);
         // Keep receiver open until all senders are closed.
         tokio::spawn(async move {
             loop {
@@ -401,13 +402,12 @@ impl RandomnessEventLoop {
             );
             return;
         }
-        if epoch == self.epoch {
-            if let Some(highest_completed_round) = self.highest_completed_round.get(&epoch) {
-                if round <= *highest_completed_round {
-                    info!("skipping sending partial sigs, we already have completed this round");
-                    return;
-                }
-            }
+        if epoch == self.epoch
+            && let Some(highest_completed_round) = self.highest_completed_round.get(&epoch)
+            && round <= *highest_completed_round
+        {
+            info!("skipping sending partial sigs, we already have completed this round");
+            return;
         }
 
         self.highest_requested_round
@@ -479,11 +479,11 @@ impl RandomnessEventLoop {
             return;
         }
         let highest_completed_round = self.highest_completed_round.get(&epoch).copied();
-        if let Some(highest_completed_round) = &highest_completed_round {
-            if *highest_completed_round >= round {
-                debug!("skipping received partial sigs, we already have completed this round");
-                return;
-            }
+        if let Some(highest_completed_round) = &highest_completed_round
+            && *highest_completed_round >= round
+        {
+            debug!("skipping received partial sigs, we already have completed this round");
+            return;
         }
 
         // If sigs are for a future epoch, we can't fully verify them without DKG output.
@@ -552,11 +552,13 @@ impl RandomnessEventLoop {
         // valid signatures of other peers which will be successfully verified below).
         let received_share_ids = partial_sigs.iter().map(|s| s.index);
         if received_share_ids
-            .zip(expected_share_ids.iter())
+            .zip_debug_eq(expected_share_ids.iter())
             .any(|(a, b)| a != *b)
         {
             let received_share_ids = partial_sigs.iter().map(|s| s.index).collect::<Vec<_>>();
-            warn!("received partial sigs with wrong share ids: expected {expected_share_ids:?}, received {received_share_ids:?}");
+            warn!(
+                "received partial sigs with wrong share ids: expected {expected_share_ids:?}, received {received_share_ids:?}"
+            );
             return;
         }
 
@@ -570,11 +572,11 @@ impl RandomnessEventLoop {
 
     #[instrument(level = "debug", skip_all, fields(?epoch, ?round))]
     fn maybe_aggregate_partial_signatures(&mut self, epoch: EpochId, round: RandomnessRound) {
-        if let Some(highest_completed_round) = self.highest_completed_round.get(&epoch) {
-            if round <= *highest_completed_round {
-                info!("skipping aggregation for already-completed round");
-                return;
-            }
+        if let Some(highest_completed_round) = self.highest_completed_round.get(&epoch)
+            && round <= *highest_completed_round
+        {
+            info!("skipping aggregation for already-completed round");
+            return;
         }
 
         let highest_requested_round = self.highest_requested_round.get(&epoch);
@@ -583,7 +585,9 @@ impl RandomnessEventLoop {
             // to complete the signature, local shared object versions are not set until consensus
             // finishes processing the corresponding commit. This function will be called again
             // after maybe_start_pending_tasks begins this round locally.
-            debug!("waiting to aggregate randomness partial signatures until local consensus catches up");
+            debug!(
+                "waiting to aggregate randomness partial signatures until local consensus catches up"
+            );
             return;
         }
 
@@ -628,7 +632,8 @@ impl RandomnessEventLoop {
             };
 
         // Try to verify the aggregated signature all at once. (Should work in the happy path.)
-        if ThresholdBls12381MinSig::verify(vss_pk.c0(), &round.signature_message(), &sig).is_err() {
+        if ThresholdBls12381MinSig::verify(&vss_pk.c0(), &round.signature_message(), &sig).is_err()
+        {
             // If verifiation fails, some of the inputs must be invalid. We have to go through
             // one-by-one to find which.
             // TODO: add test for individual sig verification.
@@ -672,10 +677,15 @@ impl RandomnessEventLoop {
                 }
             };
             if let Err(e) =
-                ThresholdBls12381MinSig::verify(vss_pk.c0(), &round.signature_message(), &sig)
+                ThresholdBls12381MinSig::verify(&vss_pk.c0(), &round.signature_message(), &sig)
             {
-                error!("error while verifying randomness partial signatures after removing invalid partials: {e:?}");
-                debug_assert!(false, "error while verifying randomness partial signatures after removing invalid partials");
+                error!(
+                    "error while verifying randomness partial signatures after removing invalid partials: {e:?}"
+                );
+                debug_assert!(
+                    false,
+                    "error while verifying randomness partial signatures after removing invalid partials"
+                );
                 return;
             }
         }
@@ -710,11 +720,11 @@ impl RandomnessEventLoop {
             return;
         }
         let highest_completed_round = self.highest_completed_round.get(&epoch).copied();
-        if let Some(highest_completed_round) = &highest_completed_round {
-            if *highest_completed_round >= round {
-                debug!("skipping received full sig, we already have completed this round");
-                return;
-            }
+        if let Some(highest_completed_round) = &highest_completed_round
+            && *highest_completed_round >= round
+        {
+            debug!("skipping received full sig, we already have completed this round");
+            return;
         }
 
         let highest_requested_round = self.highest_requested_round.get(&epoch);
@@ -727,7 +737,7 @@ impl RandomnessEventLoop {
         }
 
         if let Err(e) =
-            ThresholdBls12381MinSig::verify(vss_pk.c0(), &round.signature_message(), &sig)
+            ThresholdBls12381MinSig::verify(&vss_pk.c0(), &round.signature_message(), &sig)
         {
             info!("received invalid full signature from peer {peer_id}: {e:?}");
             if let Some(sender) = self.mailbox_sender.upgrade() {
@@ -761,16 +771,25 @@ impl RandomnessEventLoop {
             Bound::Excluded((round + 1, PeerId([0; 32]))),
         ));
         self.metrics.record_completed_round(round);
-        if let Some(start_time) = self.round_request_time.get(&(epoch, round)) {
-            if let Some(metric) = self.metrics.round_generation_latency_metric() {
-                metric.observe(start_time.elapsed().as_secs_f64());
-            }
+        if let Some(start_time) = self.round_request_time.get(&(epoch, round))
+            && let Some(metric) = self.metrics.round_generation_latency_metric()
+        {
+            metric.observe(start_time.elapsed().as_secs_f64());
         }
 
         let sig_bytes = bcs::to_bytes(&sig).expect("signature serialization should not fail");
-        self.randomness_tx
-            .try_send((epoch, round, sig_bytes))
-            .expect("RandomnessRoundReceiver mailbox should not overflow or be closed");
+        if let Err(e) = self.randomness_tx.try_send((epoch, round, sig_bytes)) {
+            match e {
+                // Receiver is torn down during node shutdown; dropping the round is harmless.
+                mpsc::error::TrySendError::Closed(_) => {
+                    info!("dropping completed randomness round {round}: receiver channel closed");
+                }
+                // Mailbox capacity is huge (default 1M); a full mailbox means a real bug.
+                mpsc::error::TrySendError::Full(_) => {
+                    panic!("RandomnessRoundReceiver mailbox should not overflow");
+                }
+            }
+        }
     }
 
     fn maybe_ignore_byzantine_peer(&mut self, epoch: EpochId, peer_id: PeerId) {
@@ -793,7 +812,10 @@ impl RandomnessEventLoop {
         let max_ignored_shares = (self.config.max_ignored_peer_weight_factor()
             * (dkg_output.nodes.total_weight() as f64)) as usize;
         if self.blocked_share_id_count + peer_shares.len() > max_ignored_shares {
-            warn!("ignoring byzantine peer {peer_id:?} with {} shares would exceed max ignored peer weight {max_ignored_shares}", peer_shares.len());
+            warn!(
+                "ignoring byzantine peer {peer_id:?} with {} shares would exceed max ignored peer weight {max_ignored_shares}",
+                peer_shares.len()
+            );
             return;
         }
 
@@ -1005,7 +1027,7 @@ impl RandomnessEventLoop {
                 // Recording multiples of 100 so tests can match on the log message.
                 "RandomnessEventLoop randomness generation backlog: over {} rounds are pending (oldest is {:?})",
                 (num_rounds_pending / 100) * 100,
-                highest_completed_round+1,
+                highest_completed_round + 1,
             );
         }
         self.metrics.set_num_rounds_pending(num_rounds_pending);
@@ -1056,7 +1078,7 @@ impl RandomnessEventLoop {
             &dkg_output.vss_pk
         };
 
-        ThresholdBls12381MinSig::verify(vss_pk.c0(), &round.signature_message(), &sig)
+        ThresholdBls12381MinSig::verify(&vss_pk.c0(), &round.signature_message(), &sig)
             .map_err(|e| anyhow::anyhow!("invalid full signature: {e:?}"))?;
 
         self.process_valid_full_signature(self.epoch, round, sig);

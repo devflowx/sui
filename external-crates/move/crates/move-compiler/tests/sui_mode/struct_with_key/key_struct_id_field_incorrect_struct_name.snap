@@ -5,12 +5,12 @@ info:
   edition: legacy
   lint: false
 ---
-error[Sui E02007]: invalid object declaration
-  ┌─ tests/sui_mode/struct_with_key/key_struct_id_field_incorrect_struct_name.move:5:9
+error[ESC02007]: invalid object declaration
+  ┌─ tests/sui_mode/struct_with_key/key_struct_id_field_incorrect_struct_name.move:6:9
   │
-4 │     struct S has key {
+5 │     struct S has key {
   │                  --- The 'key' ability is used to declare objects in Sui
-5 │         id: object::ID
+6 │         id: object::ID,
   │         ^^  ---------- But found type: 'sui::object::ID'
   │         │    
   │         Invalid object 'S'. Structs with the 'key' ability must have 'id: sui::object::UID' as their first field

@@ -1,7 +1,7 @@
 [package]
 name = "sui-framework-tests"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Mysten Labs <eng@mystenlabs.com>"]
 description = "Runs Move tests for sui-framework"
 license = "Apache-2.0"
@@ -21,6 +21,7 @@ prometheus.workspace = true
 sui-framework.workspace = true
 sui-move.workspace = true
 sui-move-build.workspace = true
+sui-package-alt.workspace = true
 sui-protocol-config.workspace = true
 sui-types.workspace = true
 
@@ -30,8 +31,15 @@ sui-verifier = { path = "../../sui-execution/latest/sui-verifier", package = "su
 
 move-bytecode-verifier-meter.workspace = true
 move-cli.workspace = true
-move-package.workspace = true
+move-package-alt-compilation.workspace = true
 move-unit-test.workspace = true
 sui-config.workspace = true
+tokio.workspace = true
+
+[target.'cfg(msim)'.dependencies]
+msim.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+fs_extra.workspace = true

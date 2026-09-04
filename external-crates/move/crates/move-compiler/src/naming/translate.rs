@@ -7,14 +7,14 @@ use crate::{
     diagnostics::{
         self, Diagnostic, DiagnosticReporter, Diagnostics,
         codes::{self, *},
-        warning_filters::WarningFilters,
+        filter::FilterScope,
     },
     editions::FeatureGate,
     expansion::{
         ast::{self as E, AbilitySet, Ellipsis, ModuleIdent, Mutability, Visibility},
         name_validation::is_valid_datatype_or_constant_name as is_constant_name,
     },
-    ice,
+    ice, ice_assert,
     naming::{
         ast::{self as N, BlockLabel, NominalBlockUsage, TParamID},
         fake_natives,
@@ -224,6 +224,16 @@ impl ResolvedType {
             ResolvedType::Unbound => (),
         }
     }
+
+    fn name_loc_opt(&self) -> Option<Loc> {
+        match self {
+            ResolvedType::ModuleType(dt) => Some(dt.name().loc()),
+            ResolvedType::TParam(loc, _) => Some(*loc),
+            ResolvedType::BuiltinType(_) => None,
+            ResolvedType::Hole => None,
+            ResolvedType::Unbound => None,
+        }
+    }
 }
 
 impl ResolvedDatatype {
@@ -383,6 +393,14 @@ impl ResolvedModuleMember {
             ResolvedModuleMember::Datatype(dt) => dt.name_symbol(),
             ResolvedModuleMember::Function(fun) => fun.name.value(),
             ResolvedModuleMember::Constant(const_) => const_.name.value(),
+        }
+    }
+
+    fn name_loc(&self) -> Loc {
+        match self {
+            ResolvedModuleMember::Datatype(dt) => dt.name().loc(),
+            ResolvedModuleMember::Function(fun) => fun.name.loc(),
+            ResolvedModuleMember::Constant(const_) => const_.name.loc(),
         }
     }
 }
@@ -554,7 +572,7 @@ pub(super) struct Context<'outer, 'env> {
     reporter: DiagnosticReporter<'env>,
     unscoped_types: Vec<BTreeMap<Symbol, ResolvedType>>,
     current_module: ModuleIdent,
-    local_scopes: Vec<BTreeMap<Symbol, u16>>,
+    local_scopes: Vec<BTreeMap<Symbol, (Loc, u16)>>,
     local_count: BTreeMap<Symbol, u16>,
     used_locals: BTreeSet<N::Var_>,
     nominal_blocks: Vec<(Option<Symbol>, BlockLabel, NominalBlockType)>,
@@ -670,7 +688,7 @@ impl<'outer, 'env> Context<'outer, 'env> {
         self.reporter.add_ide_annotation(loc, info);
     }
 
-    pub fn push_warning_filter_scope(&mut self, filters: WarningFilters) {
+    pub fn push_warning_filter_scope(&mut self, filters: FilterScope) {
         self.reporter.push_warning_filter_scope(filters)
     }
 
@@ -686,14 +704,14 @@ impl<'outer, 'env> Context<'outer, 'env> {
     fn valid_module(&mut self, m: &ModuleIdent) -> bool {
         let resolved = self.outer.module_members.contains_key(m);
         if !resolved {
-            let diag = make_unbound_module_error(self, m.loc, m);
+            // This is currently only called from 'friend', so suggesting self makes no sense.
+            let diag = make_unbound_module_error(self, m.loc, m, /* suggest_self */ false);
             self.add_diag(diag);
         }
         resolved
     }
 
-    /// Main module access resolver. Everything for modules should go through this when possible,
-    /// as it automatically preserves location information on symbols.
+    /// Module suggestion creation.
     fn resolve_module_access(
         &mut self,
         kind: &Option<ErrorKind>,
@@ -714,14 +732,16 @@ impl<'outer, 'env> Context<'outer, 'env> {
     ) -> Option<ResolvedModuleMember> {
         let Some(members) = self.outer.module_members.get(m) else {
             if report_errors {
-                self.add_diag(make_unbound_module_error(self, m.loc, m))
+                self.add_diag(make_unbound_module_error(
+                    self, m.loc, m, /* suggest_self */ true,
+                ))
             };
             return None;
         };
         let result = members.get(&n.value);
         if result.is_none() && report_errors {
             self.add_diag(make_unbound_module_member_error(
-                self, kind, loc, *m, n.value,
+                self, kind, loc, *m, &n.value,
             ))
         }
         result.map(|inner| {
@@ -860,6 +880,20 @@ impl<'outer, 'env> Context<'outer, 'env> {
     }
 
     fn resolve_unscoped_type(&mut self, loc: Loc, n: Name) -> ResolvedType {
+        fn find_suggestion<'a>(
+            unscoped_types: &'a [BTreeMap<Symbol, ResolvedType>],
+            n: &str,
+        ) -> Option<(&'a Symbol, Option<Loc>)> {
+            for candidates in unscoped_types.iter().rev() {
+                if let Some((suggestion, ty)) =
+                    suggest_levenshtein_candidate(candidates, n, |(name, _)| name.as_str())
+                {
+                    return Some((suggestion, ty.name_loc_opt()));
+                }
+            }
+            None
+        }
+
         match self
             .unscoped_types
             .iter()
@@ -868,6 +902,11 @@ impl<'outer, 'env> Context<'outer, 'env> {
         {
             None => {
                 let diag = make_unbound_local_name_error(self, &ErrorKind::Type, loc, n);
+                if let Some((suggestion, defn_loc_opt)) =
+                    find_suggestion(&self.unscoped_types, n.value.as_str())
+                {
+                    add_suggestion(&mut diag.clone(), loc, suggestion, defn_loc_opt);
+                }
                 self.add_diag(diag);
                 ResolvedType::Unbound
             }
@@ -935,6 +974,9 @@ impl<'outer, 'env> Context<'outer, 'env> {
                 match self.resolve_local(
                     n.loc,
                     NameResolution::UnboundUnscopedName,
+                    // Provide a suggestion if this might be a lambda argument.
+                    /* provide_suggestion */
+                    n.value.as_str().starts_with("$"),
                     |n| {
                         if possibly_datatype_name {
                             format!("Unbound datatype or function '{}' in current scope", n)
@@ -1129,9 +1171,11 @@ impl<'outer, 'env> Context<'outer, 'env> {
     fn resolve_term(&mut self, sp!(mloc, ma_): E::ModuleAccess) -> ResolvedTerm {
         match ma_ {
             E::ModuleAccess_::Name(name) if !is_constant_name(&name.value) => {
+                let name_starts_with_lowercase = name.value.as_str().starts_with(LOWERCASE_LETTERS);
                 match self.resolve_local(
                     mloc,
                     NameResolution::UnboundVariable,
+                    /* provide_suggestion */ name_starts_with_lowercase,
                     |name| format!("Unbound variable '{name}'"),
                     name,
                 ) {
@@ -1300,7 +1344,10 @@ impl<'outer, 'env> Context<'outer, 'env> {
             .entry(name)
             .and_modify(|c| *c += 1)
             .or_insert(default);
-        self.local_scopes.last_mut().unwrap().insert(name, id);
+        self.local_scopes
+            .last_mut()
+            .unwrap()
+            .insert(name, (vloc, id));
         // all locals start at color zero
         // they will be incremented when substituted for macros
         let nvar_ = N::Var_ { name, id, color: 0 };
@@ -1311,9 +1358,25 @@ impl<'outer, 'env> Context<'outer, 'env> {
         &mut self,
         loc: Loc,
         code: diagnostics::codes::NameResolution,
+        provide_suggestions: bool,
         variable_msg: impl FnOnce(Symbol) -> S,
         sp!(vloc, name): Name,
     ) -> Option<N::Var> {
+        pub fn find_suggestion(
+            local_scopes: &[BTreeMap<Symbol, (Loc, u16)>],
+            n: &str,
+        ) -> Option<(Symbol, Loc)> {
+            for candidates in local_scopes.iter().rev() {
+                if let Some((name, loc)) =
+                    suggest_levenshtein_candidate(candidates, n, |(name, _)| name.as_str())
+                        .map(|(s, (loc, _))| (s, loc))
+                {
+                    return Some((*name, *loc));
+                }
+            }
+            None
+        }
+
         let id_opt = self
             .local_scopes
             .iter()
@@ -1322,10 +1385,17 @@ impl<'outer, 'env> Context<'outer, 'env> {
         match id_opt {
             None => {
                 let msg = variable_msg(name);
-                self.add_diag(diag!(code, (loc, msg)));
+                let mut diag = diag!(code, (loc, msg));
+                if provide_suggestions
+                    && let Some((suggestion, loc)) =
+                        find_suggestion(&self.local_scopes, name.as_str())
+                {
+                    add_suggestion(&mut diag, vloc, suggestion, Some(loc));
+                }
+                self.add_diag(diag);
                 None
             }
-            Some(id) => {
+            Some((_, id)) => {
                 // all locals start at color zero
                 // they will be incremented when substituted for macros
                 let nvar_ = N::Var_ { name, id, color: 0 };
@@ -1346,7 +1416,7 @@ impl<'outer, 'env> Context<'outer, 'env> {
                 self.add_diag(ice!((loc, msg)));
                 None
             }
-            Some(id) => {
+            Some((_, id)) => {
                 let nvar_ = N::Var_ { name, id, color: 0 };
                 Some(sp(vloc, nvar_))
             }
@@ -1490,6 +1560,28 @@ impl<'outer, 'env> Context<'outer, 'env> {
     fn exit_nominal_block(&mut self) -> (BlockLabel, NominalBlockType) {
         let (_name, label, name_type) = self.nominal_blocks.pop().unwrap();
         (label, name_type)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Suggestions
+    // ---------------------------------------------------------------------------------------------
+
+    fn suggest_module(&self, m: &ModuleIdent, suggest_self: bool) -> Option<&ModuleIdent> {
+        // We only consider modules with the same address for suggestions.
+        // We also skip the current module, because that would have worked out during name
+        // resolution, and it is not a helpful suggestion. It is also weird to write it.
+        let candidates = self
+            .outer
+            .module_members
+            .keys()
+            .filter(|mid| mid.value.address == m.value.address)
+            .filter(|mid| {
+                suggest_self || mid.value.module_name() != self.current_module.value.module_name()
+            });
+
+        suggest_levenshtein_candidate(candidates, m.value.module_name(), |candidate| {
+            candidate.value.module_name()
+        })
     }
 }
 
@@ -1657,13 +1749,20 @@ fn make_unbound_name_error_msg(
 fn make_unbound_module_error(
     context: &Context,
     loc: Loc,
-    mident: impl std::fmt::Display,
+    mident: &ModuleIdent,
+    suggest_self: bool,
 ) -> Diagnostic {
     let msg = make_unbound_name_error_msg(context, &ErrorKind::Module, true, mident);
-    diag!(
+    let mut diag = diag!(
         ErrorKind::Module.unbound_error_code(/* is_single_name */ true),
         (loc, msg)
-    )
+    );
+
+    if let Some(suggestion) = context.suggest_module(mident, suggest_self) {
+        add_suggestion(&mut diag, loc, suggestion, None);
+    }
+
+    diag
 }
 
 fn make_unbound_local_name_error(
@@ -1685,7 +1784,7 @@ fn make_unbound_module_member_error(
     expected: &Option<ErrorKind>,
     loc: Loc,
     mident: ModuleIdent,
-    name: impl std::fmt::Display,
+    name: &Symbol,
 ) -> Diagnostic {
     let expected = expected.as_ref().unwrap_or(&ErrorKind::ModuleMember);
     let same_module = context.current_module == mident;
@@ -1698,10 +1797,27 @@ fn make_unbound_module_member_error(
         "{prefix}{}{postfix}",
         make_unbound_name_error_msg(context, expected, same_module, name)
     );
-    diag!(
+    let mut diag = diag!(
         expected.unbound_error_code(/* is_single_name */ false),
         (loc, msg)
-    )
+    );
+    if let Some(members) = context.outer.module_members.get(&mident) {
+        let members = members.iter().filter(|(_, kind)| match (expected, kind) {
+            (ErrorKind::Function, ResolvedModuleMember::Function(_)) => true,
+            (ErrorKind::Constant, ResolvedModuleMember::Constant(_)) => true,
+            (ErrorKind::Datatype, ResolvedModuleMember::Datatype(_)) => true,
+            (ErrorKind::ModuleMember, _) => false,
+            _ => false,
+        });
+        if let Some((suggestion, member)) =
+            suggest_levenshtein_candidate(members, name.to_string().as_str(), |(candidate, _)| {
+                candidate.as_str()
+            })
+        {
+            add_suggestion(&mut diag, loc, suggestion, Some(member.name_loc()));
+        }
+    }
+    diag
 }
 
 fn make_invalid_module_member_kind_error(
@@ -1748,19 +1864,12 @@ pub fn program(
     prog: E::Program,
 ) -> N::Program {
     let outer_context = OuterContext::new(compilation_env, pre_compiled_lib.clone(), &prog);
-    let E::Program {
-        warning_filters_table,
-        modules: emodules,
-    } = prog;
+    let E::Program { modules: emodules } = prog;
     let modules = modules(compilation_env, &outer_context, emodules);
     let mut inner = N::Program_ { modules };
     let mut info = NamingProgramInfo::new(pre_compiled_lib, &inner);
     super::resolve_use_funs::program(compilation_env, &mut info, &mut inner);
-    N::Program {
-        info,
-        warning_filters_table,
-        inner,
-    }
+    N::Program { info, inner }
 }
 
 fn modules(
@@ -1794,7 +1903,7 @@ fn module(
         constants: econstants,
     } = mdef;
     let context = &mut Context::new(env, outer, package_name, ident);
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let mut use_funs = use_funs(context, euse_funs);
     let mut syntax_methods = N::SyntaxMethods::new();
     let friends = efriends.filter_map(|mident, f| friend(context, mident, f));
@@ -1885,7 +1994,7 @@ fn use_funs(context: &mut Context, eufs: E::UseFuns) -> N::UseFuns {
         .flat_map(|e| explicit_use_fun(context, e))
         .collect();
     for (tn, method, nuf) in resolved_vec {
-        let methods = resolved.entry(tn).or_default();
+        let methods = resolved.entry(tn.clone()).or_default();
         let nuf_loc = nuf.loc;
         if let Err((_, prev)) = methods.add(method, nuf) {
             let msg = format!("Duplicate 'use fun' for '{}.{}'", tn, method);
@@ -1953,7 +2062,9 @@ fn explicit_use_fun(
     };
     let tn_opt = match tn_opt {
         ResolvedType::BuiltinType(bt_) => Some(N::TypeName_::Builtin(sp(ty.loc, bt_))),
-        ResolvedType::ModuleType(mt) => Some(N::TypeName_::ModuleType(mt.mident(), mt.name())),
+        ResolvedType::ModuleType(mt) => {
+            Some(N::TypeName_::ModuleType(mt.mident().into(), mt.name()))
+        }
         ResolvedType::Unbound => {
             assert!(context.env.has_errors());
             None
@@ -1990,7 +2101,7 @@ fn explicit_use_fun(
         loc,
         attributes,
         is_public,
-        tname: tn,
+        tname: tn.clone(),
         target_function,
         kind: N::UseFunKind::Explicit,
         used: is_public.is_some(), // suppress unused warning for public use funs
@@ -2163,7 +2274,7 @@ fn resolve_stdlib_function(
 }
 
 fn resolve_stdlib_type(context: &mut Context, ma: E::ModuleAccess_) -> Option<N::Type> {
-    use N::{Type_ as NT, TypeName_ as NN};
+    use N::{TypeInner as NT, TypeName_ as NN};
 
     let E::ModuleAccess_::ModuleAccess(m, n) = ma else {
         return None;
@@ -2173,19 +2284,25 @@ fn resolve_stdlib_type(context: &mut Context, ma: E::ModuleAccess_) -> Option<N:
     };
     let (decl_loc, tn, arity) = match *mt {
         ResolvedDatatype::Struct(stype) => {
-            let tn = sp(stype.decl_loc, NN::ModuleType(stype.mident, stype.name));
+            let tn = sp(
+                stype.decl_loc,
+                NN::ModuleType(stype.mident.into(), stype.name),
+            );
             let arity = stype.tyarg_arity;
             (stype.decl_loc, tn, arity)
         }
         ResolvedDatatype::Enum(etype) => {
-            let tn = sp(etype.decl_loc, NN::ModuleType(etype.mident, etype.name));
+            let tn = sp(
+                etype.decl_loc,
+                NN::ModuleType(etype.mident.into(), etype.name),
+            );
             let arity = etype.tyarg_arity;
             (etype.decl_loc, tn, arity)
         }
     };
     assert!(arity == 0, "Cannot resolve stdlib types with arguments");
     let tys = vec![];
-    Some(sp(decl_loc, NT::Apply(None, tn, tys)))
+    Some(sp(decl_loc, NT::Apply(None, tn, tys).into()))
 }
 
 //**************************************************************************************************
@@ -2217,7 +2334,7 @@ fn function(
     assert!(context.nominal_block_id == 0);
     assert!(context.used_fun_tparams.is_empty());
     assert!(context.used_locals.is_empty());
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     context.local_scopes = vec![BTreeMap::new()];
     context.local_count = BTreeMap::new();
     context.translating_fun = true;
@@ -2282,28 +2399,28 @@ fn function_signature(
                 check_mut_underscore(context, Some(mut_));
                 mut_ = Mutability::Imm;
             };
-            if param.is_syntax_identifier() {
-                if let Mutability::Mut(mutloc) = mut_ {
-                    let msg = format!(
-                        "Invalid 'mut' parameter. \
+            if param.is_syntax_identifier()
+                && let Mutability::Mut(mutloc) = mut_
+            {
+                let msg = format!(
+                    "Invalid 'mut' parameter. \
                         '{}' parameters cannot be declared as mutable",
-                        MACRO_MODIFIER
-                    );
-                    let mut diag = diag!(NameResolution::InvalidMacroParameter, (mutloc, msg));
-                    diag.add_note(ASSIGN_SYNTAX_IDENTIFIER_NOTE);
-                    context.add_diag(diag);
-                    mut_ = Mutability::Imm;
-                }
+                    MACRO_MODIFIER
+                );
+                let mut diag = diag!(NameResolution::InvalidMacroParameter, (mutloc, msg));
+                diag.add_note(ASSIGN_SYNTAX_IDENTIFIER_NOTE);
+                context.add_diag(diag);
+                mut_ = Mutability::Imm;
             }
-            if let Err((param, prev_loc)) = declared.add(param, ()) {
-                if !is_underscore {
-                    let msg = format!("Duplicate parameter with name '{}'", param);
-                    context.add_diag(diag!(
-                        Declarations::DuplicateItem,
-                        (param.loc(), msg),
-                        (prev_loc, "Previously declared here"),
-                    ))
-                }
+            if let Err((param, prev_loc)) = declared.add(param, ())
+                && !is_underscore
+            {
+                let msg = format!("Duplicate parameter with name '{}'", param);
+                context.add_diag(diag!(
+                    Declarations::DuplicateItem,
+                    (param.loc(), msg),
+                    (prev_loc, "Previously declared here"),
+                ))
             }
             let is_parameter = true;
             let nparam = context.declare_local(is_parameter, param.0);
@@ -2348,7 +2465,7 @@ fn struct_def(
         type_parameters,
         fields,
     } = sdef;
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let type_parameters = datatype_type_parameters(context, type_parameters);
     let fields = struct_fields(context, fields);
     context.pop_warning_filter_scope();
@@ -2410,7 +2527,7 @@ fn enum_def(
         type_parameters,
         variants,
     } = edef;
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     let type_parameters = datatype_type_parameters(context, type_parameters);
     let variants = enum_variants(context, variants);
     context.pop_warning_filter_scope();
@@ -2486,13 +2603,14 @@ fn constant(context: &mut Context, _name: ConstantName, econstant: E::Constant) 
         index,
         attributes,
         loc,
+        visibility,
         signature: esignature,
         value: evalue,
     } = econstant;
     assert!(context.local_scopes.is_empty());
     assert!(context.local_count.is_empty());
     assert!(context.used_locals.is_empty());
-    context.push_warning_filter_scope(warning_filter);
+    context.push_warning_filter_scope(warning_filter.clone());
     context.local_scopes = vec![BTreeMap::new()];
     let signature = type_(context, TypeAnnotation::ConstantSignature, esignature);
     let value = *exp(context, Box::new(evalue));
@@ -2507,6 +2625,7 @@ fn constant(context: &mut Context, _name: ConstantName, econstant: E::Constant) 
         index,
         attributes,
         loc,
+        visibility,
         signature,
         value,
     }
@@ -2582,25 +2701,25 @@ fn types(context: &mut Context, case: TypeAnnotation, tys: Vec<E::Type>) -> Vec<
 
 fn type_(context: &mut Context, case: TypeAnnotation, sp!(loc, ety_): E::Type) -> N::Type {
     use E::Type_ as ET;
-    use N::{Type_ as NT, TypeName_ as NN};
+    use N::{Type_ as NT_, TypeInner as NT, TypeName_ as NN};
     use ResolvedType as RT;
     let ty_ = match ety_ {
-        ET::Unit => NT::Unit,
-        ET::Multiple(tys) => NT::multiple_(
+        ET::Unit => N::UNIT_TYPE.clone(),
+        ET::Multiple(tys) => NT_::multiple_(
             loc,
             tys.into_iter().map(|t| type_(context, case, t)).collect(),
         ),
-        ET::Ref(mut_, inner) => NT::Ref(mut_, Box::new(type_(context, case, *inner))),
+        ET::Ref(mut_, inner) => NT::Ref(mut_, type_(context, case, *inner)).into(),
         ET::UnresolvedError => {
             assert!(context.env.has_errors());
-            NT::UnresolvedError
+            N::UNRESOLVED_ERROR_TYPE.clone()
         }
         ET::Apply(ma, tys) => {
             let original_loc = ma.loc;
             match context.resolve_type(ma) {
                 RT::Unbound => {
                     assert!(context.env.has_errors());
-                    NT::UnresolvedError
+                    N::UNRESOLVED_ERROR_TYPE.clone()
                 }
                 RT::Hole => {
                     let case_str_opt = match case {
@@ -2627,10 +2746,10 @@ fn type_(context: &mut Context, case: TypeAnnotation, sp!(loc, ety_): E::Type) -
                             diag.add_note("Only 'macro' functions can use '_' in their signatures");
                         }
                         context.add_diag(diag);
-                        NT::UnresolvedError
+                        N::UNRESOLVED_ERROR_TYPE.clone()
                     } else {
                         // replaced with a type variable during type instantiation
-                        NT::Anything
+                        N::ANYTHING_TYPE.clone()
                     }
                 }
                 RT::BuiltinType(bn_) => {
@@ -2638,7 +2757,7 @@ fn type_(context: &mut Context, case: TypeAnnotation, sp!(loc, ety_): E::Type) -
                     let arity = bn_.tparam_constraints(loc).len();
                     let tys = types(context, case, tys);
                     let tys = check_type_instantiation_arity(context, loc, name_f, tys, arity);
-                    NT::builtin_(sp(ma.loc, bn_), tys)
+                    NT_::builtin_(sp(ma.loc, bn_), tys)
                 }
                 RT::TParam(_, tp) => {
                     if !tys.is_empty() {
@@ -2646,23 +2765,29 @@ fn type_(context: &mut Context, case: TypeAnnotation, sp!(loc, ety_): E::Type) -
                             NameResolution::NamePositionMismatch,
                             (loc, "Generic type parameters cannot take type arguments"),
                         ));
-                        NT::UnresolvedError
+                        N::UNRESOLVED_ERROR_TYPE.clone()
                     } else {
                         if context.translating_fun {
                             context.used_fun_tparams.insert(tp.id);
                         }
-                        NT::Param(tp)
+                        NT::Param(tp).into()
                     }
                 }
                 RT::ModuleType(mt) => {
                     let (tn, arity) = match mt {
                         ResolvedDatatype::Struct(stype) => {
-                            let tn = sp(original_loc, NN::ModuleType(stype.mident, stype.name));
+                            let tn = sp(
+                                original_loc,
+                                NN::ModuleType(stype.mident.into(), stype.name),
+                            );
                             let arity = stype.tyarg_arity;
                             (tn, arity)
                         }
                         ResolvedDatatype::Enum(etype) => {
-                            let tn = sp(original_loc, NN::ModuleType(etype.mident, etype.name));
+                            let tn = sp(
+                                original_loc,
+                                NN::ModuleType(etype.mident.into(), etype.name),
+                            );
                             let arity = etype.tyarg_arity;
                             (tn, arity)
                         }
@@ -2670,14 +2795,14 @@ fn type_(context: &mut Context, case: TypeAnnotation, sp!(loc, ety_): E::Type) -
                     let tys = types(context, case, tys);
                     let name_f = || format!("{}", tn);
                     let tys = check_type_instantiation_arity(context, loc, name_f, tys, arity);
-                    NT::Apply(None, tn, tys)
+                    NT::Apply(None, tn, tys).into()
                 }
             }
         }
         ET::Fun(tys, ty) => {
             let tys = types(context, case, tys);
             let ty = Box::new(type_(context, case, *ty));
-            NT::Fun(tys, ty)
+            NT::Fun(tys, *ty).into()
         }
     };
     sp(loc, ty_)
@@ -2725,7 +2850,7 @@ fn check_type_instantiation_arity<F: FnOnce() -> String>(
     }
 
     while ty_args.len() < arity {
-        ty_args.push(sp(loc, N::Type_::UnresolvedError))
+        ty_args.push(sp(loc, N::UNRESOLVED_ERROR_TYPE.clone()))
     }
 
     ty_args
@@ -3909,18 +4034,26 @@ fn lvalue(
                     context.add_diag(diag!(Declarations::DuplicateItem, primary, secondary));
                 }
                 if v.is_syntax_identifier() {
-                    debug_assert!(
-                        matches!(case, C::Assign),
-                        "ICE this should fail during parsing"
-                    );
-                    let msg = format!(
-                        "Cannot assign to argument for parameter '{}'. \
-                        Arguments must be used in value positions",
-                        v.0
-                    );
-                    let mut diag = diag!(TypeSafety::CannotExpandMacro, (loc, msg));
-                    diag.add_note(ASSIGN_SYNTAX_IDENTIFIER_NOTE);
-                    context.add_diag(diag);
+                    match case {
+                        C::Bind => {
+                            ice_assert!(
+                                context,
+                                context.env.has_errors(),
+                                loc,
+                                "Syntax identifiers for macros should have been rejected already"
+                            );
+                        }
+                        C::Assign => {
+                            let msg = format!(
+                                "Cannot assign to argument for parameter '{}'. \
+                                Arguments must be used in value positions",
+                                v.0
+                            );
+                            let mut diag = diag!(TypeSafety::CannotExpandMacro, (loc, msg));
+                            diag.add_note(ASSIGN_SYNTAX_IDENTIFIER_NOTE);
+                            context.add_diag(diag);
+                        }
+                    }
                     return None;
                 }
                 let nv = match case {
@@ -3931,6 +4064,7 @@ fn lvalue(
                     C::Assign => context.resolve_local(
                         loc,
                         NameResolution::UnboundVariable,
+                        /* provide_suggestion */ true,
                         |name| format!("Invalid assignment. Unbound variable '{name}'"),
                         n,
                     )?,
@@ -4151,20 +4285,22 @@ fn resolve_call(
                     }
                 }
                 B::Assert(_) => {
+                    let function_call_help = || {
+                        format!(
+                            "Replace with '{0}!'. '{0}' has been replaced with a '{0}!' built-in \
+                            macro so that arguments are no longer eagerly evaluated",
+                            B::ASSERT_MACRO
+                        )
+                    };
                     if is_macro.is_none() {
                         let dep_msg = format!(
                             "'{}' function syntax has been deprecated and will be removed",
                             B::ASSERT_MACRO
                         );
-                        // TODO make this a tip/hint?
-                        let help_msg = format!(
-                            "Replace with '{0}!'. '{0}' has been replaced with a '{0}!' built-in \
-                            macro so that arguments are no longer eagerly evaluated",
-                            B::ASSERT_MACRO
-                        );
                         let mut diag =
                             diag!(Uncategorized::DeprecatedWillBeRemoved, (call_loc, dep_msg),);
-                        diag.add_note(help_msg);
+                        // TODO make this a tip/hint?
+                        diag.add_note(function_call_help());
                         context.add_diag(diag);
                     }
                     exp_types_opt_with_arity_check(
@@ -4177,12 +4313,22 @@ fn resolve_call(
                     );
                     // If no abort code is given for the assert, we add in the abort code as the
                     // bitset-line-number if `CleverAssertions` is set.
-                    if args.value.len() == 1 && is_macro.is_some() {
-                        context.check_feature(
+                    if args.value.len() == 1 {
+                        let is_supported = context.check_feature(
                             context.current_package,
                             FeatureGate::CleverAssertions,
                             subject_loc,
                         );
+                        if is_supported && is_macro.is_none() {
+                            let dep_msg = format!(
+                                "'{}' function syntax has been deprecated and cannot be used with clever assertions",
+                                B::ASSERT_MACRO
+                            );
+                            let mut diag = diag!(Editions::DeprecatedFeature, (call_loc, dep_msg));
+                            // TODO make this a tip/hint?
+                            diag.add_note(function_call_help());
+                            context.add_diag(diag);
+                        }
                         args.value.push(sp(
                             call_loc,
                             N::Exp_::ErrorConstant {
@@ -4343,7 +4489,7 @@ fn exp_types_opt_with_arity_check(
     }
 
     while args.len() < arity {
-        args.push(sp(tyarg_error_loc, N::Type_::UnresolvedError));
+        args.push(sp(tyarg_error_loc, N::UNRESOLVED_ERROR_TYPE.clone()));
     }
 
     Some(args)

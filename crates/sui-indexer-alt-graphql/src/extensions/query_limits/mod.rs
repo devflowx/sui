@@ -1,32 +1,56 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
-use async_graphql::{
-    extensions::{
-        Extension, ExtensionContext, ExtensionFactory, NextParseQuery, NextRequest, NextValidation,
-    },
-    parser::types::ExecutableDocument,
-    value, Response, ServerError, ServerResult, ValidationResult, Variables,
-};
+use async_graphql::Response;
+use async_graphql::ServerError;
+use async_graphql::ServerResult;
+use async_graphql::ValidationResult;
+use async_graphql::Variables;
+use async_graphql::extensions::Extension;
+use async_graphql::extensions::ExtensionContext;
+use async_graphql::extensions::ExtensionFactory;
+use async_graphql::extensions::NextParseQuery;
+use async_graphql::extensions::NextRequest;
+use async_graphql::extensions::NextValidation;
+use async_graphql::parser::types::ExecutableDocument;
+use async_graphql::value;
 use headers::ContentLength;
 
-use crate::{metrics::RpcMetrics, pagination::PaginationConfig};
-
-use self::error::{Error, ErrorKind};
-use self::show_usage::ShowUsage;
+use crate::extensions::query_limits::error::Error;
+use crate::extensions::query_limits::error::ErrorKind;
+use crate::extensions::query_limits::show_usage::ShowUsage;
+use crate::metrics::RpcMetrics;
+use crate::pagination::PaginationConfig;
 
 mod chain;
 mod error;
 mod input;
 mod output;
 mod payload;
+pub(crate) mod rich;
 pub(crate) mod show_usage;
 mod visitor;
+
+/// The validated query's depth, in a shared slot so it can be read after validation computes it.
+#[derive(Default, Clone)]
+pub(crate) struct QueryDepth(Arc<AtomicU32>);
+
+impl QueryDepth {
+    pub(crate) fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(depth: u32) -> Self {
+        Self(Arc::new(AtomicU32::new(depth)))
+    }
+}
 
 pub(crate) struct QueryLimitsConfig {
     pub(crate) max_output_nodes: u32,
@@ -58,7 +82,7 @@ struct ParsedDocument {
 
 struct Usage {
     input: input::Usage,
-    payload: payload::Usage,
+    payload: Option<payload::Usage>,
     output: output::Usage,
 }
 
@@ -100,8 +124,10 @@ impl Extension for QueryLimitsCheckerExt {
         variables: &Variables,
         next: NextParseQuery<'_>,
     ) -> ServerResult<ExecutableDocument> {
-        let &ContentLength(length) = ctx.data_unchecked();
-        if length > self.limits.max_payload_size() as u64 {
+        // ContentLength is not available for WebSocket subscriptions (no HTTP body).
+        if let Some(&ContentLength(length)) = ctx.data_opt()
+            && length > self.limits.max_payload_size() as u64
+        {
             Err(Error::new_global(ErrorKind::PayloadSizeOverall {
                 limit: self.limits.max_payload_size(),
                 actual: length,
@@ -141,20 +167,36 @@ impl Extension for QueryLimitsCheckerExt {
             return Ok(res);
         };
 
-        let &ContentLength(length) = ctx.data_unchecked();
+        let content_length = ctx.data_opt::<ContentLength>().map(|cl| cl.0);
         let pagination_config: &PaginationConfig = ctx.data_unchecked();
 
         let _guard = self.metrics.limits_validation_latency.start_timer();
 
         let input = input::check(self.limits.as_ref(), &doc)?;
 
-        let payload = payload::check(
-            self.limits.as_ref(),
-            length,
-            &ctx.schema_env.registry,
-            &doc,
-            &var,
-        )?;
+        // Payload check requires ContentLength, which is not available for WebSocket
+        // subscriptions. The input and output checks still apply.
+        let payload = if let Some(length) = content_length {
+            let payload = payload::check(
+                self.limits.as_ref(),
+                length,
+                &ctx.schema_env.registry,
+                &doc,
+                &var,
+            )?;
+
+            self.metrics.total_payload_size.observe(length as f64);
+            self.metrics
+                .query_payload_size
+                .observe(payload.query_payload_size as f64);
+            self.metrics
+                .tx_payload_size
+                .observe(payload.tx_payload_size as f64);
+
+            Some(payload)
+        } else {
+            None
+        };
 
         let output = output::check(
             self.limits.as_ref(),
@@ -166,14 +208,13 @@ impl Extension for QueryLimitsCheckerExt {
 
         self.metrics.input_depth.observe(input.depth as f64);
         self.metrics.input_nodes.observe(input.nodes as f64);
-        self.metrics.total_payload_size.observe(length as f64);
-        self.metrics
-            .query_payload_size
-            .observe(payload.query_payload_size as f64);
-        self.metrics
-            .tx_payload_size
-            .observe(payload.tx_payload_size as f64);
         self.metrics.output_nodes.observe(output.nodes as f64);
+
+        // Stash the validated depth so the subscription handler can add its depth surcharge to each
+        // payload's throttle cost.
+        if let Some(QueryDepth(depth)) = ctx.data_opt() {
+            depth.store(input.depth, Ordering::Relaxed);
+        }
 
         if let Some(ShowUsage(_)) = ctx.data_opt() {
             *self.usage.lock().unwrap() = Some(Usage {
@@ -213,12 +254,18 @@ impl Extension for QueryLimitsCheckerExt {
 mod tests {
     use std::collections::BTreeMap;
 
-    use async_graphql::{connection::Connection, EmptySubscription, Object, Request, Schema};
+    use async_graphql::EmptySubscription;
+    use async_graphql::Object;
+    use async_graphql::Request;
+    use async_graphql::Schema;
+    use async_graphql::connection::Connection;
     use async_graphql_value::ConstValue;
     use axum::http::HeaderValue;
-    use insta::{assert_json_snapshot, assert_snapshot};
+    use insta::assert_json_snapshot;
+    use insta::assert_snapshot;
     use serde_json::json;
 
+    use crate::api::scalars::json::Json;
     use crate::pagination::PageLimits;
 
     use super::*;
@@ -286,8 +333,9 @@ mod tests {
         }
 
         /// Looks like a transaction execution or dry-run field.
-        async fn tx(&self, bytes: String, other: usize) -> usize {
-            bytes.len() + other
+        async fn tx(&self, _transaction: Json, other: usize) -> usize {
+            // For testing purposes, just return the other value
+            other
         }
 
         /// Looks like a ZkLogin prover endpoint.
@@ -306,8 +354,9 @@ mod tests {
     #[Object]
     impl Mutation {
         /// Looks like a transaction execution or dry-run field.
-        async fn tx(&self, bytes: String, other: usize) -> usize {
-            bytes.len() + other
+        async fn tx(&self, _bytes: Json, other: usize) -> usize {
+            // For testing purposes, just return the other value
+            other
         }
 
         /// Looks like a ZkLogin prover endpoint (this field is not included in `tx_payload_args` to test that configuration).
@@ -325,7 +374,7 @@ mod tests {
             max_tx_payload_size: 1000,
             tx_payload_args: BTreeSet::from_iter([
                 ("Mutation", "tx", "bytes"),
-                ("Query", "tx", "bytes"),
+                ("Query", "tx", "transaction"),
                 ("Query", "zk", "bytes"),
                 ("Query", "zk", "sigs"),
             ]),
@@ -840,7 +889,7 @@ mod tests {
             page(),
         );
 
-        let response = execute(&schema, r#"{ tx(bytes: "hello world", other: 1) }"#).await;
+        let response = execute(&schema, r#"{ tx(transaction: "hello world", other: 1) }"#).await;
 
         assert_json_snapshot!(response, @r###"
         {
@@ -851,7 +900,7 @@ mod tests {
               "locations": [
                 {
                   "line": 1,
-                  "column": 13
+                  "column": 19
                 }
               ],
               "path": [
@@ -874,14 +923,14 @@ mod tests {
             &schema,
             r#"
             {
-              tx(bytes: "hello world", other: 1)
+              tx(transaction: "hello world", other: 1)
               zk(bytes: "hello world", sigs: ["a", "b", "c"])
             }
             "#,
         )
         .await;
 
-        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 113,tx_payload_size: 39}");
+        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 119,tx_payload_size: 39}");
     }
 
     /// Transaction payloads that are in nested fields are not counted.
@@ -893,7 +942,7 @@ mod tests {
             r#"
             {
               a {
-                tx(bytes: "hello world", other: 1)
+                tx(transaction: "hello world", other: 1)
                 zk(bytes: "hello world", sigs: ["a", "b", "c"])
               }
             }
@@ -901,7 +950,7 @@ mod tests {
         )
         .await;
 
-        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 190,tx_payload_size: 0}");
+        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 196,tx_payload_size: 0}");
     }
 
     /// The test config specifies the Query.zk contains transaction payloads, but `Mutation.zk`
@@ -922,6 +971,72 @@ mod tests {
         .await;
 
         assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 148,tx_payload_size: 13}");
+    }
+
+    /// Test that structured (JSON object) transaction payloads are counted correctly.
+    #[tokio::test]
+    async fn test_tx_payload_structured_inline() {
+        let schema = schema(config(), page());
+        let response = execute(
+            &schema,
+            r#"
+            {
+              tx(transaction: { sender: "0xabc", data: [1, 2, 3], flag: true }, other: 1)
+            }
+            "#,
+        )
+        .await;
+
+        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 92,tx_payload_size: 39}");
+    }
+
+    /// Test that structured transaction payloads in variables are counted correctly.
+    #[tokio::test]
+    async fn test_tx_payload_structured_variable() {
+        let schema = schema(config(), page());
+        let query = r#"
+            query ($txData: JSON!) {
+              tx(transaction: $txData, other: 1)
+            }
+            "#;
+
+        let variables = BTreeMap::from([(
+            "txData".to_string(),
+            json!({ "sender": "0xdef", "amount": 100, "nested": { "key": "value" } }),
+        )]);
+
+        let request = Request::from(query)
+            .data(ShowUsage(HeaderValue::from_static("true")))
+            .data(ContentLength(query.len() as u64))
+            .variables(Variables::from_json(
+                serde_json::to_value(variables).unwrap(),
+            ));
+
+        let response = schema.execute(request).await;
+        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 57,tx_payload_size: 56}");
+    }
+
+    /// Accounting for a transaction payload that is part literal, part variable.
+    #[tokio::test]
+    async fn test_tx_payload_structured_mixed() {
+        let schema = schema(config(), page());
+        let query = r#"
+            query ($nested: JSON!) {
+              tx(transaction: { sender: "0xabc", nested: $nested }, other: 1)
+            }
+            "#;
+
+        let variables = BTreeMap::from([("nested".to_string(), json!({ "key": "value" }))]);
+
+        let request = Request::from(query)
+            .data(ShowUsage(HeaderValue::from_static("true")))
+            .data(ContentLength(query.len() as u64))
+            .variables(Variables::from_json(
+                serde_json::to_value(variables).unwrap(),
+            ));
+
+        let response = schema.execute(request).await;
+        assert_snapshot!(usage(response, "payload"), @"{query_payload_size: 103,tx_payload_size: 39}");
     }
 
     #[tokio::test]

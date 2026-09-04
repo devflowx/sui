@@ -3,10 +3,15 @@
 
 use std::sync::Arc;
 
-use prometheus::{
-    register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_vec_with_registry, Histogram, HistogramVec, IntCounterVec, Registry,
-};
+use prometheus::Histogram;
+use prometheus::HistogramVec;
+use prometheus::IntCounter;
+use prometheus::IntCounterVec;
+use prometheus::Registry;
+use prometheus::register_histogram_vec_with_registry;
+use prometheus::register_histogram_with_registry;
+use prometheus::register_int_counter_vec_with_registry;
+use prometheus::register_int_counter_with_registry;
 
 pub(crate) mod middleware;
 
@@ -31,6 +36,7 @@ pub struct RpcMetrics {
     pub requests_succeeded: IntCounterVec,
     pub requests_failed: IntCounterVec,
     pub requests_cancelled: IntCounterVec,
+    pub requests_panicked: IntCounter,
 
     pub owned_objects_filter_scans: Histogram,
     pub read_retries: IntCounterVec,
@@ -81,6 +87,13 @@ impl RpcMetrics {
             )
             .unwrap(),
 
+            requests_panicked: register_int_counter_with_registry!(
+                "jsonrpc_requests_panicked",
+                "Number of requests that panicked during processing",
+                registry
+            )
+            .unwrap(),
+
             owned_objects_filter_scans: register_histogram_with_registry!(
                 "jsonrpc_owned_objects_filter_scans",
                 "Number of pages of owned objects scanned in response to compound owned object filters",
@@ -91,7 +104,7 @@ impl RpcMetrics {
 
             read_retries: register_int_counter_vec_with_registry!(
                 "read_retries",
-                "Number of retries for reads from Bigtable or Postgres tables",
+                "Number of retries for reads from Postgres tables",
                 &["table"],
                 registry
             )

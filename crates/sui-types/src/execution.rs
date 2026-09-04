@@ -2,20 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    MoveTypeTagTrait, SUI_SYSTEM_ADDRESS,
     accumulator_event::AccumulatorEvent,
     base_types::{ObjectID, ObjectRef, SequenceNumber},
     digests::{ObjectDigest, TransactionDigest},
+    error::{ExecutionError, SuiError},
     event::Event,
     is_system_package,
     object::{Data, Object, Owner},
     storage::{BackingPackageStore, ObjectChange},
-    transaction::{Argument, Command},
+    sui_system_state::SUI_SYSTEM_STATE_INNER_MODULE_NAME,
+    transaction::{Argument, Command, SharedObjectMutability},
     type_input::TypeInput,
 };
-use move_core_types::language_storage::TypeTag;
+use move_core_types::{
+    ident_str,
+    identifier::IdentStr,
+    language_storage::{StructTag, TypeTag},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+
+const EXECUTION_TIME_OBSERVATION_CHUNK_KEY_STRUCT: &IdentStr =
+    ident_str!("ExecutionTimeObservationChunkKey");
 
 /// A type containing all of the information needed to work in execution with an object whose
 /// consensus stream is ended, and when committing the execution effects of the transaction.
@@ -25,7 +35,12 @@ use std::time::Duration;
 /// 2. Whether the object appeared as mutable (or owned) in the transaction, or as read-only.
 /// 3. The transaction digest of the previous transaction that used this object mutably or
 ///    took it by value.
-pub type ConsensusStreamEndedInfo = (ObjectID, SequenceNumber, bool, TransactionDigest);
+pub type ConsensusStreamEndedInfo = (
+    ObjectID,
+    SequenceNumber,
+    SharedObjectMutability,
+    TransactionDigest,
+);
 
 /// A sequence of information about removed consensus objects in the transaction's inputs.
 pub type ConsensusStreamEndedObjects = Vec<ConsensusStreamEndedInfo>;
@@ -106,18 +121,60 @@ impl ExecutionResultsV2 {
         self.accumulator_events.clear();
     }
 
-    pub fn merge_results(&mut self, new_results: Self) {
+    /// If `consistent_merge` is true, the deletes and writes in `new_results` will update the
+    /// results any existing writes and deletes in `self` respectively. If false, it is assumed
+    /// that deletes and writes are disjoint.
+    /// If `invariant_checks` is true, the function will check for disjointness between deleted
+    /// and created/written objects.
+    pub fn merge_results(
+        &mut self,
+        new_results: Self,
+        consistent_merge: bool,
+        invariant_checks: bool,
+    ) -> Result<(), ExecutionError> {
+        if consistent_merge {
+            // An object written before the merge (e.g., gas coin written by smash_gas) may be
+            // deleted by the new results (e.g., send_funds destroying the gas coin during PTB
+            // execution). Remove such stale entries.
+            for id in &new_results.deleted_object_ids {
+                self.written_objects.remove(id);
+                // additional hardening
+                self.created_object_ids.remove(id);
+            }
+            // While not possible currently, we should ensure that any object previously marked as
+            // deleted is now marked only as written
+            for id in new_results.written_objects.keys() {
+                self.deleted_object_ids.remove(id);
+            }
+        }
+
         self.written_objects.extend(new_results.written_objects);
         self.modified_objects.extend(new_results.modified_objects);
         self.created_object_ids
             .extend(new_results.created_object_ids);
         self.deleted_object_ids
             .extend(new_results.deleted_object_ids);
+
+        if invariant_checks {
+            // debug assert that deleted is disjoint with created and written
+            assert_invariant!(
+                self.deleted_object_ids
+                    .is_disjoint(&self.created_object_ids),
+                "Deleted object IDs should be disjoint with created object IDs"
+            );
+            assert_invariant!(
+                self.written_objects
+                    .keys()
+                    .all(|id| !self.deleted_object_ids.contains(id)),
+                "Deleted object IDs should be disjoint with written object IDs"
+            );
+        }
         self.user_events.extend(new_results.user_events);
         self.accumulator_events
             .extend(new_results.accumulator_events);
         self.settlement_input_sui += new_results.settlement_input_sui;
         self.settlement_output_sui += new_results.settlement_output_sui;
+        Ok(())
     }
 
     pub fn update_version_and_previous_tx(
@@ -166,20 +223,19 @@ impl ExecutionResultsV2 {
                 }
 
                 // Update initial_shared_version for reshared objects
-                if reshare_at_initial_version {
-                    if let Some(Owner::Shared {
+                if reshare_at_initial_version
+                    && let Some(Owner::Shared {
                         initial_shared_version: previous_initial_shared_version,
                     }) = input_objects.get(id).map(|obj| &obj.owner)
-                    {
-                        debug_assert!(!self.created_object_ids.contains(id));
-                        debug_assert!(!self.deleted_object_ids.contains(id));
-                        debug_assert!(
-                            *initial_shared_version == SequenceNumber::new()
-                                || *initial_shared_version == *previous_initial_shared_version
-                        );
+                {
+                    debug_assert!(!self.created_object_ids.contains(id));
+                    debug_assert!(!self.deleted_object_ids.contains(id));
+                    debug_assert!(
+                        *initial_shared_version == SequenceNumber::new()
+                            || *initial_shared_version == *previous_initial_shared_version
+                    );
 
-                        *initial_shared_version = *previous_initial_shared_version;
-                    }
+                    *initial_shared_version = *previous_initial_shared_version;
                 }
             }
 
@@ -291,6 +347,22 @@ impl ExecutionTimeObservationKey {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Serialize, Deserialize)]
+pub struct ExecutionTimeObservationChunkKey {
+    pub chunk_index: u64,
+}
+
+impl MoveTypeTagTrait for ExecutionTimeObservationChunkKey {
+    fn get_type_tag() -> TypeTag {
+        TypeTag::Struct(Box::new(StructTag {
+            address: SUI_SYSTEM_ADDRESS,
+            module: SUI_SYSTEM_STATE_INNER_MODULE_NAME.to_owned(),
+            name: EXECUTION_TIME_OBSERVATION_CHUNK_KEY_STRUCT.to_owned(),
+            type_params: vec![],
+        }))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum ExecutionTiming {
     Success(Duration),
@@ -311,3 +383,50 @@ impl ExecutionTiming {
 }
 
 pub type ResultWithTimings<R, E> = Result<(R, Vec<ExecutionTiming>), (E, Vec<ExecutionTiming>)>;
+
+/// Captures the output of executing a transaction in the execution driver.
+#[derive(Debug)]
+pub enum ExecutionOutput<T> {
+    /// The expected typical path - transaction executed successfully.
+    Success(T),
+    /// Validator has halted at epoch end or epoch mismatch. This is a valid state that should
+    /// be handled gracefully.
+    EpochEnded,
+    /// Execution failed with an error. This should never happen - we use fatal! when encountered.
+    Fatal(SuiError),
+    /// Execution should be retried later due to unsatisfied constraints such as insufficient object
+    /// balance withdrawals that require waiting for the balance to reach a deterministic amount.
+    /// When this happens, the transaction is auto-rescheduled from AuthorityState.
+    RetryLater,
+}
+
+impl<T> ExecutionOutput<T> {
+    /// Unwraps the ExecutionOutput, panicking if it's not Success.
+    /// This is primarily for test code.
+    pub fn unwrap(self) -> T {
+        match self {
+            ExecutionOutput::Success(value) => value,
+            ExecutionOutput::EpochEnded => {
+                panic!("called `ExecutionOutput::unwrap()` on `EpochEnded`")
+            }
+            ExecutionOutput::Fatal(e) => {
+                panic!("called `ExecutionOutput::unwrap()` on `Fatal`: {e}")
+            }
+            ExecutionOutput::RetryLater => {
+                panic!("called `ExecutionOutput::unwrap()` on `RetryLater`")
+            }
+        }
+    }
+
+    /// Expect the execution output to be an error (i.e. not Success).
+    pub fn unwrap_err<S>(self) -> ExecutionOutput<S> {
+        match self {
+            Self::Success(_) => {
+                panic!("called `ExecutionOutput::unwrap_err()` on `Success`")
+            }
+            Self::EpochEnded => ExecutionOutput::EpochEnded,
+            Self::Fatal(e) => ExecutionOutput::Fatal(e),
+            Self::RetryLater => ExecutionOutput::RetryLater,
+        }
+    }
+}

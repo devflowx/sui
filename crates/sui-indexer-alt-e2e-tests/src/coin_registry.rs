@@ -4,15 +4,24 @@
 use std::path::PathBuf;
 
 use fastcrypto::ed25519::Ed25519KeyPair;
-use move_core_types::{ident_str, language_storage::StructTag};
+use move_core_types::ident_str;
+use move_core_types::language_storage::StructTag;
 use sui_move_build::BuildConfig;
-use sui_types::{
-    base_types::{ObjectID, ObjectRef, SuiAddress},
-    effects::TransactionEffects,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{CallArg, Command, ObjectArg, Transaction, TransactionData},
-    Identifier, TypeTag, SUI_COIN_REGISTRY_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID,
-};
+use sui_types::Identifier;
+use sui_types::SUI_COIN_REGISTRY_OBJECT_ID;
+use sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+use sui_types::TypeTag;
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SuiAddress;
+use sui_types::effects::TransactionEffects;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::CallArg;
+use sui_types::transaction::Command;
+use sui_types::transaction::ObjectArg;
+use sui_types::transaction::SharedObjectMutability;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
 
 use crate::FullCluster;
 
@@ -105,7 +114,7 @@ pub async fn finalize(
                 CallArg::Object(ObjectArg::SharedObject {
                     id: SUI_COIN_REGISTRY_OBJECT_ID,
                     initial_shared_version: 1.into(),
-                    mutable: true,
+                    mutability: SharedObjectMutability::Mutable,
                 }),
                 CallArg::Object(ObjectArg::Receiving(currency)),
             ],
@@ -155,7 +164,7 @@ pub async fn create_dynamic_currency(
             vec![CallArg::Object(ObjectArg::SharedObject {
                 id: SUI_COIN_REGISTRY_OBJECT_ID,
                 initial_shared_version: 1.into(),
-                mutable: true,
+                mutability: SharedObjectMutability::Mutable,
             })],
         )
         .unwrap();
@@ -206,7 +215,7 @@ pub async fn burn_from_currency(
         .obj(ObjectArg::SharedObject {
             id: currency.0,
             initial_shared_version: currency.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -269,7 +278,7 @@ pub async fn burn_from_treasury(
         .obj(ObjectArg::SharedObject {
             id: treasury.0,
             initial_shared_version: treasury.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -324,7 +333,7 @@ pub async fn hide_treasury_cap(
         .obj(ObjectArg::SharedObject {
             id: treasury.0,
             initial_shared_version: treasury.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -375,7 +384,7 @@ pub async fn show_treasury_cap(
         .obj(ObjectArg::SharedObject {
             id: treasury.0,
             initial_shared_version: treasury.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -423,7 +432,7 @@ pub async fn migrate(
         .obj(ObjectArg::SharedObject {
             id: SUI_COIN_REGISTRY_OBJECT_ID,
             initial_shared_version: 1.into(),
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -477,7 +486,7 @@ pub async fn migrate_deny_cap(
         .obj(ObjectArg::SharedObject {
             id: currency.0,
             initial_shared_version: currency.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -533,7 +542,7 @@ pub async fn migrate_regulated_metadata(
         .obj(ObjectArg::SharedObject {
             id: currency.0,
             initial_shared_version: currency.1,
-            mutable: true,
+            mutability: SharedObjectMutability::Mutable,
         })
         .unwrap();
 
@@ -562,82 +571,5 @@ pub async fn migrate_regulated_metadata(
         .expect("Deny cap migration failed");
 
     assert!(error.is_none(), "Metadata migration failed: {error:?}");
-    fx
-}
-
-/// Delete the migrated legacy metadata.
-///
-/// - `sender` and `kp` describe the account that will sign and pay for the transaction.
-/// - `outputs` describes owned outputs of currency creation.
-/// - `currency` is the `Currency<T>` object.
-/// - `gas` is the gas object to use for the transaction, which must be owned by `sender`.
-///
-/// Returns the effects of running the delete transaction.
-pub async fn delete_migrated_legacy_metadata(
-    cluster: &mut FullCluster,
-    sender: SuiAddress,
-    kp: &Ed25519KeyPair,
-    outputs: &LegacyCoinOutputs,
-    currency: ObjectRef,
-    gas: ObjectRef,
-) -> TransactionEffects {
-    let mut builder = ProgrammableTransactionBuilder::new();
-
-    let currency = builder
-        .obj(ObjectArg::SharedObject {
-            id: currency.0,
-            initial_shared_version: currency.1,
-            mutable: true,
-        })
-        .unwrap();
-
-    let treasury_cap = builder
-        .obj(ObjectArg::ImmOrOwnedObject(outputs.treasury))
-        .unwrap();
-
-    let legacy_metadata = builder
-        .obj(ObjectArg::ImmOrOwnedObject(outputs.metadata.unwrap()))
-        .unwrap();
-
-    // Claim the metadata cap
-    let metadata_cap = builder.programmable_move_call(
-        SUI_FRAMEWORK_PACKAGE_ID,
-        ident_str!("coin_registry").to_owned(),
-        ident_str!("claim_metadata_cap").to_owned(),
-        vec![TypeTag::Struct(Box::new(outputs.coin_type.clone()))],
-        vec![currency, treasury_cap],
-    );
-
-    // Delete the metadata cap
-    builder.programmable_move_call(
-        SUI_FRAMEWORK_PACKAGE_ID,
-        ident_str!("coin_registry").to_owned(),
-        ident_str!("delete_metadata_cap").to_owned(),
-        vec![TypeTag::Struct(Box::new(outputs.coin_type.clone()))],
-        vec![currency, metadata_cap],
-    );
-
-    // Delete the migrated legacy metadata
-    builder.programmable_move_call(
-        SUI_FRAMEWORK_PACKAGE_ID,
-        ident_str!("coin_registry").to_owned(),
-        ident_str!("delete_migrated_legacy_metadata").to_owned(),
-        vec![TypeTag::Struct(Box::new(outputs.coin_type.clone()))],
-        vec![currency, legacy_metadata],
-    );
-
-    let data = TransactionData::new_programmable(
-        sender,
-        vec![gas],
-        builder.finish(),
-        DEFAULT_GAS_BUDGET,
-        cluster.reference_gas_price(),
-    );
-
-    let (fx, error) = cluster
-        .execute_transaction(Transaction::from_data_and_signer(data, vec![kp]))
-        .expect("Delete migrated legacy metadata failed");
-
-    assert!(error.is_none(), "Deletion failed: {error:?}");
     fx
 }

@@ -5,6 +5,7 @@ use crate::{
     completions::utils::{
         addr_to_ide_string, all_mod_enums_to_import, all_mod_functions_to_import,
         all_mod_structs_to_import, auto_import_text_edit, compute_cursor, import_insertion_info,
+        module_import_info,
     },
     context::Context,
     symbols::{
@@ -13,7 +14,7 @@ use crate::{
         cursor::{ChainInfo, CursorContext},
         runner::SymbolicatorRunner,
     },
-    utils::loc_start_to_lsp_position_opt,
+    utils::{canonical_path_from_uri, loc_start_to_lsp_position_opt},
 };
 
 use lsp_server::{Message, Request, Response};
@@ -24,7 +25,6 @@ use lsp_types::{
 use move_symbol_pool::Symbol;
 use std::{
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use strum::IntoEnumIterator;
@@ -33,12 +33,13 @@ use url::Url;
 use vfs::VfsPath;
 
 use move_compiler::{
+    editions::Flavor,
     expansion::ast::ModuleIdent,
     linters::LintLevel,
     parser::ast::{LeadingNameAccess_, NameAccessChain_},
     shared::{Identifier, Name},
 };
-use move_package::source_package::parsed_manifest::Dependencies;
+use move_package_alt::MoveFlavor;
 
 // The following reflects prefixes of error messages for
 // problems with a single-element access chain that are
@@ -80,21 +81,23 @@ impl TwoElementChainDiagPrefix {
 }
 
 /// Handles inlay hints request of the language server
-pub fn on_code_action_request(
+pub fn on_code_action_request<F: MoveFlavor>(
     context: &Context,
     request: &Request,
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
-    implicit_deps: Dependencies,
+    move_flavor: Arc<F>,
+    flavor: Option<Flavor>,
 ) {
     let response = Response::new_ok(
         request.id.clone(),
-        access_chain_autofix_actions(
+        access_chain_autofix_actions::<F>(
             context,
             request,
             ide_files_root,
             pkg_dependencies,
-            implicit_deps,
+            move_flavor,
+            flavor,
         ),
     );
     eprintln!("code_action_request: {:?}", request);
@@ -104,12 +107,13 @@ pub fn on_code_action_request(
 }
 
 /// Computes code actions related to access chain autofixes.
-fn access_chain_autofix_actions(
+fn access_chain_autofix_actions<F: MoveFlavor>(
     context: &Context,
     request: &Request,
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
-    implicit_deps: Dependencies,
+    move_flavor: Arc<F>,
+    flavor: Option<Flavor>,
 ) -> Vec<CodeAction> {
     let mut code_actions = vec![];
 
@@ -132,17 +136,21 @@ fn access_chain_autofix_actions(
     }
 
     let file_url = params.text_document.uri.clone();
-    let file_path = PathBuf::from(file_url.path());
+    let Some(file_path) = canonical_path_from_uri(&file_url) else {
+        return code_actions;
+    };
     let Some(pkg_path) = SymbolicatorRunner::root_dir(&file_path) else {
         return code_actions;
     };
 
-    let Ok((Some(mut compiled_pkg_info), _)) = get_compiled_pkg(
+    let Ok((Some(mut compiled_pkg_info), _)) = get_compiled_pkg::<F>(
         pkg_dependencies.clone(),
         ide_files_root,
         &pkg_path,
         LintLevel::None,
-        implicit_deps,
+        move_flavor,
+        flavor,
+        Some(&file_path),
     ) else {
         return code_actions;
     };
@@ -185,8 +193,13 @@ pub fn access_chain_autofix_actions_for_error(
     {
         return;
     }
+    if let Some(autocomplete_info) = compiled_pkg_info.compiler_autocomplete_info.clone() {
+        symbols.compiler_autocomplete_info = autocomplete_info;
+    }
     // compute cursor and update symbols with it
-    let file_path: PathBuf = file_url.path().into();
+    let Some(file_path) = canonical_path_from_uri(&file_url) else {
+        return;
+    };
     compute_cursor(symbols, compiled_pkg_info, &file_path, err_pos);
     let Some(ref cursor) = symbols.cursor_context else {
         return;
@@ -222,7 +235,7 @@ pub fn access_chain_autofix_actions_for_error(
                 }
                 SingleElementChainDiagPrefix::UnboundFunction => {
                     if err_msg.starts_with(prefix.as_str()) {
-                        single_element_access_chain_autofixes(
+                        single_element_function_autofixes(
                             code_actions,
                             symbols,
                             cursor,
@@ -236,29 +249,30 @@ pub fn access_chain_autofix_actions_for_error(
             });
         }
         NameAccessChain_::Path(name_path) => {
-            if let LeadingNameAccess_::Name(unbound_name) = name_path.root.name.value {
-                if name_path.entries.len() == 1 {
-                    // we assume that diagnostic reporting unbound chain component
-                    // is on the first element of the chain
-                    if unbound_name.loc.contains(&cursor.loc) {
-                        TwoElementChainDiagPrefix::iter().for_each(|prefix| match prefix {
-                            TwoElementChainDiagPrefix::UnresolvedName => {
-                                if err_msg.starts_with(prefix.as_str()) {
-                                    two_element_access_chain_autofixes(
-                                        code_actions,
-                                        symbols,
-                                        file_url.clone(),
-                                        unbound_name,
-                                        name_path.entries[0].name,
-                                        all_mod_structs_to_import(symbols, cursor)
-                                            .chain(all_mod_enums_to_import(symbols, cursor))
-                                            .chain(all_mod_functions_to_import(symbols, cursor)),
-                                        diag.clone(),
-                                    );
-                                }
+            if let LeadingNameAccess_::Name(unbound_name) = name_path.root.name.value
+                && name_path.entries.len() == 1
+            {
+                // we assume that diagnostic reporting unbound chain component
+                // is on the first element of the chain
+                if unbound_name.loc.contains(&cursor.loc) {
+                    TwoElementChainDiagPrefix::iter().for_each(|prefix| match prefix {
+                        TwoElementChainDiagPrefix::UnresolvedName => {
+                            if err_msg.starts_with(prefix.as_str()) {
+                                two_element_access_chain_autofixes(
+                                    code_actions,
+                                    symbols,
+                                    cursor,
+                                    file_url.clone(),
+                                    unbound_name,
+                                    name_path.entries[0].name,
+                                    all_mod_structs_to_import(symbols, cursor)
+                                        .chain(all_mod_enums_to_import(symbols, cursor))
+                                        .chain(all_mod_functions_to_import(symbols, cursor)),
+                                    diag.clone(),
+                                );
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             }
         }
@@ -301,17 +315,20 @@ fn single_element_access_chain_autofixes<I, K>(
             let title = format!("Qualify as `{}{}`", autofix_prefix, unbound_name);
             code_actions.push(access_chain_code_action(
                 title,
-                text_edit,
+                vec![text_edit],
                 diag.clone(),
                 file_url.clone(),
             ));
+            // No conflict check is needed for this module import: the unbound-name error
+            // fires only when nothing in the leading-name namespace has this name, and a
+            // module import only affects that namespace.
             if let Some(import_insertion_info) = import_insertion_info(symbols, cursor) {
                 let title = format!("Import as `{}{}`", autofix_prefix, unbound_name);
                 let import_text = format!("use {}{}", autofix_prefix, unbound_name);
                 let text_edit = auto_import_text_edit(import_text, import_insertion_info);
                 code_actions.push(access_chain_code_action(
                     title,
-                    text_edit,
+                    vec![text_edit],
                     diag.clone(),
                     file_url.clone(),
                 ));
@@ -335,7 +352,7 @@ fn single_element_access_chain_autofixes<I, K>(
                 let title = format!("Qualify as `{}{}`", autofix_prefix, unbound_name);
                 code_actions.push(access_chain_code_action(
                     title,
-                    text_edit,
+                    vec![text_edit],
                     diag.clone(),
                     file_url.clone(),
                 ));
@@ -345,7 +362,116 @@ fn single_element_access_chain_autofixes<I, K>(
                     let text_edit = auto_import_text_edit(import_text, import_insertion_info);
                     code_actions.push(access_chain_code_action(
                         title,
-                        text_edit,
+                        vec![text_edit],
+                        diag.clone(),
+                        file_url.clone(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Create auto-fixes for a single unbound function using module-qualified call style.
+/// For `f()`, when the target is `foo::f`, the code action should end up with `foo::f()`
+/// and auto-inserted `use pkg::foo;`.
+fn single_element_function_autofixes<I, K>(
+    code_actions: &mut Vec<CodeAction>,
+    symbols: &Symbols,
+    cursor: &CursorContext,
+    file_url: Url,
+    unbound_name: Name,
+    mod_functions: I,
+    diag: Option<Diagnostic>,
+) where
+    I: Iterator<Item = (ModuleIdent, K)>,
+    K: Iterator<Item = Symbol>,
+{
+    let Some(unbound_name_lsp_pos) =
+        loc_start_to_lsp_position_opt(&symbols.files, &unbound_name.loc)
+    else {
+        return;
+    };
+    let info_opt = symbols
+        .compiler_autocomplete_info
+        .get_path_autocomplete_info(&unbound_name.loc);
+    for (mod_ident, mod_functions) in mod_functions {
+        for function_name in mod_functions {
+            if function_name != unbound_name.value {
+                continue;
+            }
+
+            // Always offer full qualification; it is valid even when a module import would clash.
+            let qualified_prefix = format!(
+                "{}::{}::",
+                addr_to_ide_string(&mod_ident.value.address),
+                mod_ident.value.module
+            );
+            let text_edit = TextEdit {
+                range: Range {
+                    start: unbound_name_lsp_pos,
+                    end: unbound_name_lsp_pos,
+                },
+                new_text: qualified_prefix.clone(),
+            };
+            let title = format!("Qualify as `{}{}`", qualified_prefix, unbound_name);
+            code_actions.push(access_chain_code_action(
+                title,
+                vec![text_edit],
+                diag.clone(),
+                file_url.clone(),
+            ));
+
+            // Then offer the Move-style fix: import the module and qualify the call through it.
+            // Without alias info recorded at this location we cannot tell whether the module
+            // is already imported (possibly under a different name), and inserting an import
+            // blindly could create a duplicate or conflicting `use`, so offer nothing more.
+            let Some(info) = info_opt else {
+                continue;
+            };
+            // `module_import_info` returns `None` if the module name is already bound to a
+            // different module, a member alias, a named address, or a type parameter, in
+            // which case the full-qualification fix above is the only one.
+            let Some(import_info) = module_import_info(mod_ident, info) else {
+                continue;
+            };
+            let prefix_edit = TextEdit {
+                range: Range {
+                    start: unbound_name_lsp_pos,
+                    end: unbound_name_lsp_pos,
+                },
+                new_text: format!("{}::", import_info.module_prefix),
+            };
+            match import_info.import_text {
+                Some(import_text) => {
+                    // The module is not in scope yet, so apply both edits as one code action.
+                    let Some(import_insertion_info) = import_insertion_info(symbols, cursor) else {
+                        continue;
+                    };
+                    let import_edit =
+                        auto_import_text_edit(import_text.clone(), import_insertion_info);
+                    let title = format!(
+                        "Import `{}` and use `{}::{}`",
+                        import_text.trim_start_matches("use "),
+                        import_info.module_prefix,
+                        unbound_name
+                    );
+                    code_actions.push(access_chain_code_action(
+                        title,
+                        vec![prefix_edit, import_edit],
+                        diag.clone(),
+                        file_url.clone(),
+                    ));
+                }
+                None => {
+                    // The module is already in scope, possibly under an alias; only qualify the call.
+                    let title = format!(
+                        "Qualify as `{}::{}`",
+                        import_info.module_prefix, unbound_name
+                    );
+                    code_actions.push(access_chain_code_action(
+                        title,
+                        vec![prefix_edit],
                         diag.clone(),
                         file_url.clone(),
                     ));
@@ -360,6 +486,7 @@ fn single_element_access_chain_autofixes<I, K>(
 fn two_element_access_chain_autofixes<I, K>(
     code_actions: &mut Vec<CodeAction>,
     symbols: &Symbols,
+    cursor: &CursorContext,
     file_url: Url,
     unbound_first_name: Name,
     second_name: Name,
@@ -379,6 +506,8 @@ fn two_element_access_chain_autofixes<I, K>(
             if mod_ident.value.module.value() == unbound_first_name.value
                 && member_name == second_name.value
             {
+                // Fully qualifying the package prefix preserves the existing module-qualified use
+                // site, e.g. `foo::Bar` becomes `Pkg::foo::Bar`.
                 let qualified_prefix =
                     format!("{}::", addr_to_ide_string(&mod_ident.value.address));
                 let text_edit = TextEdit {
@@ -394,7 +523,30 @@ fn two_element_access_chain_autofixes<I, K>(
                 );
                 code_actions.push(access_chain_code_action(
                     title,
-                    text_edit,
+                    vec![text_edit],
+                    diag.clone(),
+                    file_url.clone(),
+                ));
+                // Importing the module is enough to resolve the first element of the chain while
+                // keeping the source expression as `module::member`.
+                let Some(import_insertion_info) = import_insertion_info(symbols, cursor) else {
+                    continue;
+                };
+                let import_text = format!(
+                    "use {}::{}",
+                    addr_to_ide_string(&mod_ident.value.address),
+                    mod_ident.value.module,
+                );
+                let text_edit = auto_import_text_edit(import_text.clone(), import_insertion_info);
+                let title = format!(
+                    "Import `{}` for `{}::{}`",
+                    import_text.trim_start_matches("use "),
+                    unbound_first_name,
+                    second_name
+                );
+                code_actions.push(access_chain_code_action(
+                    title,
+                    vec![text_edit],
                     diag.clone(),
                     file_url.clone(),
                 ));
@@ -406,12 +558,12 @@ fn two_element_access_chain_autofixes<I, K>(
 /// Create code action for fixing access chain.
 fn access_chain_code_action(
     title: String,
-    text_edit: TextEdit,
+    text_edits: Vec<TextEdit>,
     diag: Option<Diagnostic>,
     file_url: Url,
 ) -> CodeAction {
     let mut changes = HashMap::new();
-    changes.insert(file_url.clone(), vec![text_edit]);
+    changes.insert(file_url.clone(), text_edits);
     CodeAction {
         title,
         kind: Some(CodeActionKind::QUICKFIX),

@@ -140,7 +140,6 @@ See <code><a href="../sui/transfer_policy.md#sui_transfer_policy">transfer_polic
 -  [Function `is_listed_exclusively`](#sui_kiosk_is_listed_exclusively)
 -  [Function `has_access`](#sui_kiosk_has_access)
 -  [Function `uid_mut_as_owner`](#sui_kiosk_uid_mut_as_owner)
--  [Function `set_allow_extensions`](#sui_kiosk_set_allow_extensions)
 -  [Function `uid`](#sui_kiosk_uid)
 -  [Function `uid_mut`](#sui_kiosk_uid_mut)
 -  [Function `owner`](#sui_kiosk_owner)
@@ -155,17 +154,19 @@ See <code><a href="../sui/transfer_policy.md#sui_transfer_policy">transfer_polic
 -  [Function `purchase_cap_kiosk`](#sui_kiosk_purchase_cap_kiosk)
 -  [Function `purchase_cap_item`](#sui_kiosk_purchase_cap_item)
 -  [Function `purchase_cap_min_price`](#sui_kiosk_purchase_cap_min_price)
+-  [Function `set_allow_extensions`](#sui_kiosk_set_allow_extensions)
 
 
 <pre><code><b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
-<b>use</b> <a href="../sui/accumulator_metadata.md#sui_accumulator_metadata">sui::accumulator_metadata</a>;
 <b>use</b> <a href="../sui/accumulator_settlement.md#sui_accumulator_settlement">sui::accumulator_settlement</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
 <b>use</b> <a href="../sui/bag.md#sui_bag">sui::bag</a>;
@@ -183,6 +184,7 @@ See <code><a href="../sui/transfer_policy.md#sui_transfer_policy">transfer_polic
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/package.md#sui_package">sui::package</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/sui.md#sui_sui">sui::sui</a>;
 <b>use</b> <a href="../sui/table.md#sui_table">sui::table</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
@@ -734,8 +736,8 @@ Creates a new Kiosk in a default configuration: sender receives the
 
 <pre><code><b>entry</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_default">default</a>(ctx: &<b>mut</b> TxContext) {
     <b>let</b> (<a href="../sui/kiosk.md#sui_kiosk">kiosk</a>, cap) = <a href="../sui/kiosk.md#sui_kiosk_new">new</a>(ctx);
-    <a href="../sui/transfer.md#sui_transfer_transfer">sui::transfer::transfer</a>(cap, ctx.sender());
-    <a href="../sui/transfer.md#sui_transfer_share_object">sui::transfer::share_object</a>(<a href="../sui/kiosk.md#sui_kiosk">kiosk</a>);
+    <a href="../sui/transfer.md#sui_transfer_transfer">transfer::transfer</a>(cap, ctx.sender());
+    <a href="../sui/transfer.md#sui_transfer_share_object">transfer::share_object</a>(<a href="../sui/kiosk.md#sui_kiosk">kiosk</a>);
 }
 </code></pre>
 
@@ -954,7 +956,7 @@ Performs an authorization check to make sure only owner can do that.
     <b>assert</b>!(!self.<a href="../sui/kiosk.md#sui_kiosk_is_listed_exclusively">is_listed_exclusively</a>(id), <a href="../sui/kiosk.md#sui_kiosk_EListedExclusively">EListedExclusively</a>);
     <b>assert</b>!(self.<a href="../sui/kiosk.md#sui_kiosk_has_item">has_item</a>(id), <a href="../sui/kiosk.md#sui_kiosk_EItemNotFound">EItemNotFound</a>);
     self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> = self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> - 1;
-    df::remove_if_exists&lt;<a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a>, u64&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>false</b> });
+    df::remove_opt&lt;<a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a>, u64&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>false</b> });
     dof::remove(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Item">Item</a> { id })
 }
 </code></pre>
@@ -1087,7 +1089,7 @@ finalized.
     <b>let</b> inner = dof::remove&lt;<a href="../sui/kiosk.md#sui_kiosk_Item">Item</a>, T&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Item">Item</a> { id });
     self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> = self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> - 1;
     <b>assert</b>!(price == payment.value(), <a href="../sui/kiosk.md#sui_kiosk_EIncorrectAmount">EIncorrectAmount</a>);
-    df::remove_if_exists&lt;<a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a>, bool&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id });
+    df::remove_opt&lt;<a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a>, bool&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id });
     <a href="../sui/coin.md#sui_coin_put">coin::put</a>(&<b>mut</b> self.profits, payment);
     <a href="../sui/event.md#sui_event_emit">event::emit</a>(<a href="../sui/kiosk.md#sui_kiosk_ItemPurchased">ItemPurchased</a>&lt;T&gt; { <a href="../sui/kiosk.md#sui_kiosk">kiosk</a>: <a href="../sui/object.md#sui_object_id">object::id</a>(self), id, price });
     (inner, <a href="../sui/transfer_policy.md#sui_transfer_policy_new_request">transfer_policy::new_request</a>(id, price, <a href="../sui/object.md#sui_object_id">object::id</a>(self)))
@@ -1170,7 +1172,7 @@ as the price for the listing making sure it's no less than <code>min_amount</cod
     df::remove&lt;<a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a>, u64&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>true</b> });
     <a href="../sui/coin.md#sui_coin_put">coin::put</a>(&<b>mut</b> self.profits, payment);
     self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> = self.<a href="../sui/kiosk.md#sui_kiosk_item_count">item_count</a> - 1;
-    df::remove_if_exists&lt;<a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a>, bool&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id });
+    df::remove_opt&lt;<a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a>, bool&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id });
     <b>let</b> item = dof::remove&lt;<a href="../sui/kiosk.md#sui_kiosk_Item">Item</a>, T&gt;(&<b>mut</b> self.id, <a href="../sui/kiosk.md#sui_kiosk_Item">Item</a> { id });
     (item, <a href="../sui/transfer_policy.md#sui_transfer_policy_new_request">transfer_policy::new_request</a>(id, paid, <a href="../sui/object.md#sui_object_id">object::id</a>(self)))
 }
@@ -1341,7 +1343,7 @@ Check whether the <code>item</code> is present in the <code><a href="../sui/kios
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_has_item">has_item</a>(self: &<a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, id: ID): bool {
-    dof::exists_(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Item">Item</a> { id })
+    dof::exists(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Item">Item</a> { id })
 }
 </code></pre>
 
@@ -1393,7 +1395,7 @@ that the only two actions that can be performed on it are <code><a href="../sui/
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_is_locked">is_locked</a>(self: &<a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, id: ID): bool {
-    df::exists_(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id })
+    df::exists(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Lock">Lock</a> { id })
 }
 </code></pre>
 
@@ -1418,7 +1420,7 @@ Check whether an <code>item</code> is listed (exclusively or non exclusively).
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_is_listed">is_listed</a>(self: &<a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, id: ID): bool {
-    df::exists_(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>false</b> })
+    df::exists(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>false</b> })
         || self.<a href="../sui/kiosk.md#sui_kiosk_is_listed_exclusively">is_listed_exclusively</a>(id)
 }
 </code></pre>
@@ -1444,7 +1446,7 @@ Check whether there's a <code><a href="../sui/kiosk.md#sui_kiosk_PurchaseCap">Pu
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_is_listed_exclusively">is_listed_exclusively</a>(self: &<a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, id: ID): bool {
-    df::exists_(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>true</b> })
+    df::exists(&self.id, <a href="../sui/kiosk.md#sui_kiosk_Listing">Listing</a> { id, is_exclusive: <b>true</b> })
 }
 </code></pre>
 
@@ -1496,34 +1498,6 @@ Access the <code>UID</code> using the <code><a href="../sui/kiosk.md#sui_kiosk_K
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_uid_mut_as_owner">uid_mut_as_owner</a>(self: &<b>mut</b> <a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, cap: &<a href="../sui/kiosk.md#sui_kiosk_KioskOwnerCap">KioskOwnerCap</a>): &<b>mut</b> UID {
     <b>assert</b>!(self.<a href="../sui/kiosk.md#sui_kiosk_has_access">has_access</a>(cap), <a href="../sui/kiosk.md#sui_kiosk_ENotOwner">ENotOwner</a>);
     &<b>mut</b> self.id
-}
-</code></pre>
-
-
-
-</details>
-
-<a name="sui_kiosk_set_allow_extensions"></a>
-
-## Function `set_allow_extensions`
-
-[DEPRECATED]
-Allow or disallow <code><a href="../sui/kiosk.md#sui_kiosk_uid">uid</a></code> and <code><a href="../sui/kiosk.md#sui_kiosk_uid_mut">uid_mut</a></code> access via the <code>allow_extensions</code>
-setting.
-
-
-<pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_set_allow_extensions">set_allow_extensions</a>(self: &<b>mut</b> <a href="../sui/kiosk.md#sui_kiosk_Kiosk">sui::kiosk::Kiosk</a>, cap: &<a href="../sui/kiosk.md#sui_kiosk_KioskOwnerCap">sui::kiosk::KioskOwnerCap</a>, allow_extensions: bool)
-</code></pre>
-
-
-
-<details>
-<summary>Implementation</summary>
-
-
-<pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_set_allow_extensions">set_allow_extensions</a>(self: &<b>mut</b> <a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, cap: &<a href="../sui/kiosk.md#sui_kiosk_KioskOwnerCap">KioskOwnerCap</a>, allow_extensions: bool) {
-    <b>assert</b>!(self.<a href="../sui/kiosk.md#sui_kiosk_has_access">has_access</a>(cap), <a href="../sui/kiosk.md#sui_kiosk_ENotOwner">ENotOwner</a>);
-    self.allow_extensions = allow_extensions;
 }
 </code></pre>
 
@@ -1896,6 +1870,32 @@ Get the <code>min_price</code> from the <code><a href="../sui/kiosk.md#sui_kiosk
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_purchase_cap_min_price">purchase_cap_min_price</a>&lt;T: key + store&gt;(self: &<a href="../sui/kiosk.md#sui_kiosk_PurchaseCap">PurchaseCap</a>&lt;T&gt;): u64 {
     self.min_price
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="sui_kiosk_set_allow_extensions"></a>
+
+## Function `set_allow_extensions`
+
+Allow or disallow <code><a href="../sui/kiosk.md#sui_kiosk_uid">uid</a></code> and <code><a href="../sui/kiosk.md#sui_kiosk_uid_mut">uid_mut</a></code> access via the <code>allow_extensions</code> setting.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_set_allow_extensions">set_allow_extensions</a>(self: &<b>mut</b> <a href="../sui/kiosk.md#sui_kiosk_Kiosk">sui::kiosk::Kiosk</a>, cap: &<a href="../sui/kiosk.md#sui_kiosk_KioskOwnerCap">sui::kiosk::KioskOwnerCap</a>, allow_extensions: bool)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/kiosk.md#sui_kiosk_set_allow_extensions">set_allow_extensions</a>(self: &<b>mut</b> <a href="../sui/kiosk.md#sui_kiosk_Kiosk">Kiosk</a>, cap: &<a href="../sui/kiosk.md#sui_kiosk_KioskOwnerCap">KioskOwnerCap</a>, allow_extensions: bool) {
+    <b>assert</b>!(self.<a href="../sui/kiosk.md#sui_kiosk_has_access">has_access</a>(cap), <a href="../sui/kiosk.md#sui_kiosk_ENotOwner">ENotOwner</a>);
+    self.allow_extensions = allow_extensions;
 }
 </code></pre>
 

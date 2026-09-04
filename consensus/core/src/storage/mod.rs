@@ -13,10 +13,10 @@ use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockRef, Round, TransactionIndex};
 
 use crate::{
+    CommitIndex,
     block::VerifiedBlock,
     commit::{CommitInfo, CommitRange, CommitRef, TrustedCommit},
     error::ConsensusResult,
-    CommitIndex,
 };
 
 /// A common interface for consensus storage.
@@ -35,6 +35,15 @@ pub trait Store: Send + Sync {
         &self,
         authority: AuthorityIndex,
         start_round: Round,
+    ) -> ConsensusResult<Vec<VerifiedBlock>>;
+
+    /// Reads blocks for an authority in [start_round, end_round), up to limit.
+    fn scan_blocks_by_author_in_range(
+        &self,
+        author: AuthorityIndex,
+        start_round: Round,
+        end_round: Round,
+        limit: usize,
     ) -> ConsensusResult<Vec<VerifiedBlock>>;
 
     // The method returns the last `num_of_rounds` rounds blocks by author in round ascending order.
@@ -62,11 +71,11 @@ pub trait Store: Send + Sync {
     /// Reads the last finalized commit.
     fn read_last_finalized_commit(&self) -> ConsensusResult<Option<CommitRef>>;
 
-    // Scans finalized commits with their rejected transactions.
-    fn scan_finalized_commits(
+    // Reads rejected transactions by block for a given commit.
+    fn read_rejected_transactions(
         &self,
-        range: CommitRange,
-    ) -> ConsensusResult<Vec<(CommitRef, BTreeMap<BlockRef, Vec<TransactionIndex>>)>>;
+        commit_ref: CommitRef,
+    ) -> ConsensusResult<Option<BTreeMap<BlockRef, Vec<TransactionIndex>>>>;
 }
 
 /// Represents data to be written to the store together atomically.

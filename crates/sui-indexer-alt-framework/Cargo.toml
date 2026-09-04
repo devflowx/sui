@@ -4,54 +4,69 @@ version.workspace = true
 authors = ["Mysten Labs <build@mystenlabs.com>"]
 license = "Apache-2.0"
 publish = false
-edition = "2021"
+edition = "2024"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 backoff.workspace = true
-bb8 = "0.8.5"
+bytes.workspace = true
 chrono.workspace = true
 clap = { workspace = true, features = ["env"] }
-diesel = { workspace = true, features = ["chrono"] }
-diesel-async = { workspace = true, features = ["bb8", "postgres", "async-connection-wrapper"] }
-diesel_migrations.workspace = true
+diesel = { workspace = true, features = ["chrono"], optional = true }
+diesel-async = { workspace = true, features = ["bb8", "postgres", "async-connection-wrapper"], optional = true }
+diesel_migrations = { workspace = true, optional = true }
 futures.workspace = true
-pin-project-lite.workspace = true
+http.workspace = true
+sui-http.workspace = true
+num_cpus.workspace = true
 prometheus.workspace = true
+object_store.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
+rand.workspace = true
 scoped-futures.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
 tonic.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 url.workspace = true
 
 sui-field-count.workspace = true
+sui-futures.workspace = true
 sui-indexer-alt-framework-store-traits.workspace = true
 sui-indexer-alt-metrics.workspace = true
-sui-rpc-api.workspace = true
-sui-storage.workspace = true
+sui-rpc.workspace = true
 sui-types.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+zstd.workspace = true
 
 sui-pg-db = { workspace = true, optional = true }
 
 [dev-dependencies]
-rand.workspace = true
 telemetry-subscribers.workspace = true
 wiremock.workspace = true
-sui-pg-db.workspace = true
 dashmap.workspace = true
 
+sui-indexer-alt-framework-store-traits = { workspace = true, features = ["testing"] }
 sui-synthetic-ingestion.workspace = true
 
 [features]
 default = ["cluster"]
 cluster = ["dep:tracing-subscriber", "postgres"]
-postgres = ["dep:sui-pg-db"]
+postgres = [
+    "dep:sui-pg-db",
+    "dep:diesel",
+    "dep:diesel-async",
+    "dep:diesel_migrations",
+]

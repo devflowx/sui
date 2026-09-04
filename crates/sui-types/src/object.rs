@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
@@ -15,15 +16,17 @@ use mysten_common::debug_fatal;
 use once_cell::sync::Lazy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use serde_with::Bytes;
+use serde_with::serde_as;
 
 use crate::accumulator_root::AccumulatorValue;
 use crate::base_types::{FullObjectID, FullObjectRef, MoveObjectType, ObjectIDParseError};
 use crate::coin::{Coin, CoinMetadata, TreasuryCap};
 use crate::crypto::{default_hash, deterministic_random_account_key};
-use crate::error::{ExecutionError, ExecutionErrorKind, UserInputError, UserInputResult};
-use crate::error::{SuiError, SuiResult};
+use crate::error::{
+    ExecutionError, SuiError, SuiErrorKind, SuiResult, UserInputError, UserInputResult,
+};
+use crate::execution_status::ExecutionErrorKind;
 use crate::gas_coin::GAS;
 use crate::is_system_package;
 use crate::layout_resolver::LayoutResolver;
@@ -41,6 +44,8 @@ use self::bounded_visitor::BoundedVisitor;
 
 mod balance_traversal;
 pub mod bounded_visitor;
+pub mod option_visitor;
+pub mod rpc_visitor;
 
 pub const GAS_VALUE_FOR_TESTING: u64 = 300_000_000_000_000;
 pub const OBJECT_START_VERSION: SequenceNumber = SequenceNumber::from_u64(1);
@@ -97,7 +102,15 @@ impl MoveObject {
         } else {
             protocol_config.max_move_object_size()
         };
-        Self::new_from_execution_with_limit(type_, has_public_transfer, version, contents, bound)
+        unsafe {
+            Self::new_from_execution_with_limit(
+                type_,
+                has_public_transfer,
+                version,
+                contents,
+                bound,
+            )
+        }
     }
 
     /// # Safety
@@ -237,6 +250,10 @@ impl MoveObject {
         self.version
     }
 
+    pub fn contents_and_type_equal(&self, other: &Self) -> bool {
+        self.contents == other.contents && self.type_ == other.type_
+    }
+
     /// Contents of the object that are specific to its type--i.e., not its ID and version, which all objects have
     /// For example if the object was declared as `struct S has key { id: ID, f1: u64, f2: bool },
     /// this returns the slice containing `f1` and `f2`.
@@ -320,7 +337,7 @@ impl MoveObject {
     ) -> Result<MoveStructLayout, SuiError> {
         let type_ = TypeTag::Struct(Box::new(struct_tag));
         let layout = TypeLayoutBuilder::build_with_types(&type_, resolver).map_err(|e| {
-            SuiError::ObjectSerializationError {
+            SuiErrorKind::ObjectSerializationError {
                 error: e.to_string(),
             }
         })?;
@@ -335,9 +352,10 @@ impl MoveObject {
     /// Convert `self` to the JSON representation dictated by `layout`.
     pub fn to_move_struct(&self, layout: &MoveStructLayout) -> Result<MoveStruct, SuiError> {
         BoundedVisitor::deserialize_struct(&self.contents, layout).map_err(|e| {
-            SuiError::ObjectSerializationError {
+            SuiErrorKind::ObjectSerializationError {
                 error: e.to_string(),
             }
+            .into()
         })
     }
 
@@ -388,7 +406,7 @@ impl MoveObject {
 
             let mut traversal = BalanceTraversal::default();
             MoveValue::visit_deserialize(&self.contents, &layout.into_layout(), &mut traversal)
-                .map_err(|e| SuiError::ObjectSerializationError {
+                .map_err(|e| SuiErrorKind::ObjectSerializationError {
                     error: e.to_string(),
                 })?;
 
@@ -476,6 +494,437 @@ impl Data {
     }
 }
 
+/// A single permission that can be granted on a party-owned object.
+///
+/// Bit layout (u8):
+///
+/// ```text
+///  7  6  5  4  3  2  1  0
+///  _  W  P  T  D  M  U  I
+/// ```
+///
+/// - `I` Bit 0: [`Self::ImmutableUsage`] is required for immutable usage at signing
+/// - `U` Bit 1: [`Self::MutableUsage`] is required for mutable usage at signing
+///   - It is also required for any additional permissions below
+/// - `M` Bit 2: [`Self::Write`] allows for the value of the object to be changed
+/// - `D` Bit 3: [`Self::Delete`] allows for the object to be deleted
+/// - `T` Bit 4: [`Self::InternalTransfer`] allows for usage of the internal transfer functions
+/// - `P` Bit 5: [`Self::PublicTransfer`] allows for usage of public transfer functions
+/// - `W` Bit 6: [`Self::Wrap`] allows for the object to be wrapped
+#[repr(u8)]
+#[derive(Debug, Clone, Eq, Copy, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ObjectPermission {
+    ImmutableUsage = 1 << 0,
+    MutableUsage = 1 << 1,
+    Write = 1 << 2,
+    Delete = 1 << 3,
+    InternalTransfer = 1 << 4,
+    PublicTransfer = 1 << 5,
+    Wrap = 1 << 6,
+}
+
+impl ObjectPermission {
+    pub fn from_u64(bits: u64) -> Option<Self> {
+        match bits {
+            b if b == Self::Write as u64 => Some(Self::Write),
+            b if b == Self::Delete as u64 => Some(Self::Delete),
+            b if b == Self::InternalTransfer as u64 => Some(Self::InternalTransfer),
+            b if b == Self::PublicTransfer as u64 => Some(Self::PublicTransfer),
+            b if b == Self::Wrap as u64 => Some(Self::Wrap),
+            b if b == Self::MutableUsage as u64 => Some(Self::MutableUsage),
+            b if b == Self::ImmutableUsage as u64 => Some(Self::ImmutableUsage),
+            _ => {
+                debug_assert!(false, "Invalid ObjectPermission bit pattern: {bits}.");
+                None
+            }
+        }
+    }
+}
+
+impl Display for ObjectPermission {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write => write!(f, "Write"),
+            Self::Delete => write!(f, "Delete"),
+            Self::InternalTransfer => write!(f, "InternalTransfer"),
+            Self::PublicTransfer => write!(f, "PublicTransfer"),
+            Self::Wrap => write!(f, "Wrap"),
+            Self::MutableUsage => write!(f, "MutableUsage"),
+            Self::ImmutableUsage => write!(f, "ImmutableUsage"),
+        }
+    }
+}
+
+/// A bitflag set of `ObjectPermission`s.
+#[derive(
+    Eq, PartialEq, Debug, Clone, Copy, Deserialize, Serialize, Hash, JsonSchema, Ord, PartialOrd,
+)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ObjectPermissions(u64);
+
+#[cfg(feature = "fuzzing")]
+impl proptest::arbitrary::Arbitrary for ObjectPermissions {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+    fn arbitrary_with(_: ()) -> Self::Strategy {
+        use proptest::prelude::*;
+        any::<u8>()
+            .prop_map(|bits| {
+                let mut bits = bits as u64 & Self::ALL_BITS;
+                if bits & Self::MUTABLE_PERMISSION_BITS != 0 {
+                    bits |= ObjectPermission::MutableUsage as u64;
+                }
+                Self(bits)
+            })
+            .boxed()
+    }
+}
+
+impl ObjectPermissions {
+    /// Bitmask of the individual mutable permissions.
+    /// Each requires [`ObjectPermission::MutableUsage`] to also be set.
+    const MUTABLE_PERMISSION_BITS: u64 = (ObjectPermission::Write as u64)
+        | (ObjectPermission::Delete as u64)
+        | (ObjectPermission::InternalTransfer as u64)
+        | (ObjectPermission::PublicTransfer as u64)
+        | (ObjectPermission::Wrap as u64);
+
+    /// Bitmask of all known bits.
+    const ALL_BITS: u64 = Self::MUTABLE_PERMISSION_BITS
+        | (ObjectPermission::MutableUsage as u64)
+        | (ObjectPermission::ImmutableUsage as u64);
+
+    pub const NONE: Self = Self(0);
+    pub const IMMUTABLE_USAGE: Self = Self::from_bits(ObjectPermission::ImmutableUsage as u64);
+    pub const MUTABLE_USAGE: Self = Self::from_bits(ObjectPermission::MutableUsage as u64);
+    pub const WRITE: Self =
+        Self::from_bits(ObjectPermission::Write as u64 | ObjectPermission::MutableUsage as u64);
+    pub const DELETE: Self =
+        Self::from_bits(ObjectPermission::Delete as u64 | ObjectPermission::MutableUsage as u64);
+    pub const INTERNAL_TRANSFER: Self = Self::from_bits(
+        ObjectPermission::InternalTransfer as u64 | ObjectPermission::MutableUsage as u64,
+    );
+    pub const PUBLIC_TRANSFER: Self = Self::from_bits(
+        ObjectPermission::PublicTransfer as u64 | ObjectPermission::MutableUsage as u64,
+    );
+    pub const WRAP: Self =
+        Self::from_bits(ObjectPermission::Wrap as u64 | ObjectPermission::MutableUsage as u64);
+    pub const ALL: Self = Self::from_bits(Self::ALL_BITS);
+
+    pub const LEGACY_SHARED_OBJECT: Self = Self::from_bits(
+        (ObjectPermission::Write as u64)
+            | (ObjectPermission::Delete as u64)
+            | (ObjectPermission::MutableUsage as u64)
+            | (ObjectPermission::ImmutableUsage as u64),
+    );
+
+    /// Private const constructor. Asserts that:
+    /// - no unknown bits are set
+    /// - if any individual mutable permission is set, `MutableUsage` is also set
+    const fn from_bits(bits: u64) -> Self {
+        assert!(bits & !Self::ALL_BITS == 0, "unknown permission bit");
+        let has_mutable_perm = bits & Self::MUTABLE_PERMISSION_BITS != 0;
+        let has_mutable_usage = bits & (ObjectPermission::MutableUsage as u64) != 0;
+        assert!(
+            !has_mutable_perm || has_mutable_usage,
+            "a mutable permission requires MutableUsage"
+        );
+        Self(bits)
+    }
+
+    /// Construct from raw bits. Returns `None` if any unknown bit is set, or
+    /// if any individual mutable permission is set without `MutableUsage`.
+    pub const fn new(bits: u64) -> Option<Self> {
+        if bits & !Self::ALL_BITS != 0 {
+            return None;
+        }
+        let has_mutable_perm = bits & Self::MUTABLE_PERMISSION_BITS != 0;
+        let has_mutable_usage = bits & (ObjectPermission::MutableUsage as u64) != 0;
+        if has_mutable_perm && !has_mutable_usage {
+            return None;
+        }
+        Some(Self(bits))
+    }
+
+    pub fn can(&self, permission: ObjectPermission) -> bool {
+        let p = permission as u64;
+        (self.0 & p) == p
+    }
+
+    /// Can it change the Move value of the object?
+    pub fn can_write(&self) -> bool {
+        self.can(ObjectPermission::Write)
+    }
+
+    /// Can the object's UID be deleted?
+    // TODO(Party WIP) this might also gate derived object UID release
+    pub fn can_delete(&self) -> bool {
+        self.can(ObjectPermission::Delete)
+    }
+
+    /// Can the object be transferred using the internal transfer functions?
+    pub fn can_internal_transfer(&self) -> bool {
+        self.can(ObjectPermission::InternalTransfer)
+    }
+
+    /// Can the object be transferred using the public transfer functions?
+    pub fn can_public_transfer(&self) -> bool {
+        self.can(ObjectPermission::PublicTransfer)
+    }
+
+    /// Can the object be wrapped?
+    // TODO(Party WIP) this might _not_ gate derived object UID release even though it will be a
+    // wrap
+    pub fn can_wrap(&self) -> bool {
+        self.can(ObjectPermission::Wrap)
+    }
+
+    /// Can the object be used as a mutable input in a transaction?
+    /// Note that this is required for all mutable permissions
+    pub fn can_use_mutably(&self) -> bool {
+        self.can(ObjectPermission::MutableUsage)
+    }
+
+    /// Can the object be used as an immutable input in a transaction?
+    pub fn can_use_immutably(&self) -> bool {
+        self.can(ObjectPermission::ImmutableUsage)
+    }
+
+    #[inline(always)]
+    const fn is_subset_bits(sub: u64, sup: u64) -> bool {
+        (sub & sup) == sub
+    }
+
+    pub const fn is_subset(&self, other: Self) -> bool {
+        Self::is_subset_bits(self.0, other.0)
+    }
+}
+
+impl std::ops::BitOr<ObjectPermissions> for ObjectPermissions {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        // Two valid sets union into a valid set: any mutable permission in
+        // either input was already paired with MutableUsage there.
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl TryFrom<u64> for ObjectPermissions {
+    type Error = &'static str;
+    fn try_from(bits: u64) -> Result<Self, Self::Error> {
+        Self::new(bits).ok_or("invalid ObjectPermissions bits")
+    }
+}
+
+impl From<ObjectPermissions> for u64 {
+    fn from(p: ObjectPermissions) -> u64 {
+        p.0
+    }
+}
+
+pub struct ObjectPermissionsIterator {
+    set: ObjectPermissions,
+    idx: usize,
+    #[cfg(debug_assertions)]
+    emitted: u64,
+}
+
+impl ObjectPermissionsIterator {
+    const ORDER: &'static [ObjectPermission] = &[
+        ObjectPermission::ImmutableUsage,
+        ObjectPermission::MutableUsage,
+        ObjectPermission::Write,
+        ObjectPermission::Delete,
+        ObjectPermission::InternalTransfer,
+        ObjectPermission::PublicTransfer,
+        ObjectPermission::Wrap,
+    ];
+}
+
+impl Iterator for ObjectPermissionsIterator {
+    type Item = ObjectPermission;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < Self::ORDER.len() {
+            let p = Self::ORDER[self.idx];
+            self.idx += 1;
+            if self.set.can(p) {
+                #[cfg(debug_assertions)]
+                {
+                    self.emitted |= p as u64;
+                }
+                return Some(p);
+            }
+        }
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.emitted, self.set.0,
+            "ObjectPermissionsIterator did not iterate over every permission in the set",
+        );
+        None
+    }
+}
+
+impl IntoIterator for ObjectPermissions {
+    type Item = ObjectPermission;
+    type IntoIter = ObjectPermissionsIterator;
+    fn into_iter(self) -> Self::IntoIter {
+        debug_assert_eq!(
+            ObjectPermissionsIterator::ORDER
+                .iter()
+                .copied()
+                .fold(0u64, |a, p| {
+                    let bit = p as u64;
+                    debug_assert_eq!(
+                        a & bit,
+                        0,
+                        "duplicate ObjectPermission in ObjectPermissionsIterator::ORDER: {p:?}",
+                    );
+                    a | bit
+                }),
+            ObjectPermissions::ALL.0,
+            "ObjectPermissionsIterator::ORDER must contain every ObjectPermission",
+        );
+        ObjectPermissionsIterator {
+            idx: 0,
+            set: self,
+            #[cfg(debug_assertions)]
+            emitted: 0,
+        }
+    }
+}
+
+impl Display for ObjectPermissions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        let mut first = true;
+        for permission in *self {
+            if !first {
+                write!(f, ",")?;
+            }
+            write!(f, "{}", permission)?;
+            first = false;
+        }
+        write!(f, "}}")
+    }
+}
+
+/// Per-address permission map for a party-owned object.
+/// Addresses not in `members` receive `default_permissions`.
+#[derive(
+    Eq, PartialEq, Debug, Clone, Deserialize, Serialize, Hash, JsonSchema, Ord, PartialOrd,
+)]
+#[serde(try_from = "RawPartySerde", into = "RawPartySerde")]
+pub struct Party {
+    /// The default permissions, used for any party member not explicitly listed in `members`.
+    default_permissions: ObjectPermissions,
+    /// The permissions for each party member.
+    members: BTreeMap<SuiAddress, ObjectPermissions>,
+}
+
+impl Party {
+    /// Returns `None` if it could be represented as a single `ConsensusAddressOwner`
+    pub fn new(
+        default_permissions: ObjectPermissions,
+        members: BTreeMap<SuiAddress, ObjectPermissions>,
+    ) -> Option<Self> {
+        if Self::is_consensus_address_owner(default_permissions, &members) {
+            return None;
+        }
+        Some(Self {
+            default_permissions,
+            members,
+        })
+    }
+
+    pub fn is_consensus_address_owner(
+        default_permissions: ObjectPermissions,
+        members: &BTreeMap<SuiAddress, ObjectPermissions>,
+    ) -> bool {
+        default_permissions == ObjectPermissions::NONE
+            && members.len() == 1
+            && members.values().next() == Some(&ObjectPermissions::ALL)
+    }
+
+    pub fn permissions_for(&self, address: &SuiAddress) -> ObjectPermissions {
+        self.members
+            .get(address)
+            .copied()
+            .unwrap_or(self.default_permissions)
+    }
+}
+
+impl Display for Party {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Party {{ default_permissions: {}, members: {{",
+            self.default_permissions.0
+        )?;
+        let mut first = true;
+        for (address, permissions) in &self.members {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "{} => {}", address, permissions.0)?;
+            first = false;
+        }
+        write!(f, "}} }}")
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct RawPartySerde {
+    default_permissions: ObjectPermissions,
+    members: Vec<(SuiAddress, ObjectPermissions)>,
+}
+
+impl TryFrom<RawPartySerde> for Party {
+    type Error = &'static str;
+    fn try_from(raw: RawPartySerde) -> Result<Self, Self::Error> {
+        for window in raw.members.windows(2) {
+            match window[0].0.cmp(&window[1].0) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => return Err("duplicate Party member address"),
+                std::cmp::Ordering::Greater => return Err("Party members must be sorted"),
+            }
+        }
+        let members: BTreeMap<SuiAddress, ObjectPermissions> = raw.members.into_iter().collect();
+        // A Party cannot be equivalent to a ConsensusAddressOwner.
+        // The error message here is left generic for any additional restrictions that may be
+        // added in the future.
+        Self::new(raw.default_permissions, members)
+            .ok_or("invalid Party: violates canonical representation")
+    }
+}
+
+impl From<Party> for RawPartySerde {
+    fn from(p: Party) -> Self {
+        Self {
+            default_permissions: p.default_permissions,
+            members: p.members.into_iter().collect(),
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+impl proptest::arbitrary::Arbitrary for Party {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+    fn arbitrary_with(_: ()) -> Self::Strategy {
+        use proptest::prelude::*;
+        (
+            any::<ObjectPermissions>(),
+            any::<BTreeMap<SuiAddress, ObjectPermissions>>(),
+        )
+            .prop_filter_map(
+                "Party representable as ConsensusAddressOwner",
+                |(default_permissions, members)| Self::new(default_permissions, members),
+            )
+            .boxed()
+    }
+}
+
 #[derive(
     Eq, PartialEq, Debug, Clone, Deserialize, Serialize, Hash, JsonSchema, Ord, PartialOrd,
 )]
@@ -502,6 +951,17 @@ pub enum Owner {
         // The owner of the object.
         owner: SuiAddress,
     },
+    /// Object is sequenced via consensus with per-address permissions.
+    /// Each address can be granted a subset of [`ObjectPermission`] flags.
+    /// Addresses not explicitly listed fall back to the default permissions.
+    Party {
+        /// The version at which the object most recently became a party object.
+        /// Serves the same function as `initial_shared_version`, except it may change
+        /// if the object's Owner type changes.
+        start_version: SequenceNumber,
+        /// The permission map for this object.
+        permissions: Party,
+    },
 }
 
 impl Owner {
@@ -513,7 +973,8 @@ impl Owner {
             Self::Shared { .. }
             | Self::Immutable
             | Self::ObjectOwner(_)
-            | Self::ConsensusAddressOwner { .. } => Err(SuiError::UnexpectedOwnerType),
+            | Self::ConsensusAddressOwner { .. }
+            | Self::Party { .. } => Err(SuiErrorKind::UnexpectedOwnerType.into()),
         }
     }
 
@@ -525,18 +986,21 @@ impl Owner {
             Self::AddressOwner(address)
             | Self::ObjectOwner(address)
             | Self::ConsensusAddressOwner { owner: address, .. } => Ok(*address),
-            Self::Shared { .. } | Self::Immutable => Err(SuiError::UnexpectedOwnerType),
+            Self::Shared { .. } | Self::Immutable | Self::Party { .. } => {
+                Err(SuiErrorKind::UnexpectedOwnerType.into())
+            }
         }
     }
 
     // Returns initial_shared_version for Shared objects, and start_version
-    // for ConsensusAddressOwner objects.
+    // for ConsensusAddressOwner and Party objects.
     pub fn start_version(&self) -> Option<SequenceNumber> {
         match self {
             Self::Shared {
                 initial_shared_version,
             } => Some(*initial_shared_version),
-            Self::ConsensusAddressOwner { start_version, .. } => Some(*start_version),
+            Self::ConsensusAddressOwner { start_version, .. }
+            | Self::Party { start_version, .. } => Some(*start_version),
             Self::Immutable | Self::AddressOwner(_) | Self::ObjectOwner(_) => None,
         }
     }
@@ -560,7 +1024,7 @@ impl Owner {
     pub fn is_consensus(&self) -> bool {
         matches!(
             self,
-            Owner::Shared { .. } | Owner::ConsensusAddressOwner { .. }
+            Owner::Shared { .. } | Owner::ConsensusAddressOwner { .. } | Owner::Party { .. }
         )
     }
 }
@@ -573,7 +1037,8 @@ impl PartialEq<ObjectID> for Owner {
             Self::AddressOwner(_)
             | Self::Shared { .. }
             | Self::Immutable
-            | Self::ConsensusAddressOwner { .. } => false,
+            | Self::ConsensusAddressOwner { .. }
+            | Self::Party { .. } => false,
         }
     }
 }
@@ -605,6 +1070,12 @@ impl Display for Owner {
                     start_version.value(),
                     owner
                 )
+            }
+            Self::Party {
+                start_version,
+                permissions,
+            } => {
+                write!(f, "Party( {}, {} )", start_version.value(), permissions)
             }
         }
     }
@@ -964,14 +1435,18 @@ impl ObjectInner {
     /// like this: `S<T>`.
     /// Returns the inner parameter type `T`.
     pub fn get_move_template_type(&self) -> SuiResult<TypeTag> {
-        let move_struct = self.data.struct_tag().ok_or_else(|| SuiError::TypeError {
-            error: "Object must be a Move object".to_owned(),
-        })?;
+        let move_struct = self
+            .data
+            .struct_tag()
+            .ok_or_else(|| SuiErrorKind::TypeError {
+                error: "Object must be a Move object".to_owned(),
+            })?;
         fp_ensure!(
             move_struct.type_params.len() == 1,
-            SuiError::TypeError {
+            SuiErrorKind::TypeError {
                 error: "Move object struct must have one type parameter".to_owned()
             }
+            .into()
         );
         // Index access safe due to checks above.
         let type_tag = move_struct.type_params[0].clone();
@@ -1285,7 +1760,11 @@ impl Display for PastObjectRead {
                 asked_version,
                 latest_version,
             } => {
-                write!(f, "PastObjectRead::VersionTooHigh ({:?}, asked sequence number {:?}, latest sequence number {:?})", object_id, asked_version, latest_version)
+                write!(
+                    f,
+                    "PastObjectRead::VersionTooHigh ({:?}, asked sequence number {:?}, latest sequence number {:?})",
+                    object_id, asked_version, latest_version
+                )
             }
         }
     }
@@ -1293,7 +1772,7 @@ impl Display for PastObjectRead {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::{Object, Owner, OBJECT_START_VERSION};
+    use crate::object::{OBJECT_START_VERSION, Object, Owner};
     use crate::{
         base_types::{ObjectID, SuiAddress, TransactionDigest},
         gas_coin::GasCoin,
@@ -1323,7 +1802,10 @@ mod tests {
         );
 
         let objref = format!("{:?}", o.compute_object_reference());
-        assert_eq!(objref, "(0x0000000000000000000000000000000000000000000000000000000000000000, SequenceNumber(1), o#59tZq65HVqZjUyNtD7BCGLTD87N5cpayYwEFrtwR4aMz)");
+        assert_eq!(
+            objref,
+            "(0x0000000000000000000000000000000000000000000000000000000000000000, SequenceNumber(1), o#59tZq65HVqZjUyNtD7BCGLTD87N5cpayYwEFrtwR4aMz)"
+        );
     }
 
     #[test]
@@ -1369,5 +1851,22 @@ mod tests {
         test_for_value(u32::MAX as u64);
         test_for_value(u32::MAX as u64 + 1);
         test_for_value(u64::MAX);
+    }
+
+    #[test]
+    fn test_owner_variant_sizes() {
+        use super::{Party, SequenceNumber};
+
+        // AddressOwner / ObjectOwner
+        assert_eq!(std::mem::size_of::<SuiAddress>(), 32);
+        // Shared
+        assert_eq!(std::mem::size_of::<SequenceNumber>(), 8);
+        // ConsensusAddressOwner
+        assert_eq!(std::mem::size_of::<(SequenceNumber, SuiAddress)>(), 40);
+        // Party
+        assert_eq!(std::mem::size_of::<(SequenceNumber, Party)>(), 40);
+
+        // largest variant (40) + tag and alignment
+        assert_eq!(std::mem::size_of::<Owner>(), 48);
     }
 }

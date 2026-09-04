@@ -15,12 +15,13 @@ use sui_rpc::proto::sui::rpc::v2::ListOwnedObjectsRequest;
 use sui_rpc::proto::sui::rpc::v2::ListOwnedObjectsResponse;
 use sui_rpc::proto::sui::rpc::v2::Object;
 use sui_sdk_types::Address;
+use sui_types::full_checkpoint_content::ObjectSet;
 use sui_types::storage::OwnedObjectInfo;
 
 const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE_BYTES: usize = 512 * 1024; // 512KiB
-const READ_MASK_DEFAULT: &str = "object_id,version,object_type";
+const READ_MASK_DEFAULT: &str = crate::read_mask_defaults::OWNED_OBJECT;
 
 #[tracing::instrument(skip(service))]
 pub fn list_owned_objects(
@@ -61,13 +62,15 @@ pub fn list_owned_objects(
         .page_token
         .map(|token| decode_page_token(&token))
         .transpose()?;
-    if let Some(token) = &page_token {
-        if token.owner != owner || token.object_type != object_type {
-            return Err(FieldViolation::new("page_token")
-                .with_description("invalid page_token")
-                .with_reason(ErrorReason::FieldInvalid)
-                .into());
-        }
+    if let Some(token) = &page_token
+        && (token.owner != owner
+            || token.object_type != object_type
+            || !cursor_within_type_filter(token, object_type.as_ref()))
+    {
+        return Err(FieldViolation::new("page_token")
+            .with_description("invalid page_token")
+            .with_reason(ErrorReason::FieldInvalid)
+            .into());
     }
     let read_mask = {
         let read_mask = request
@@ -108,14 +111,7 @@ pub fn list_owned_objects(
                 continue;
             };
 
-            let mut message = Object::default();
-
-            if read_mask.contains(Object::JSON_FIELD) {
-                message.json =
-                    crate::grpc::v2::render_object_to_json(service, &object).map(Box::new);
-            }
-            sui_rpc::merge::Merge::merge(&mut message, &object, &read_mask);
-            message
+            service.render_object_to_proto(&object, &read_mask, &ObjectSet::default())
         } else {
             owned_object_to_proto(object_info, &read_mask)
         };
@@ -183,6 +179,32 @@ struct PageToken {
     owner: Address,
     object_type: Option<move_core_types::language_storage::StructTag>,
     inner: OwnedObjectInfo,
+}
+
+/// Whether the token's inner cursor position lies within the query's
+/// type filter, mirroring the store's `TypeFilter::Type` matching
+/// contract: a filter with empty type parameters matches every
+/// instantiation of the named type, while one with parameters pins the
+/// exact instantiation. The token's recorded *query* is validated
+/// separately; this checks the resume *position* itself, so a crafted
+/// token cannot seek the scan outside the filtered prefix (the store
+/// also rejects such a cursor, but as an internal error rather than an
+/// invalid argument).
+fn cursor_within_type_filter(
+    token: &PageToken,
+    filter: Option<&move_core_types::language_storage::StructTag>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let cursor_type = &token.inner.object_type;
+    if filter.type_params.is_empty() {
+        cursor_type.address == filter.address
+            && cursor_type.module == filter.module
+            && cursor_type.name == filter.name
+    } else {
+        cursor_type == filter
+    }
 }
 
 fn should_load_object(mask: &FieldMaskTree) -> bool {

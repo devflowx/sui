@@ -9,7 +9,7 @@ use crate::{
     expansion::ast::{AbilitySet, Attributes, ModuleIdent, Visibility},
     naming::ast::{
         self as N, BuiltinTypeName_, DatatypeTypeParameter, EnumDefinition, FunctionSignature,
-        ResolvedUseFuns, StructDefinition, StructFields, SyntaxMethods, Type, Type_, TypeName_,
+        ResolvedUseFuns, StructDefinition, StructFields, SyntaxMethods, Type, TypeInner, TypeName_,
         VariantFields,
     },
     parser::ast::{
@@ -42,6 +42,7 @@ pub struct ConstantInfo {
     pub index: usize,
     pub attributes: Attributes,
     pub defined_loc: Loc,
+    pub visibility: Visibility,
     pub signature: Type,
     // Set after compilation
     pub value: OnceLock<runtime_value::MoveValue>,
@@ -110,6 +111,7 @@ macro_rules! program_info {
                 index: cdef.index,
                 attributes: cdef.attributes.clone(),
                 defined_loc: cname.loc(),
+                visibility: cdef.visibility,
                 signature: cdef.signature.clone(),
                 value: OnceLock::new(),
             });
@@ -213,8 +215,8 @@ fn typing_module_info_to_naming(minfo: &ModuleInfo) -> ModuleInfo {
     // (for user-defined data types and vector element types). We need to strip these
     // down so that ProgramInfo does not trip subsequent typing analysis.
     fn strip_type_abilities(ty: &mut Type) {
-        match &mut ty.value {
-            Type_::Apply(abilities, type_name, type_args) => {
+        match &mut Arc::make_mut(&mut ty.value.0) {
+            TypeInner::Apply(abilities, type_name, type_args) => {
                 let should_strip = matches!(
                     &type_name.value,
                     TypeName_::Builtin(sp!(_, BuiltinTypeName_::Vector))
@@ -229,19 +231,19 @@ fn typing_module_info_to_naming(minfo: &ModuleInfo) -> ModuleInfo {
                     strip_type_abilities(ty_arg);
                 }
             }
-            Type_::Ref(_, ty) => strip_type_abilities(ty),
-            Type_::Fun(args, result) => {
+            TypeInner::Ref(_, ty) => strip_type_abilities(ty),
+            TypeInner::Fun(args, result) => {
                 for arg in args {
                     strip_type_abilities(arg);
                 }
                 strip_type_abilities(result);
             }
-            Type_::Unit
-            | Type_::Param(_)
-            | Type_::Var(_)
-            | Type_::Anything
-            | Type_::Void
-            | Type_::UnresolvedError => (),
+            TypeInner::Unit
+            | TypeInner::Param(_)
+            | TypeInner::Var(_)
+            | TypeInner::Anything
+            | TypeInner::Void
+            | TypeInner::UnresolvedError => (),
         }
     }
 
@@ -440,11 +442,10 @@ impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
         module: &ModuleIdent,
         struct_name: &DatatypeName,
     ) -> Option<UniqueMap<Field, usize>> {
-        let fields = match &self.struct_definition(module, struct_name).fields {
+        match &self.struct_definition(module, struct_name).fields {
             N::StructFields::Defined(_, fields) => Some(fields.ref_map(|_, (ndx, _)| *ndx)),
             N::StructFields::Native(_) => None,
-        };
-        fields
+        }
     }
 
     /// Indicates if the struct is positional. Returns false on native.
@@ -505,7 +506,7 @@ impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
             .clone()
             .into_iter()
             .collect::<Vec<_>>();
-        names.sort_by(|(_, ndx0), (_, ndx1)| ndx0.cmp(ndx1));
+        names.sort_by_key(|(_, ndx0)| *ndx0);
         names.into_iter().map(|(name, _ndx)| name).collect()
     }
 

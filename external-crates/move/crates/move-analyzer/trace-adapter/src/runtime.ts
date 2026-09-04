@@ -9,6 +9,7 @@ import {
     createFileInfo,
     IFileInfo,
     ILocalInfo,
+    ILoc,
     IDebugInfo,
     readAllDebugInfos,
     computeOptimizedLines,
@@ -18,6 +19,7 @@ import {
     INLINED_FRAME_ID_DIFFERENT_FILE,
     TraceEffectKind,
     TraceEvent,
+    TraceDiagnostic,
     TraceEventKind,
     TraceInstructionKind,
     readTrace,
@@ -130,7 +132,7 @@ interface IRuntimeVariable {
  * Describes a stack frame in the runtime representing a Move function
  * call and its current state during trace viewing session.
  */
-interface IMoveCallStackFrame {
+export interface IMoveCallStackFrame {
     /**
      *  Frame identifier.
      */
@@ -163,6 +165,14 @@ interface IMoveCallStackFrame {
      * Current line in the disassembled bytecode file corresponding to currently viewed instruction.
      */
     bcodeLine?: number; // 1-based
+    /**
+     * Function name location for display before the first source instruction is processed.
+     */
+    srcFunctionNameLoc?: ILoc;
+    /**
+     * Function name location for display before the first bytecode instruction is processed.
+     */
+    bcodeFunctionNameLoc?: ILoc;
     /**
      *  Local variable types by variable frame index.
      */
@@ -210,6 +220,11 @@ interface IMoveCallStackFrame {
      * showing disasembled bytecode.
      */
     disassemblyView: boolean;
+    /**
+     * Force bytecode view due to source being unavailable
+     * or unsafe for this frame.
+     */
+    forceDisassembly: boolean;
 }
 
 /**
@@ -323,15 +338,56 @@ export enum RuntimeEvents {
      *  Finish trace viewing session.
      */
     end = 'end',
+
+    /**
+     * Non-fatal warning about degraded trace-debugging behavior.
+     */
+    warning = 'warning',
+}
+
+/**
+ * Warning surfaced during trace debugging.
+ */
+export interface RuntimeWarning {
+    /**
+     * Opaque key used by the client to de-duplicate UI notifications.
+     */
+    key: string;
+    /**
+     * User-facing warning text.
+     */
+    message: string;
 }
 /**
- * Describes result of the execution.
+ * Describes kind of execution result.
  */
-export enum ExecutionResult {
+export enum ExecutionResultKind {
     Ok,
     TraceEnd,
     Exception,
     Breakpoint,
+}
+
+/**
+ * Describes result of the execution.
+ */
+export type ExecutionResult =
+    | { kind: ExecutionResultKind.Ok }
+    | { kind: ExecutionResultKind.TraceEnd }
+    | { kind: ExecutionResultKind.Breakpoint }
+    | { kind: ExecutionResultKind.Exception, msg: string };
+
+/**
+ * Returns the line to display for a Move stack frame.
+ */
+export function moveStackFrameDisplayLine(frame: IMoveCallStackFrame): number {
+    // Use actual frame line unless it's set to 0 which happens at frame
+    // creation time. Then try using function name location, which creates
+    // a much better user experience.
+    if (frame.disassemblyModeTriggered) {
+        return frame.bcodeLine || frame.bcodeFunctionNameLoc?.line || 0;
+    }
+    return frame.srcLine || frame.srcFunctionNameLoc?.line || 0;
 }
 
 /**
@@ -375,6 +431,14 @@ export class Runtime extends EventEmitter {
      * corresponds to one of the frames on the stack.
      */
     private currentMoveFile: string | undefined = undefined;
+
+    /**
+     * Warnings for synchronous snapshot tests. Warnings
+     * are emitted asynchronously as events and without being
+     * stored would not be available during synchronous execution
+     * until it's too late.
+     */
+    private warningsForTest: string[] = [];
 
     /**
      * Start a trace viewing session and set up the initial state of the runtime.
@@ -566,6 +630,8 @@ export class Runtime extends EventEmitter {
                     currentEvent.bcodeFileHash,
                     currentEvent.localsTypes,
                     currentEvent.localsNames,
+                    currentEvent.srcFunctionNameLoc,
+                    currentEvent.bcodeFunctionNameLoc,
                     currentEvent.optimizedSrcLines,
                     currentEvent.optimizedBcodeLines
                 );
@@ -583,6 +649,7 @@ export class Runtime extends EventEmitter {
             // and we have both source and disassembled bytecode files
             newFrame.disassemblyModeTriggered = disassemblyView && newFrame.bcodeFilePath !== undefined;
             newFrame.disassemblyView = disassemblyView;
+            this.handleOpenFrameDebugInfoMismatch(currentEvent, newFrame);
 
             const frameStack: IMoveCallStack = {
                 frames: [newFrame],
@@ -610,17 +677,17 @@ export class Runtime extends EventEmitter {
      * @returns processed (potentially different) result of the action.
      */
     private handleActionResult(result: ExecutionResult): ExecutionResult {
-        switch (result) {
-            case ExecutionResult.Ok:
-            case ExecutionResult.TraceEnd:
+        switch (result.kind) {
+            case ExecutionResultKind.Ok:
+            case ExecutionResultKind.TraceEnd:
                 this.sendEvent(RuntimeEvents.stopOnStep);
                 break;
-            case ExecutionResult.Exception:
-                this.sendEvent(RuntimeEvents.stopOnException);
+            case ExecutionResultKind.Exception:
+                this.sendEvent(RuntimeEvents.stopOnException, result.msg);
                 break;
-            case ExecutionResult.Breakpoint:
+            case ExecutionResultKind.Breakpoint:
                 this.sendEvent(RuntimeEvents.stopOnLineBreakpoint);
-                return ExecutionResult.Ok;
+                return { kind: ExecutionResultKind.Ok };
         }
         return result;
     }
@@ -653,11 +720,15 @@ export class Runtime extends EventEmitter {
     private stepInternal(next: boolean, stopAtCloseFrame: boolean): ExecutionResult {
         this.eventIndex++;
         if (this.eventIndex >= this.trace.events.length) {
-            return ExecutionResult.TraceEnd;
+            return { kind: ExecutionResultKind.TraceEnd };
         }
         let currentEvent = this.trace.events[this.eventIndex];
 
-        if (currentEvent.type === TraceEventKind.Instruction ||
+        if (currentEvent.type === TraceEventKind.Effect &&
+            // error effects may happen inside or outside of Move calls
+            currentEvent.effect.type === TraceEffectKind.ExecutionError) {
+            return { kind: ExecutionResultKind.Exception, msg: currentEvent.effect.msg };
+        } else if (currentEvent.type === TraceEventKind.Instruction ||
             currentEvent.type === TraceEventKind.ReplaceInlinedFrame ||
             currentEvent.type === TraceEventKind.OpenFrame ||
             currentEvent.type === TraceEventKind.CloseFrame ||
@@ -757,12 +828,12 @@ export class Runtime extends EventEmitter {
                         // the last call instruction in a give frame happened, and
                         // also we need to make `stepOut` aware of whether it is executed
                         // as part of `next` (which is how `next` is implemented) or not.
-                        return ExecutionResult.Ok;
+                        return { kind: ExecutionResultKind.Ok };
                     } else {
                         return this.stepInternal(next, stopAtCloseFrame);
                     }
                 }
-                return ExecutionResult.Ok;
+                return { kind: ExecutionResultKind.Ok };
             } else if (currentEvent.type === TraceEventKind.ReplaceInlinedFrame) {
                 let currentFrame = moveCallStack.frames.pop();
                 if (!currentFrame) {
@@ -787,16 +858,16 @@ export class Runtime extends EventEmitter {
                         const nextEvent = this.trace.events[this.eventIndex + 1];
                         if (nextEvent.type === TraceEventKind.Effect &&
                             nextEvent.effect.type === TraceEffectKind.ExecutionError) {
-                            return ExecutionResult.Exception;
+                            return { kind: ExecutionResultKind.Exception, msg: nextEvent.effect.msg };
                         }
                     }
                     // process optional effects until reaching CloseFrame for the native function
                     while (true) {
                         const executionResult = this.stepInternal(/* next */ false, /* stopAtCloseFrame */ true);
-                        if (executionResult === ExecutionResult.Exception) {
+                        if (executionResult.kind === ExecutionResultKind.Exception) {
                             return executionResult;
                         }
-                        if (executionResult === ExecutionResult.TraceEnd) {
+                        if (executionResult.kind === ExecutionResultKind.TraceEnd) {
                             throw new Error('Cannot find CloseFrame event for native function');
                         }
                         const currentEvent = this.trace.events[this.eventIndex];
@@ -818,22 +889,31 @@ export class Runtime extends EventEmitter {
                         currentEvent.bcodeFileHash,
                         currentEvent.localsTypes,
                         currentEvent.localsNames,
+                        currentEvent.srcFunctionNameLoc,
+                        currentEvent.bcodeFunctionNameLoc,
                         currentEvent.optimizedSrcLines,
                         currentEvent.optimizedBcodeLines
                     );
-                // when creating a new frame maintain the invariant
-                // that all frames that belong to modules in the same
-                // file get the same view
+                // When creating a new frame, maintain the invariant that all
+                // frames for modules in the same source/bytecode file pair use
+                // the same user-selected view.
+                //
+                // Do not inherit from frames whose source is unavailable. Their
+                // disassembly view is a forced fallback for that specific frame,
+                // not a user-selected view that should propagate to other frames.
                 newFrame.disassemblyModeTriggered = moveCallStack.frames.find(
-                    frame => frame.disassemblyModeTriggered
+                    frame => !frame.forceDisassembly
+                        && frame.disassemblyModeTriggered
                         && frame.bcodeFilePath === newFrame.bcodeFilePath
                         && frame.srcFilePath === newFrame.srcFilePath
                 ) !== undefined;
                 newFrame.disassemblyView = moveCallStack.frames.find(
-                    frame => frame.disassemblyView
+                    frame => !frame.forceDisassembly
+                        && frame.disassemblyView
                         && frame.bcodeFilePath === newFrame.bcodeFilePath
                         && frame.srcFilePath === newFrame.srcFilePath
                 ) !== undefined;
+                this.handleOpenFrameDebugInfoMismatch(currentEvent, newFrame);
 
                 // set values of parameters in the new frame
                 moveCallStack.frames.push(newFrame);
@@ -860,7 +940,7 @@ export class Runtime extends EventEmitter {
                 if (stopAtCloseFrame) {
                     // don't do anything as the caller needs to inspect
                     // the event before proceeding
-                    return ExecutionResult.Ok;
+                    return { kind: ExecutionResultKind.Ok };
                 } else {
                     // pop the top frame from the stack
                     const framesLength = moveCallStack.frames.length;
@@ -881,9 +961,6 @@ export class Runtime extends EventEmitter {
                 }
             } else if (currentEvent.type === TraceEventKind.Effect) {
                 const effect = currentEvent.effect;
-                if (effect.type === TraceEffectKind.ExecutionError) {
-                    return ExecutionResult.Exception;
-                }
                 if (effect.type === TraceEffectKind.Write) {
                     const traceLocation = effect.indexedLoc.loc;
                     if ('globalIndex' in traceLocation) {
@@ -954,7 +1031,7 @@ export class Runtime extends EventEmitter {
                             locals,
                         };
                         this.eventsStack.eventFrame = eventFrame;
-                        return ExecutionResult.Ok;
+                        return { kind: ExecutionResultKind.Ok };
                     case ExtEventKind.MoveCallEnd:
                     case ExtEventKind.ExtEventEnd:
                         // go back to summary frame
@@ -962,7 +1039,7 @@ export class Runtime extends EventEmitter {
                         if (this.eventsStack.summaryFrame) {
                             this.eventsStack.summaryFrame.line += 1;
                         }
-                        return ExecutionResult.Ok;
+                        return { kind: ExecutionResultKind.Ok };
                 }
             }
             throw new Error('Unknown external event: ' + currentEvent);
@@ -997,7 +1074,7 @@ export class Runtime extends EventEmitter {
         if (summaryFrame && !eventFrame) {
             // stepping out of (top) active summary frame
             // finishes debugging session
-            return ExecutionResult.TraceEnd;
+            return { kind: ExecutionResultKind.TraceEnd };
         }
 
         // summary frame is not active here which means that
@@ -1013,7 +1090,7 @@ export class Runtime extends EventEmitter {
             const stackHeight = moveCallStack.frames.length;
             if (stackHeight === 0 || (stackHeight === 1 && !summaryFrame)) {
                 // do nothing as there is no frame to step out to
-                return ExecutionResult.Ok;
+                return { kind: ExecutionResultKind.Ok };
             }
             // newest frame is at the top of the stack
             const currentFrame = moveCallStack.frames[stackHeight - 1];
@@ -1026,16 +1103,16 @@ export class Runtime extends EventEmitter {
                 // the actual close frame event that we are looking for
                 // and have the loop execute too far
                 const executionResult = this.stepInternal(/* next */ false, /* stopAtCloseFrame */ true);
-                if (executionResult === ExecutionResult.Exception) {
+                if (executionResult.kind === ExecutionResultKind.Exception) {
                     return executionResult;
                 }
-                if (executionResult === ExecutionResult.TraceEnd) {
+                if (executionResult.kind === ExecutionResultKind.TraceEnd) {
                     throw new Error('Cannot find corresponding CloseFrame event for function: ' +
                         currentFrame.name);
                 }
                 currentEvent = this.trace.events[this.eventIndex];
                 if (this.is_event_at_breakpoint(currentEvent)) {
-                    return ExecutionResult.Breakpoint;
+                    return { kind: ExecutionResultKind.Breakpoint };
                 }
                 if (currentEvent.type === TraceEventKind.CloseFrame) {
                     const currentFrameID = currentFrame.id;
@@ -1074,13 +1151,13 @@ export class Runtime extends EventEmitter {
     private continueInternal(): ExecutionResult {
         while (true) {
             const executionResult = this.stepInternal(/* next */ false, /* stopAtCloseFrame */ false);
-            if (executionResult === ExecutionResult.TraceEnd ||
-                executionResult === ExecutionResult.Exception) {
+            if (executionResult.kind === ExecutionResultKind.TraceEnd ||
+                executionResult.kind === ExecutionResultKind.Exception) {
                 return executionResult;
             }
             const currentEvent = this.trace.events[this.eventIndex];
             if (this.is_event_at_breakpoint(currentEvent)) {
-                return ExecutionResult.Breakpoint;
+                return { kind: ExecutionResultKind.Breakpoint };
             }
         }
     }
@@ -1161,6 +1238,46 @@ export class Runtime extends EventEmitter {
         }
         this.lineBreakpoints.set(filePath, breakpoints);
         return validated;
+    }
+
+    /**
+     * Emits latent diagnostics attached to the current trace event.
+     */
+    private emitDiagnostics(diagnostics?: TraceDiagnostic[]): void {
+        if (!diagnostics) {
+            return;
+        }
+        for (const diagnostic of diagnostics) {
+            this.warn({ key: diagnostic.key, message: diagnostic.message });
+        }
+    }
+
+    /**
+     * Records a warning for tests and forwards it to the adapter.
+     */
+    private warn(warning: RuntimeWarning): void {
+        this.warningsForTest.push(warning.message);
+        this.sendEvent(RuntimeEvents.warning, warning);
+    }
+
+    /**
+     * Applies OpenFrame fallback behavior for trace/source debug-info mismatches.
+     */
+    private handleOpenFrameDebugInfoMismatch(
+        event: Extract<TraceEvent, { type: TraceEventKind.OpenFrame }>,
+        frame: IMoveCallStackFrame
+    ): void {
+        this.emitDiagnostics(event.diagnostics);
+        frame.forceDisassembly = event.forceDisassembly === true;
+        if (frame.forceDisassembly) {
+            // If bcodeFilePath is unavailable, srcFilePath already points at
+            // the bytecode file or there is no alternate bytecode view. In that
+            // case, do not force disassemblyView because it affects local-name rendering.
+            frame.disassemblyModeTriggered = frame.bcodeFilePath !== undefined;
+            if (frame.disassemblyModeTriggered) {
+                frame.disassemblyView = true;
+            }
+        }
     }
 
     /**
@@ -1323,6 +1440,9 @@ export class Runtime extends EventEmitter {
             const moveCallStack = eventFrame as IMoveCallStack;
             moveCallStack.frames.forEach(frame => {
                 if (frame.bcodeFilePath === this.currentMoveFile) {
+                    if (frame.forceDisassembly) {
+                        return;
+                    }
                     frame.disassemblyModeTriggered = false;
                     frame.disassemblyView = false;
                 }
@@ -1352,6 +1472,8 @@ export class Runtime extends EventEmitter {
         bcodeFileHash: undefined | string,
         localsTypes: string[],
         localsInfo: ILocalInfo[],
+        srcFunctionNameLoc: undefined | ILoc,
+        bcodeFunctionNameLoc: undefined | ILoc,
         optimizedSrcLines: number[],
         optimizedBcodeLines: undefined | number[]
     ): IMoveCallStackFrame {
@@ -1379,9 +1501,12 @@ export class Runtime extends EventEmitter {
             bcodeFilePath,
             srcFileHash,
             bcodeFileHash,
-            // lines will be updated when next event (Instruction) is processed
+            // Keep execution lines unset until the first instruction is processed; otherwise
+            // same-line detection could skip the first instruction when it shares the function line.
             srcLine: 0,
             bcodeLine: 0,
+            srcFunctionNameLoc,
+            bcodeFunctionNameLoc,
             localsTypes,
             localsInfo,
             locals,
@@ -1393,6 +1518,7 @@ export class Runtime extends EventEmitter {
             // as this function is executed in different contexts
             disassemblyModeTriggered: false,
             disassemblyView: false,
+            forceDisassembly: false,
         };
 
         if (this.trace.events.length <= this.eventIndex + 1 ||
@@ -1419,6 +1545,15 @@ export class Runtime extends EventEmitter {
     //
     // Utility functions for testing and debugging.
     //
+
+    /**
+     * Returns and clears warnings emitted since the last test retrieval.
+     */
+    public takeWarningsForTest(): string[] {
+        const result = this.warningsForTest;
+        this.warningsForTest = [];
+        return result;
+    }
 
     /**
      * Whitespace used for indentation in the string representation of the runtime.
@@ -1485,14 +1620,13 @@ export class Runtime extends EventEmitter {
             const fileName = frame.disassemblyModeTriggered ?
                 path.basename(frame.bcodeFilePath!) :
                 path.basename(frame.srcFilePath);
-            const line = frame.disassemblyModeTriggered ? frame.bcodeLine : frame.srcLine;
             res += tabs + this.singleTab
                 + 'function: '
                 + frame.name
                 + ' ('
                 + fileName
                 + ':'
-                + line
+                + moveStackFrameDisplayLine(frame)
                 + ')\n';
             for (let i = 0; i < frame.locals.length; i++) {
                 res += tabs + this.singleTab + this.singleTab + 'scope ' + i + ' :\n';
@@ -1583,16 +1717,17 @@ export class Runtime extends EventEmitter {
         if ('globalIndex' in indexedLoc.loc) {
             // global location
             const globalValue = moveCallStack.globals.get(indexedLoc.loc.globalIndex);
-            if (globalValue) {
-                const indexPath = [...indexedLoc.indexPath];
-                return this.valueToString(tabs, globalValue, name, indexPath, type);
+            if (!globalValue) {
+                return 'INCORRECT REF VALUE (NO GLOBAL VALUE)';
             }
+            const indexPath = [...indexedLoc.indexPath];
+            return this.valueToString(tabs, globalValue, name, indexPath, type);
         } else if ('frameID' in indexedLoc.loc && 'localIndex' in indexedLoc.loc) {
             const frameID = indexedLoc.loc.frameID;
             const frame = moveCallStack.frames.find(frame => frame.id === frameID);
             let local = undefined;
             if (!frame) {
-                return res;
+                return 'INCORRECT REF VALUE (NO FRAME)';
             }
             for (const scope of frame.locals) {
                 local = scope[indexedLoc.loc.localIndex];
@@ -1601,12 +1736,12 @@ export class Runtime extends EventEmitter {
                 }
             }
             if (!local) {
-                return res;
+                return 'INCORRECT REF VALUE (NO LOCAL)';
             }
             const indexPath = [...indexedLoc.indexPath];
             return this.valueToString(tabs, local.value, name, indexPath, type);
         }
-        return res;
+        return 'INCORRECT REF VALUE (NO GLOBAL OR LOCAL)';
     }
 
     /**
@@ -1628,6 +1763,9 @@ export class Runtime extends EventEmitter {
     ): string {
         let res = '';
         if (typeof value === 'string') {
+            if (indexPath.length > 0) {
+                return 'INCORRECT VALUE (INVALID INDEX FOR STRING)';
+            }
             res += tabs + name + ' : ' + value + '\n';
             if (type) {
                 res += tabs + 'type: ' + type + '\n';
@@ -1635,9 +1773,10 @@ export class Runtime extends EventEmitter {
         } else if (Array.isArray(value)) {
             if (indexPath.length > 0) {
                 const index = indexPath.pop();
-                if (index !== undefined) {
-                    res += this.valueToString(tabs, value[index], name, indexPath, type);
+                if (index === undefined || index >= value.length) {
+                    return 'INCORRECT VALUE (INVALID INDEX)';
                 }
+                res += this.valueToString(tabs, value[index], name, indexPath, type);
             } else {
                 res += tabs + name + ' : [\n';
                 for (let i = 0; i < value.length; i++) {
@@ -1651,9 +1790,10 @@ export class Runtime extends EventEmitter {
         } else if ('fields' in value) {
             if (indexPath.length > 0) {
                 const index = indexPath.pop();
-                if (index !== undefined) {
-                    res += this.valueToString(tabs, value.fields[index][1], name, indexPath, type);
+                if (index === undefined || index >= value.fields.length) {
+                    return 'INCORRECT VALUE (INVALID INDEX)';
                 }
+                res += this.valueToString(tabs, value.fields[index][1], name, indexPath, type);
             } else {
                 res += tabs + name + ' : ' + this.compoundValueToString(tabs, value);
                 if (type) {
@@ -1661,6 +1801,9 @@ export class Runtime extends EventEmitter {
                 }
             }
         } else {
+            if (indexPath.length > 0) {
+                return 'INCORRECT VALUE (INVALID INDEX FOR REFERENCE VALUE)';
+            }
             res += this.refValueToString(tabs, value, name, type);
         }
         return res;

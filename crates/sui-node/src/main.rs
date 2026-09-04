@@ -84,6 +84,7 @@ fn main() {
     let (_guard, filter_handle) = telemetry_subscribers::TelemetryConfig::new()
         .with_env()
         .with_prom_registry(&prometheus_registry)
+        .with_disable_span_latency(true)
         .init();
 
     drop(metrics_rt);
@@ -101,15 +102,15 @@ fn main() {
 
     {
         let _enter = runtimes.metrics.enter();
-        if let Some(metrics_config) = &config.metrics {
-            if let Some(push_url) = &metrics_config.push_url {
-                sui_metrics_push_client::start_metrics_push_task(
-                    metrics_config.push_interval_seconds,
-                    push_url.clone(),
-                    config.network_key_pair().copy(),
-                    registry_service.clone(),
-                );
-            }
+        if let Some(metrics_config) = &config.metrics
+            && let Some(push_url) = &metrics_config.push_url
+        {
+            sui_metrics_push_client::start_metrics_push_task(
+                metrics_config.push_interval_seconds,
+                push_url.clone(),
+                config.network_key_pair().copy(),
+                registry_service.clone(),
+            );
         }
     }
 
@@ -117,7 +118,7 @@ fn main() {
         config.network_address = listen_address;
     }
 
-    let is_validator = config.consensus_config().is_some();
+    let is_validator = config.intended_node_role().is_validator();
 
     let admin_interface_port = config.admin_interface_port;
 
@@ -176,7 +177,7 @@ fn main() {
             ))
             .unwrap();
 
-        sui_node::admin::run_admin_server(node, admin_interface_port, filter_handle).await
+        sui_node::admin::run_admin_server(node, admin_interface_port, Some(filter_handle)).await
     });
 
     runtimes.metrics.spawn(async move {

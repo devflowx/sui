@@ -7,10 +7,15 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{SuiClient, SuiClientBuilder, SUI_DEVNET_URL, SUI_LOCAL_NETWORK_URL, SUI_TESTNET_URL};
+use crate::{SUI_DEVNET_URL, SUI_LOCAL_NETWORK_URL, SUI_MAINNET_URL, SUI_TESTNET_URL};
 use sui_config::Config;
 use sui_keys::keystore::{AccountKeystore, Keystore};
-use sui_types::base_types::*;
+use sui_rpc_api::Client;
+use sui_rpc_api::client::HeadersInterceptor;
+use sui_types::{
+    base_types::*,
+    digests::{get_mainnet_chain_identifier, get_testnet_chain_identifier},
+};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -64,6 +69,21 @@ impl SuiClientConfig {
             self.envs.push(env)
         }
     }
+
+    /// Update the cached chain ID for the specified environment.
+    pub fn update_env_chain_id(
+        &mut self,
+        alias: &str,
+        chain_id: String,
+    ) -> Result<(), anyhow::Error> {
+        let env = self
+            .envs
+            .iter_mut()
+            .find(|env| env.alias == alias)
+            .ok_or_else(|| anyhow!("Environment {} not found", alias))?;
+        env.chain_id = Some(chain_id);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,21 +93,15 @@ pub struct SuiEnv {
     pub ws: Option<String>,
     /// Basic HTTP access authentication in the format of username:password, if needed.
     pub basic_auth: Option<String>,
+    /// Cached chain identifier for this environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
 }
 
 impl SuiEnv {
-    pub async fn create_rpc_client(
-        &self,
-        request_timeout: Option<std::time::Duration>,
-        max_concurrent_requests: Option<u64>,
-    ) -> Result<SuiClient, anyhow::Error> {
-        let mut builder = SuiClientBuilder::default();
-        if let Some(request_timeout) = request_timeout {
-            builder = builder.request_timeout(request_timeout);
-        }
-        if let Some(ws_url) = &self.ws {
-            builder = builder.ws_url(ws_url);
-        }
+    pub fn create_grpc_client(&self) -> Result<Client, anyhow::Error> {
+        let mut client = Client::new(&self.rpc)?;
+
         if let Some(basic_auth) = &self.basic_auth {
             let fields: Vec<_> = basic_auth.split(':').collect();
             if fields.len() != 2 {
@@ -95,13 +109,12 @@ impl SuiEnv {
                     "Basic auth should be in the format `username:password`"
                 ));
             }
-            builder = builder.basic_auth(fields[0], fields[1]);
+            let mut headers = HeadersInterceptor::new();
+            headers.basic_auth(fields[0], Some(fields[1]));
+            client = client.with_headers(headers);
         }
 
-        if let Some(max_concurrent_requests) = max_concurrent_requests {
-            builder = builder.max_concurrent_requests(max_concurrent_requests as usize);
-        }
-        Ok(builder.build(&self.rpc).await?)
+        Ok(client)
     }
 
     pub fn devnet() -> Self {
@@ -110,6 +123,7 @@ impl SuiEnv {
             rpc: SUI_DEVNET_URL.into(),
             ws: None,
             basic_auth: None,
+            chain_id: None,
         }
     }
     pub fn testnet() -> Self {
@@ -118,6 +132,7 @@ impl SuiEnv {
             rpc: SUI_TESTNET_URL.into(),
             ws: None,
             basic_auth: None,
+            chain_id: Some(get_testnet_chain_identifier().to_string()),
         }
     }
 
@@ -127,6 +142,17 @@ impl SuiEnv {
             rpc: SUI_LOCAL_NETWORK_URL.into(),
             ws: None,
             basic_auth: None,
+            chain_id: None,
+        }
+    }
+
+    pub fn mainnet() -> Self {
+        Self {
+            alias: "mainnet".to_string(),
+            rpc: SUI_MAINNET_URL.into(),
+            ws: None,
+            basic_auth: None,
+            chain_id: Some(get_mainnet_chain_identifier().to_string()),
         }
     }
 }
@@ -143,6 +169,10 @@ impl Display for SuiEnv {
         if let Some(basic_auth) = &self.basic_auth {
             writeln!(writer)?;
             write!(writer, "Basic Auth: {}", basic_auth)?;
+        }
+        if let Some(chain_id) = &self.chain_id {
+            writeln!(writer)?;
+            write!(writer, "Chain ID: {}", chain_id)?;
         }
         write!(f, "{}", writer)
     }

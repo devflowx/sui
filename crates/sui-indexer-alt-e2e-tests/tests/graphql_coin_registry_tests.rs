@@ -5,19 +5,23 @@ use insta::assert_debug_snapshot;
 use move_core_types::language_storage::StructTag;
 use serde::Deserialize;
 use serde_json::json;
-use sui_indexer_alt_e2e_tests::{
-    coin_registry::{self, LegacyCoinOutputs},
-    find, FullCluster,
-};
-use sui_types::{
-    base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
-    coin::{CoinMetadata, TreasuryCap},
-    deny_list_v2::DenyCapV2,
-    digests::ObjectDigest,
-    effects::TransactionEffectsAPI,
-    object::Owner,
-    Identifier, SUI_COIN_REGISTRY_ADDRESS,
-};
+use sui_types::Identifier;
+use sui_types::SUI_COIN_REGISTRY_ADDRESS;
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SequenceNumber;
+use sui_types::base_types::SuiAddress;
+use sui_types::coin::CoinMetadata;
+use sui_types::coin::TreasuryCap;
+use sui_types::deny_list_v2::DenyCapV2;
+use sui_types::digests::ObjectDigest;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::object::Owner;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::coin_registry::LegacyCoinOutputs;
+use sui_indexer_alt_e2e_tests::coin_registry::{self};
+use sui_indexer_alt_e2e_tests::find;
 
 const METADATA_QUERY: &str = r#"
 query GetCoinMetadata($coinType: String!) {
@@ -104,7 +108,7 @@ async fn test_fixed_supply() {
     let (a, kp, fx) = coin_registry::publish(&mut cluster, "fixed_supply").await;
     let package = find::immutable(&fx).unwrap().0;
     let currency = find::address_owned_by(&fx, SUI_COIN_REGISTRY_ADDRESS.into()).unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     coin_registry::finalize(&mut cluster, a, &kp, package, "fixed", currency, gas).await;
     cluster.create_checkpoint().await;
@@ -140,7 +144,7 @@ async fn test_dynamic() {
     let mut cluster = FullCluster::new().await.unwrap();
     let (sender, kp, fx) = coin_registry::publish(&mut cluster, "dynamic").await;
     let package = find::immutable(&fx).unwrap().0;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     // Create a dynamic currency
     let coin_type = StructTag {
@@ -186,14 +190,14 @@ async fn test_burn_only() {
     let package = find::immutable(&fx).unwrap().0;
     let currency = find::address_owned_by(&fx, SUI_COIN_REGISTRY_ADDRESS.into()).unwrap();
     let coin = find::address_owned_by(&fx, sender).unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let fx =
         coin_registry::finalize(&mut cluster, sender, &kp, package, "burn", currency, gas).await;
 
     cluster.create_checkpoint().await;
     let currency = find::shared(&fx).unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let metadata = query_metadata(&cluster, &format!("{package}::burn::BURN")).await;
     assert_debug_snapshot!(metadata, @r###"
@@ -251,13 +255,13 @@ async fn test_unknown() {
     let currency = find::address_owned_by(&fx, SUI_COIN_REGISTRY_ADDRESS.into()).unwrap();
     let coin = find::address_owned_by(&fx, sender).unwrap();
     let treasury_cap = find::shared(&fx).unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let fx =
         coin_registry::finalize(&mut cluster, sender, &kp, package, "unknown", currency, gas).await;
 
     cluster.create_checkpoint().await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let metadata = query_metadata(&cluster, &format!("{package}::unknown::UNKNOWN")).await;
     assert_debug_snapshot!(metadata, @r###"
@@ -296,7 +300,7 @@ async fn test_unknown() {
     .await;
 
     cluster.create_checkpoint().await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
     let coin = find::address_mutated(&fx).unwrap();
 
     // `supply` should reflect the burn operation.
@@ -321,7 +325,7 @@ async fn test_unknown() {
     .await;
 
     cluster.create_checkpoint().await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     // `supply` should be `None` while the treasury cap is hidden.
     assert_eq!(
@@ -347,7 +351,7 @@ async fn test_unknown() {
     .await;
 
     cluster.create_checkpoint().await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     // `supply` has been modified but it is still `None` while the treasury cap is hidden.
     assert_eq!(
@@ -389,7 +393,7 @@ async fn test_legacy() {
 
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let metadata = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_debug_snapshot!(metadata, @r###"
@@ -415,32 +419,14 @@ async fn test_legacy() {
     "###);
 
     // Migrate the legacy coin to the coin registry
-    let fx = coin_registry::migrate(&mut cluster, sender, &kp, &outputs, gas).await;
+    coin_registry::migrate(&mut cluster, sender, &kp, &outputs, gas).await;
 
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
-    let currency = find::shared(&fx).unwrap(); // The migrated Currency<T> object
-    let gas = fx.gas_object().0;
 
     // RPC output should be the same after the migration
     let migrated = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_eq!(metadata, migrated);
-
-    coin_registry::delete_migrated_legacy_metadata(
-        &mut cluster,
-        sender,
-        &kp,
-        &outputs,
-        currency,
-        gas,
-    )
-    .await;
-
-    cluster.create_checkpoint().await;
-
-    // RPC output should also be the same after deleting the legacy metadata
-    let deleted = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
-    assert_eq!(metadata, deleted);
 }
 
 #[tokio::test]
@@ -449,7 +435,7 @@ async fn test_regulated() {
     let (a, kp, fx) = coin_registry::publish(&mut cluster, "regulated").await;
     let package = find::immutable(&fx).unwrap().0;
     let currency = find::address_owned_by(&fx, SUI_COIN_REGISTRY_ADDRESS.into()).unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     coin_registry::finalize(&mut cluster, a, &kp, package, "regulated", currency, gas).await;
     cluster.create_checkpoint().await;
@@ -487,7 +473,7 @@ async fn test_legacy_regulated_migrate_deny_cap() {
 
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let metadata = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_debug_snapshot!(metadata, @r###"
@@ -516,18 +502,16 @@ async fn test_legacy_regulated_migrate_deny_cap() {
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
     let currency = find::shared(&fx).unwrap(); // The migrated Currency<T> object
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     // Query the coin metadata again after migration - should produce the same results
     let migrated = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_eq!(metadata, migrated);
 
-    let fx =
-        coin_registry::migrate_deny_cap(&mut cluster, sender, &kp, &outputs, currency, gas).await;
+    coin_registry::migrate_deny_cap(&mut cluster, sender, &kp, &outputs, currency, gas).await;
 
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
-    let gas = fx.gas_object().0;
 
     // After migrating the deny cap, `allow_global_pause` is `false` but the rest is the same.
     let migrated = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
@@ -538,23 +522,6 @@ async fn test_legacy_regulated_migrate_deny_cap() {
             ..metadata.clone()
         }
     );
-
-    coin_registry::delete_migrated_legacy_metadata(
-        &mut cluster,
-        sender,
-        &kp,
-        &outputs,
-        currency,
-        gas,
-    )
-    .await;
-
-    cluster.create_checkpoint().await;
-    let outputs = query_owned_outputs(&cluster, sender).await;
-
-    // RPC response should be unchanged after deleting the legacy metadata.
-    let deleted = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
-    assert_eq!(deleted, migrated);
 }
 
 #[tokio::test]
@@ -572,7 +539,7 @@ async fn test_legacy_regulated_migrate_regulated_metadata() {
                 .then_some(oref)
         })
         .unwrap();
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     let metadata = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_debug_snapshot!(metadata, @r###"
@@ -601,13 +568,13 @@ async fn test_legacy_regulated_migrate_regulated_metadata() {
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
     let currency = find::shared(&fx).unwrap(); // The migrated Currency<T> object
-    let gas = fx.gas_object().0;
+    let gas = fx.gas_object().unwrap().0;
 
     // Query the coin metadata again after migration - should produce the same results
     let migrated = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_eq!(metadata, migrated);
 
-    let fx = coin_registry::migrate_regulated_metadata(
+    coin_registry::migrate_regulated_metadata(
         &mut cluster,
         sender,
         &kp,
@@ -620,28 +587,11 @@ async fn test_legacy_regulated_migrate_regulated_metadata() {
 
     cluster.create_checkpoint().await;
     let outputs = query_owned_outputs(&cluster, sender).await;
-    let gas = fx.gas_object().0;
 
     // After migrating the metadata, the output is the same (migration from metadata doesn't port
     // the `allow_global_pause` field).
     let migrated = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
     assert_eq!(migrated, metadata);
-
-    coin_registry::delete_migrated_legacy_metadata(
-        &mut cluster,
-        sender,
-        &kp,
-        &outputs,
-        currency,
-        gas,
-    )
-    .await;
-    cluster.create_checkpoint().await;
-    let outputs = query_owned_outputs(&cluster, sender).await;
-
-    // RPC response should also be unchanged after deleting the legacy metadata.
-    let deleted = query_metadata(&cluster, &outputs.coin_type.to_canonical_string(true)).await;
-    assert_eq!(deleted, metadata);
 }
 
 /// Run a GraphQL query to fetch the coin metadata for `coin_type` from `cluster`.

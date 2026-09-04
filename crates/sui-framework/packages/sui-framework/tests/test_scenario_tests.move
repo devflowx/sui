@@ -960,7 +960,7 @@ fun dynamic_field_still_borrowed() {
     let sender = @0x0;
     let mut scenario = test_scenario::begin(sender);
     let mut parent = scenario.new_object();
-    dynamic_field::add(&mut parent, b"", 10);
+    dynamic_field::add(&mut parent, b"", 10u64);
     let r = dynamic_field::borrow<vector<u8>, u64>(&parent, b"");
     scenario.end();
     assert!(*r == 10);
@@ -1313,4 +1313,49 @@ fun create_system_objects() {
     test_scenario::return_shared(deny_list);
 
     scenario.end();
+}
+
+// === macros ===
+
+#[test]
+#[allow(unused_mut_ref)]
+fun with_shared() {
+    use sui::clock::Clock;
+    use sui::random::Random;
+
+    let mut test = test_scenario::begin(@0);
+    test.create_system_objects();
+
+    test.with_shared!<Clock>(|clock, test| {
+        assert_eq!(clock.timestamp_ms(), 0);
+
+        test.with_shared!<Random>(|random, test| {
+            let _ = random.new_generator(test.ctx());
+        });
+    });
+
+    test.end();
+}
+
+#[test]
+#[allow(unused_mut_ref)]
+fun with_shared_by_id() {
+    use sui::clock::Clock;
+
+    let mut test = test_scenario::begin(@0);
+    test.create_system_objects();
+
+    let test_clock_id;
+
+    test.with_shared!<Clock>(|clock, _| {
+        test_clock_id = object::id(clock);
+    });
+
+    test.next_tx(@0);
+
+    test.with_shared_by_id!<Clock>(test_clock_id, |clock, _| {
+        assert_eq!(clock.timestamp_ms(), 0);
+    });
+
+    test.end();
 }

@@ -1,13 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::ArgUses;
 use super::NormalizedPackages;
 use crate::Result;
 use crate::RpcError;
 use move_binary_format::normalized;
-use prost_types::value::Kind;
 use prost_types::Value;
+use prost_types::value::Kind;
 use sui_sdk_types::Command;
+use sui_types::MOVE_STDLIB_ADDRESS;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::STD_ASCII_MODULE_NAME;
 use sui_types::base_types::STD_ASCII_STRUCT_NAME;
@@ -15,17 +17,16 @@ use sui_types::base_types::STD_OPTION_MODULE_NAME;
 use sui_types::base_types::STD_OPTION_STRUCT_NAME;
 use sui_types::base_types::STD_UTF8_MODULE_NAME;
 use sui_types::base_types::STD_UTF8_STRUCT_NAME;
-use sui_types::MOVE_STDLIB_ADDRESS;
 
 type Type = normalized::Type<normalized::RcIdentifier>;
 
 pub(super) fn resolve_literal(
     called_packages: &mut NormalizedPackages,
-    commands: &[Command],
+    arg_uses: &ArgUses,
     arg_idx: usize,
     value: &Value,
 ) -> Result<Vec<u8>> {
-    let literal_type = determine_literal_type(called_packages, commands, arg_idx)?;
+    let literal_type = determine_literal_type(called_packages, arg_uses, arg_idx)?;
 
     let mut buf = Vec::new();
 
@@ -36,7 +37,7 @@ pub(super) fn resolve_literal(
 
 fn determine_literal_type(
     called_packages: &mut NormalizedPackages,
-    commands: &[Command],
+    arg_uses: &ArgUses,
     arg_idx: usize,
 ) -> Result<Type> {
     fn set_type(maybe_type: &mut Option<Type>, ty: Type) -> Result<()> {
@@ -46,7 +47,7 @@ fn determine_literal_type(
                 return Err(RpcError::new(
                     tonic::Code::InvalidArgument,
                     "unable to resolve literal as it is used as multiple different types across commands",
-                ))
+                ));
             }
             None => {
                 *maybe_type = Some(ty);
@@ -57,7 +58,7 @@ fn determine_literal_type(
     }
     let mut literal_type = None;
 
-    for (command, idx) in super::find_arg_uses(arg_idx, commands) {
+    for (command, idx) in arg_uses.uses_of(arg_idx) {
         match (command, idx) {
             (Command::MoveCall(move_call), Some(idx)) => {
                 let arg_type = super::arg_type_of_move_call_input(called_packages, move_call, idx)?;
@@ -183,7 +184,7 @@ fn resolve_as_bool(buf: &mut Vec<u8>, value: &Value) -> Result<()> {
             return Err(RpcError::new(
                 tonic::Code::InvalidArgument,
                 "literal cannot be resolved into type bool",
-            ))
+            ));
         }
     };
 
@@ -226,7 +227,7 @@ where
                     "literal cannot be resolved into type {}",
                     std::any::type_name::<T>()
                 ),
-            ))
+            ));
         }
     };
 
@@ -248,7 +249,7 @@ fn resolve_as_address(buf: &mut Vec<u8>, value: &Value) -> Result<()> {
             return Err(RpcError::new(
                 tonic::Code::InvalidArgument,
                 "literal cannot be resolved into type address",
-            ))
+            ));
         }
     };
 
@@ -266,7 +267,7 @@ fn resolve_as_string(buf: &mut Vec<u8>, value: &Value) -> Result<()> {
             return Err(RpcError::new(
                 tonic::Code::InvalidArgument,
                 "literal cannot be resolved into string",
-            ))
+            ));
         }
     };
 
@@ -289,7 +290,7 @@ fn resolve_as_option(buf: &mut Vec<u8>, type_: &Type, value: &Value) -> Result<(
             return Err(RpcError::new(
                 tonic::Code::InvalidArgument,
                 "literal cannot be resolved into Option",
-            ))
+            ));
         }
     }
 
@@ -775,10 +776,12 @@ mod test {
             (
                 vector_type(vector_type(Type::U8)),
                 Kind::ListValue(prost_types::ListValue {
-                    values: vec![Kind::ListValue(prost_types::ListValue {
-                        values: vec![Kind::NumberValue(9 as _).into()],
-                    })
-                    .into()],
+                    values: vec![
+                        Kind::ListValue(prost_types::ListValue {
+                            values: vec![Kind::NumberValue(9 as _).into()],
+                        })
+                        .into(),
+                    ],
                 }),
                 Some(bcs::to_bytes(&vec![vec![9u8]]).unwrap()),
             ),

@@ -4,18 +4,19 @@
 use self::sui_system_state_inner_v1::{SuiSystemStateInnerV1, ValidatorV1};
 use self::sui_system_state_summary::{SuiSystemStateSummary, SuiValidatorSummary};
 use crate::base_types::ObjectID;
+use crate::collection_types::Bag;
 use crate::committee::CommitteeWithNetworkMetadata;
 use crate::dynamic_field::{
-    get_dynamic_field_from_store, get_dynamic_field_object_from_store, Field,
+    Field, get_dynamic_field_from_store, get_dynamic_field_object_from_store,
 };
-use crate::error::SuiError;
+use crate::error::{SuiError, SuiErrorKind};
 use crate::gas::GasCostSummary;
 use crate::object::{MoveObject, Object};
 use crate::storage::ObjectStore;
 use crate::sui_system_state::epoch_start_sui_system_state::EpochStartSystemState;
 use crate::sui_system_state::sui_system_state_inner_v2::SuiSystemStateInnerV2;
 use crate::versioned::Versioned;
-use crate::{id::UID, MoveTypeTagTrait, SUI_SYSTEM_ADDRESS, SUI_SYSTEM_STATE_OBJECT_ID};
+use crate::{MoveTypeTagTrait, SUI_SYSTEM_ADDRESS, SUI_SYSTEM_STATE_OBJECT_ID, id::UID};
 use anyhow::Result;
 use enum_dispatch::enum_dispatch;
 use move_core_types::{ident_str, identifier::IdentStr, language_storage::StructTag};
@@ -41,6 +42,11 @@ use self::simtest_sui_system_state_inner::{
 const SUI_SYSTEM_STATE_WRAPPER_STRUCT_NAME: &IdentStr = ident_str!("SuiSystemState");
 
 pub const SUI_SYSTEM_MODULE_NAME: &IdentStr = ident_str!("sui_system");
+pub const SUI_SYSTEM_STATE_INNER_MODULE_NAME: &IdentStr = ident_str!("sui_system_state_inner");
+pub const SUI_SYSTEM_STATE_INNER_V1_STRUCT_NAME: &IdentStr = ident_str!("SuiSystemStateInner");
+pub const SUI_SYSTEM_STATE_INNER_V2_STRUCT_NAME: &IdentStr = ident_str!("SuiSystemStateInnerV2");
+pub const VALIDATOR_MODULE_NAME: &IdentStr = ident_str!("validator");
+pub const VALIDATOR_STRUCT_NAME: &IdentStr = ident_str!("Validator");
 pub const ADVANCE_EPOCH_FUNCTION_NAME: &IdentStr = ident_str!("advance_epoch");
 pub const ADVANCE_EPOCH_SAFE_MODE_FUNCTION_NAME: &IdentStr = ident_str!("advance_epoch_safe_mode");
 
@@ -52,7 +58,7 @@ pub const SUI_SYSTEM_STATE_SIM_TEST_SHALLOW_V2: u64 = 18446744073709551606; // u
 pub const SUI_SYSTEM_STATE_SIM_TEST_DEEP_V2: u64 = 18446744073709551607; // u64::MAX - 8
 
 /// Rust version of the Move sui::sui_system::SuiSystemState type
-/// This repreents the object with 0x5 ID.
+/// This represents the object with 0x5 ID.
 /// In Rust, this type should be rarely used since it's just a thin
 /// wrapper used to access the inner object.
 /// Within this module, we use it to determine the current version of the system state inner object type,
@@ -173,6 +179,7 @@ pub trait SuiSystemStateTrait {
     fn system_state_version(&self) -> u64;
     fn epoch_start_timestamp_ms(&self) -> u64;
     fn epoch_duration_ms(&self) -> u64;
+    fn extra_fields(&self) -> &Bag;
     fn safe_mode(&self) -> bool;
     fn safe_mode_gas_cost_summary(&self) -> GasCostSummary;
     fn advance_epoch_safe_mode(&mut self, params: &AdvanceEpochParams);
@@ -230,15 +237,17 @@ pub fn get_sui_system_state_wrapper(
         .get_object(&SUI_SYSTEM_STATE_OBJECT_ID)
         // Don't panic here on None because object_store is a generic store.
         .ok_or_else(|| {
-            SuiError::SuiSystemStateReadError("SuiSystemStateWrapper object not found".to_owned())
+            SuiErrorKind::SuiSystemStateReadError(
+                "SuiSystemStateWrapper object not found".to_owned(),
+            )
         })?;
     let move_object = wrapper.data.try_as_move().ok_or_else(|| {
-        SuiError::SuiSystemStateReadError(
+        SuiErrorKind::SuiSystemStateReadError(
             "SuiSystemStateWrapper object must be a Move object".to_owned(),
         )
     })?;
     let result = bcs::from_bytes::<SuiSystemStateWrapper>(move_object.contents())
-        .map_err(|err| SuiError::SuiSystemStateReadError(err.to_string()))?;
+        .map_err(|err| SuiErrorKind::SuiSystemStateReadError(err.to_string()))?;
     Ok(result)
 }
 
@@ -250,7 +259,7 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
             let result: SuiSystemStateInnerV1 =
                 get_dynamic_field_from_store(object_store, id, &wrapper.version).map_err(
                     |err| {
-                        SuiError::DynamicFieldReadError(format!(
+                        SuiErrorKind::DynamicFieldReadError(format!(
                             "Failed to load sui system state inner object with ID {:?} and version {:?}: {:?}",
                             id, wrapper.version, err
                         ))
@@ -262,7 +271,7 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
             let result: SuiSystemStateInnerV2 =
                 get_dynamic_field_from_store(object_store, id, &wrapper.version).map_err(
                     |err| {
-                        SuiError::DynamicFieldReadError(format!(
+                        SuiErrorKind::DynamicFieldReadError(format!(
                             "Failed to load sui system state inner object with ID {:?} and version {:?}: {:?}",
                             id, wrapper.version, err
                         ))
@@ -275,7 +284,7 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
             let result: SimTestSuiSystemStateInnerV1 =
                 get_dynamic_field_from_store(object_store, id, &wrapper.version).map_err(
                     |err| {
-                        SuiError::DynamicFieldReadError(format!(
+                        SuiErrorKind::DynamicFieldReadError(format!(
                             "Failed to load sui system state inner object with ID {:?} and version {:?}: {:?}",
                             id, wrapper.version, err
                         ))
@@ -288,7 +297,7 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
             let result: SimTestSuiSystemStateInnerShallowV2 =
                 get_dynamic_field_from_store(object_store, id, &wrapper.version).map_err(
                     |err| {
-                        SuiError::DynamicFieldReadError(format!(
+                        SuiErrorKind::DynamicFieldReadError(format!(
                             "Failed to load sui system state inner object with ID {:?} and version {:?}: {:?}",
                             id, wrapper.version, err
                         ))
@@ -301,7 +310,7 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
             let result: SimTestSuiSystemStateInnerDeepV2 =
                 get_dynamic_field_from_store(object_store, id, &wrapper.version).map_err(
                     |err| {
-                        SuiError::DynamicFieldReadError(format!(
+                        SuiErrorKind::DynamicFieldReadError(format!(
                             "Failed to load sui system state inner object with ID {:?} and version {:?}: {:?}",
                             id, wrapper.version, err
                         ))
@@ -309,10 +318,11 @@ pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemS
                 )?;
             Ok(SuiSystemState::SimTestDeepV2(result))
         }
-        _ => Err(SuiError::SuiSystemStateReadError(format!(
+        _ => Err(SuiErrorKind::SuiSystemStateReadError(format!(
             "Unsupported SuiSystemState version: {}",
             wrapper.version
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -330,7 +340,7 @@ where
 {
     let field: ValidatorWrapper = get_dynamic_field_from_store(object_store, table_id, key)
         .map_err(|err| {
-            SuiError::SuiSystemStateReadError(format!(
+            SuiErrorKind::SuiSystemStateReadError(format!(
                 "Failed to load validator wrapper from table: {:?}",
                 err
             ))
@@ -342,7 +352,7 @@ where
             let validator: ValidatorV1 =
                 get_dynamic_field_from_store(object_store, versioned.id.id.bytes, &version)
                     .map_err(|err| {
-                        SuiError::SuiSystemStateReadError(format!(
+                        SuiErrorKind::SuiSystemStateReadError(format!(
                             "Failed to load inner validator from the wrapper: {:?}",
                             err
                         ))
@@ -354,7 +364,7 @@ where
             let validator: SimTestValidatorV1 =
                 get_dynamic_field_from_store(object_store, versioned.id.id.bytes, &version)
                     .map_err(|err| {
-                        SuiError::SuiSystemStateReadError(format!(
+                        SuiErrorKind::SuiSystemStateReadError(format!(
                             "Failed to load inner validator from the wrapper: {:?}",
                             err
                         ))
@@ -366,17 +376,18 @@ where
             let validator: SimTestValidatorDeepV2 =
                 get_dynamic_field_from_store(object_store, versioned.id.id.bytes, &version)
                     .map_err(|err| {
-                        SuiError::SuiSystemStateReadError(format!(
+                        SuiErrorKind::SuiSystemStateReadError(format!(
                             "Failed to load inner validator from the wrapper: {:?}",
                             err
                         ))
                     })?;
             Ok(validator.into_sui_validator_summary())
         }
-        _ => Err(SuiError::SuiSystemStateReadError(format!(
+        _ => Err(SuiErrorKind::SuiSystemStateReadError(format!(
             "Unsupported Validator version: {}",
             version
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -393,7 +404,7 @@ where
     for i in 0..table_size {
         let validator: ValidatorType = get_dynamic_field_from_store(&object_store, table_id, &i)
             .map_err(|err| {
-                SuiError::SuiSystemStateReadError(format!(
+                SuiErrorKind::SuiSystemStateReadError(format!(
                     "Failed to load validator from table: {:?}",
                     err
                 ))
@@ -447,21 +458,17 @@ pub struct AdvanceEpochParams {
 
 #[cfg(msim)]
 pub mod advance_epoch_result_injection {
+    use crate::error::ExecutionErrorTrait;
     use crate::{
-        committee::EpochId,
-        error::{ExecutionError, ExecutionErrorKind},
-        execution::ResultWithTimings,
+        committee::EpochId, error::ExecutionError, execution::ResultWithTimings,
+        execution_status::ExecutionErrorKind,
     };
-    use std::cell::RefCell;
-
-    thread_local! {
-        /// Override the result of advance_epoch in the range [start, end).
-        static OVERRIDE: RefCell<Option<(EpochId, EpochId)>>  = RefCell::new(None);
-    }
+    /// Override the result of advance_epoch in the range [start, end).
+    static OVERRIDE: std::sync::Mutex<Option<(EpochId, EpochId)>> = std::sync::Mutex::new(None);
 
     /// Override the result of advance_epoch transaction if new epoch is in the provided range [start, end).
     pub fn set_override(value: Option<(EpochId, EpochId)>) {
-        OVERRIDE.with(|o| *o.borrow_mut() = value);
+        *OVERRIDE.lock().unwrap() = value;
     }
 
     /// This function is used to modify the result of advance_epoch transaction for testing.
@@ -470,10 +477,28 @@ pub mod advance_epoch_result_injection {
         result: ResultWithTimings<(), ExecutionError>,
         current_epoch: EpochId,
     ) -> ResultWithTimings<(), ExecutionError> {
-        if let Some((start, end)) = OVERRIDE.with(|o| *o.borrow()) {
+        if let Some((start, end)) = *OVERRIDE.lock().unwrap() {
             if current_epoch >= start && current_epoch < end {
                 return Err((
                     ExecutionError::new(ExecutionErrorKind::FunctionNotFound, None),
+                    vec![],
+                ));
+            }
+        }
+        result
+    }
+
+    /// This function is used to modify the result of advance_epoch transaction for testing.
+    /// If the override is set, the result will be an execution error, otherwise the original result will be returned.
+    pub fn maybe_modify_result_for<E: ExecutionErrorTrait>(
+        result: ResultWithTimings<(), E>,
+        current_epoch: EpochId,
+    ) -> ResultWithTimings<(), E> {
+        if let Some((start, end)) = *OVERRIDE.lock().unwrap() {
+            if current_epoch >= start && current_epoch < end {
+                return Err((
+                    // TODO use E constructor
+                    ExecutionError::new(ExecutionErrorKind::FunctionNotFound, None).into(),
                     vec![],
                 ));
             }
@@ -486,7 +511,7 @@ pub mod advance_epoch_result_injection {
         result: Result<(), ExecutionError>,
         current_epoch: EpochId,
     ) -> Result<(), ExecutionError> {
-        if let Some((start, end)) = OVERRIDE.with(|o| *o.borrow()) {
+        if let Some((start, end)) = *OVERRIDE.lock().unwrap() {
             if current_epoch >= start && current_epoch < end {
                 return Err(ExecutionError::new(
                     ExecutionErrorKind::FunctionNotFound,

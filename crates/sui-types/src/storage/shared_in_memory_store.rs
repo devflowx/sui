@@ -1,15 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::error::Result;
 use super::ObjectStore;
+use super::error::Result;
 use crate::base_types::{EpochId, ExecutionData, TransactionDigest};
 use crate::committee::Committee;
 use crate::digests::{CheckpointContentsDigest, CheckpointDigest};
 use crate::effects::{TransactionEffects, TransactionEvents};
 use crate::messages_checkpoint::{
-    CheckpointContents, CheckpointSequenceNumber, FullCheckpointContents, VerifiedCheckpoint,
-    VerifiedCheckpointContents,
+    CheckpointContents, CheckpointSequenceNumber, VerifiedCheckpoint, VerifiedCheckpointContents,
+    VersionedFullCheckpointContents,
 };
 use crate::storage::{ReadStore, WriteStore};
 use crate::transaction::VerifiedTransaction;
@@ -69,7 +69,7 @@ impl ReadStore for SharedInMemoryStore {
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
         self.inner()
             .get_full_checkpoint_contents(sequence_number, digest)
     }
@@ -100,6 +100,13 @@ impl ReadStore for SharedInMemoryStore {
         _digest: &TransactionDigest,
     ) -> Option<Vec<crate::storage::ObjectKey>> {
         todo!()
+    }
+
+    fn get_transaction_checkpoint(
+        &self,
+        _digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber> {
+        None
     }
 
     fn get_latest_checkpoint(&self) -> Result<VerifiedCheckpoint> {
@@ -183,7 +190,7 @@ pub struct InMemoryStore {
     highest_verified_checkpoint: Option<(CheckpointSequenceNumber, CheckpointDigest)>,
     highest_synced_checkpoint: Option<(CheckpointSequenceNumber, CheckpointDigest)>,
     checkpoints: HashMap<CheckpointDigest, VerifiedCheckpoint>,
-    full_checkpoint_contents: HashMap<CheckpointSequenceNumber, FullCheckpointContents>,
+    full_checkpoint_contents: HashMap<CheckpointSequenceNumber, VersionedFullCheckpointContents>,
     contents_digest_to_sequence_number: HashMap<CheckpointContentsDigest, CheckpointSequenceNumber>,
     sequence_number_to_digest: HashMap<CheckpointSequenceNumber, CheckpointDigest>,
     checkpoint_contents: HashMap<CheckpointContentsDigest, CheckpointContents>,
@@ -229,7 +236,8 @@ impl InMemoryStore {
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
+        // TODO fix this!
         let contents = sequence_number
             .or_else(|| self.get_sequence_number_by_contents_digest(digest))
             .and_then(|seq_num| self.full_checkpoint_contents.get(&seq_num).cloned());
@@ -252,10 +260,12 @@ impl InMemoryStore {
             }
         }
 
-        Some(FullCheckpointContents::from_contents_and_execution_data(
-            contents.to_owned(),
-            transactions.into_iter(),
-        ))
+        Some(
+            VersionedFullCheckpointContents::from_contents_and_execution_data(
+                contents.to_owned(),
+                transactions.into_iter(),
+            ),
+        )
     }
 
     pub fn get_sequence_number_by_contents_digest(
@@ -375,10 +385,10 @@ impl InMemoryStore {
         if !self.checkpoints.contains_key(checkpoint.digest()) {
             panic!("store should already contain checkpoint");
         }
-        if let Some(highest_synced_checkpoint) = self.highest_synced_checkpoint {
-            if highest_synced_checkpoint.0 >= checkpoint.sequence_number {
-                return;
-            }
+        if let Some(highest_synced_checkpoint) = self.highest_synced_checkpoint
+            && highest_synced_checkpoint.0 >= checkpoint.sequence_number
+        {
+            return;
         }
         self.highest_synced_checkpoint =
             Some((*checkpoint.sequence_number(), *checkpoint.digest()));
@@ -388,10 +398,10 @@ impl InMemoryStore {
         if !self.checkpoints.contains_key(checkpoint.digest()) {
             panic!("store should already contain checkpoint");
         }
-        if let Some(highest_verified_checkpoint) = self.highest_verified_checkpoint {
-            if highest_verified_checkpoint.0 >= checkpoint.sequence_number {
-                return;
-            }
+        if let Some(highest_verified_checkpoint) = self.highest_verified_checkpoint
+            && highest_verified_checkpoint.0 >= checkpoint.sequence_number
+        {
+            return;
         }
         self.highest_verified_checkpoint =
             Some((*checkpoint.sequence_number(), *checkpoint.digest()));
@@ -456,7 +466,7 @@ impl SingleCheckpointSharedInMemoryStore {
         contents: VerifiedCheckpointContents,
         committee: Committee,
     ) {
-        let mut locked = self.0 .0.write().unwrap();
+        let mut locked = self.0.0.write().unwrap();
         locked.insert_genesis_state(checkpoint, contents, committee);
     }
 }
@@ -506,7 +516,7 @@ impl ReadStore for SingleCheckpointSharedInMemoryStore {
         &self,
         sequence_number: Option<CheckpointSequenceNumber>,
         digest: &CheckpointContentsDigest,
-    ) -> Option<FullCheckpointContents> {
+    ) -> Option<VersionedFullCheckpointContents> {
         self.0.get_full_checkpoint_contents(sequence_number, digest)
     }
 
@@ -533,6 +543,13 @@ impl ReadStore for SingleCheckpointSharedInMemoryStore {
         todo!()
     }
 
+    fn get_transaction_checkpoint(
+        &self,
+        _digest: &TransactionDigest,
+    ) -> Option<CheckpointSequenceNumber> {
+        None
+    }
+
     fn get_latest_checkpoint(&self) -> Result<VerifiedCheckpoint> {
         todo!()
     }
@@ -555,7 +572,7 @@ impl ReadStore for SingleCheckpointSharedInMemoryStore {
 impl WriteStore for SingleCheckpointSharedInMemoryStore {
     fn insert_checkpoint(&self, checkpoint: &VerifiedCheckpoint) -> Result<()> {
         {
-            let mut locked = self.0 .0.write().unwrap();
+            let mut locked = self.0.0.write().unwrap();
             locked.checkpoints.clear();
             locked.sequence_number_to_digest.clear();
         }
@@ -579,7 +596,7 @@ impl WriteStore for SingleCheckpointSharedInMemoryStore {
         contents: VerifiedCheckpointContents,
     ) -> Result<()> {
         {
-            let mut locked = self.0 .0.write().unwrap();
+            let mut locked = self.0.0.write().unwrap();
             locked.transactions.clear();
             locked.effects.clear();
             locked.contents_digest_to_sequence_number.clear();

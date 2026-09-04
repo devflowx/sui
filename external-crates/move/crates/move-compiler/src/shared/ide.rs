@@ -32,6 +32,9 @@ use std::{
 #[derive(Debug, Clone, Default)]
 pub struct IDEInfo {
     pub(crate) annotations: Vec<(Loc, IDEAnnotation)>,
+    /// Typed macro function bodies keyed by defining module and function name
+    /// whose location is the location of the function definition.
+    macro_function_bodies: BTreeMap<(E::ModuleIdent, P::FunctionName), T::Sequence>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ pub enum IDEAnnotation {
     MissingMatchArms(Box<MissingMatchArmsInfo>),
     /// Ellipsis Match Arm.
     EllipsisMatchEntries(Box<EllipsisMatchEntries>),
+    /// String Value.
+    StringValue(Box<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,13 @@ pub struct MacroCallInfo {
     pub type_arguments: Vec<N::Type>,
     /// By-value args (at this point there should only be one, representing receiver arg)
     pub by_value_args: Vec<T::SequenceItem>,
+    /// Location of the outermost (root) macro call in the expansion chain.
+    /// For the outermost call itself, this equals call_loc. For nested macro calls
+    /// (e.g., do! inside find_index!), this is the location of the outermost
+    /// find_index! call site. Used to disambiguate MacroCallInfo entries that share
+    /// the same inner call Loc (from the macro body) but belong to different
+    /// expansion contexts.
+    pub root_call_loc: Loc,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -172,12 +184,29 @@ impl IDEInfo {
         self.annotations.push((loc, info));
     }
 
+    pub fn add_macro_function_body(
+        &mut self,
+        module: E::ModuleIdent,
+        name: P::FunctionName,
+        seq: T::Sequence,
+    ) {
+        self.macro_function_bodies.insert((module, name), seq);
+    }
+
+    pub fn macro_function_bodies(
+        &self,
+    ) -> &BTreeMap<(E::ModuleIdent, P::FunctionName), T::Sequence> {
+        &self.macro_function_bodies
+    }
+
     pub fn extend(&mut self, mut other: Self) {
         self.annotations.append(&mut other.annotations);
+        self.macro_function_bodies
+            .extend(other.macro_function_bodies);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.annotations.is_empty()
+        self.annotations.is_empty() && self.macro_function_bodies.is_empty()
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, (Loc, IDEAnnotation)> {
@@ -250,7 +279,7 @@ impl
             .filter(|(symbol, _)| symbol.to_string() != UNIT_TEST_POISON_INJECTION_NAME.to_string())
         {
             match entry {
-                MemberEntry::Member(mident, name) => {
+                MemberEntry::Member(mident, name, _) => {
                     members
                         .entry((*mident, name.value))
                         .or_default()
@@ -259,6 +288,7 @@ impl
                 MemberEntry::TypeParam => {
                     type_params.insert(*symbol);
                 }
+                MemberEntry::LambdaParam => (),
             }
         }
 
@@ -281,6 +311,7 @@ impl From<(Loc, IDEAnnotation)> for Diagnostic {
                     method_name,
                     type_arguments,
                     by_value_args,
+                    root_call_loc: _,
                 } = *info;
                 let mut diag = diag!(IDE::MacroCallInfo, (loc, "macro call info"));
                 diag.add_note(format!("Called {module}::{name}"));
@@ -371,6 +402,9 @@ impl From<(Loc, IDEAnnotation)> for Diagnostic {
                 let msg = format!("Ellipsis expansion: {}", entries);
                 diag!(IDE::EllipsisExpansion, (loc, msg))
             }
+            IDEAnnotation::StringValue(s) => {
+                diag!(IDE::StringValue, (loc, format!("String value: {}", s)))
+            }
         }
     }
 }
@@ -388,8 +422,7 @@ impl fmt::Display for PatternSuggestion {
                 field_count,
             } => {
                 write!(f, "{module}::{name}")?;
-                let wildcards = std::iter::repeat("_")
-                    .take(*field_count)
+                let wildcards = std::iter::repeat_n("_", *field_count)
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "({wildcards})")
@@ -401,8 +434,7 @@ impl fmt::Display for PatternSuggestion {
                 field_count,
             } => {
                 write!(f, "{module}::{enum_name}::{variant_name}")?;
-                let wildcards = std::iter::repeat("_")
-                    .take(*field_count)
+                let wildcards = std::iter::repeat_n("_", *field_count)
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "({wildcards})")

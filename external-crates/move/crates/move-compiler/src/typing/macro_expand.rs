@@ -7,7 +7,7 @@ use crate::{
     expansion::ast::{ModuleIdent, Mutability},
     ice,
     naming::ast::{
-        self as N, BlockLabel, Color, MatchArm_, TParamID, Type, Type_, UseFuns, Var, Var_,
+        self as N, BlockLabel, Color, MatchArm_, TParamID, Type, TypeInner, UseFuns, Var, Var_,
     },
     parser::ast::FunctionName,
     shared::{ide::IDEAnnotation, program_info::FunctionInfo, unique_map::UniqueMap},
@@ -88,7 +88,9 @@ pub(crate) fn call(
         ) {
             Ok(res) => res,
             Err(None) => {
-                assert!(context.env().has_errors());
+                context.assert_has_errors(
+                    "ICE macro recoloring failure should have already resulted in an error",
+                );
                 return None;
             }
             Err(Some(diag)) => {
@@ -99,7 +101,8 @@ pub(crate) fn call(
     context.set_max_variable_color(max_color);
 
     if macro_type_params.len() != type_args.len() || macro_params.len() != args.len() {
-        assert!(context.env().has_errors());
+        context
+            .assert_has_errors("ICE macro arity mismatch should have already resulted in an error");
         return None;
     }
     // tparam subst
@@ -134,14 +137,12 @@ pub(crate) fn call(
             Arg::ByValue(e) => (EvalStrategy::ByValue(e.exp.loc), e.ty.clone()),
             Arg::ByName((e, ty)) => (EvalStrategy::ByName(e.loc), ty.clone()),
         };
-        let unfolded = core::unfold_type(&context.subst, arg_ty);
-        if let sp!(tfunloc, Type_::Fun(param_tys, result_ty)) = unfolded {
+        let unfolded = core::unfold_type(&context.subst, &arg_ty);
+        if let TypeInner::Fun(param_tys, result_ty) = unfolded.value.inner() {
+            let tfunloc = unfolded.loc;
             let arg_exp = match arg {
                 Arg::ByValue(_) => {
-                    assert!(
-                        context.env().has_errors(),
-                        "ICE lambda args should never be by value"
-                    );
+                    context.assert_has_errors("ICE lambda args should never be by value");
                     continue;
                 }
                 Arg::ByName((e, _)) => e,
@@ -153,8 +154,8 @@ pub(crate) fn call(
                     v,
                     arg_exp,
                     tfunloc,
-                    param_tys,
-                    *result_ty,
+                    param_tys.to_vec(),
+                    result_ty.clone(),
                 )?
             }
         } else {
@@ -765,7 +766,7 @@ fn types(context: &mut Context, tys: &mut [Type]) {
 }
 
 fn type_(context: &mut Context, ty: &mut N::Type) {
-    *ty = core::subst_tparams(&context.tparam_subst, ty.clone())
+    *ty = core::subst_tparams(&context.tparam_subst, ty)
 }
 
 fn block(context: &mut Context, b: &mut N::Block) {
@@ -796,14 +797,11 @@ fn lvalue(context: &mut Context, sp!(_, lv_): &mut N::LValue) {
     match lv_ {
         N::LValue_::Ignore => (),
         N::LValue_::Error => (),
-        N::LValue_::Var {
-            var: sp!(_, v_), ..
-        } => {
-            if context.all_params.contains_key(v_) {
-                assert!(
-                    context.core.env().has_errors(),
-                    "ICE cannot assign to macro parameter"
-                );
+        N::LValue_::Var { var, .. } => {
+            if context.all_params.contains_key(&var.value) {
+                context
+                    .core
+                    .assert_has_errors("ICE cannot assign to macro parameter");
                 *lv_ = N::LValue_::Ignore
             }
         }
@@ -867,12 +865,11 @@ fn exp(context: &mut Context, sp!(eloc, e_): &mut N::Exp) {
                     rhs,
                 } = &mut arm.value;
                 take_and_mut_replace!(binders, valid_binders, {
-                    valid_binders.retain(|(_, sp!(_, var_))| {
-                        if context.all_params.contains_key(var_) {
-                            assert!(
-                                context.core.env().has_errors(),
-                                "ICE cannot use macro parameter in pattern"
-                            );
+                    valid_binders.retain(|(_, var)| {
+                        if context.all_params.contains_key(&var.value) {
+                            context
+                                .core
+                                .assert_has_errors("ICE cannot use macro parameter in pattern");
                             false
                         } else {
                             true
@@ -1176,9 +1173,8 @@ fn exp(context: &mut Context, sp!(eloc, e_): &mut N::Exp) {
             if is_unbound_param {
                 assert!(!context.lambdas.contains_key(v_));
                 assert!(!context.by_name_args.contains_key(v_));
-                assert!(
-                    context.core.env().has_errors(),
-                    "ICE unbound param should have already resulted in an error"
+                context.core.assert_has_errors(
+                    "ICE unbound param should have already resulted in an error",
                 );
                 *e_ = N::Exp_::UnresolvedError;
             }
@@ -1192,9 +1188,8 @@ fn exp(context: &mut Context, sp!(eloc, e_): &mut N::Exp) {
             if is_unbound_param {
                 assert!(!context.lambdas.contains_key(v_));
                 assert!(!context.by_name_args.contains_key(v_));
-                assert!(
-                    context.core.env().has_errors(),
-                    "ICE unbound param should have already resulted in an error"
+                context.core.assert_has_errors(
+                    "ICE unbound param should have already resulted in an error",
                 );
                 *e_ = N::Exp_::UnresolvedError;
             }
@@ -1256,10 +1251,9 @@ fn pat(context: &mut Context, sp!(_, p_): &mut N::MatchPattern) {
         }
         MP::Binder(_mut, var, _) => {
             if context.all_params.contains_key(&var.value) {
-                assert!(
-                    context.core.env().has_errors(),
-                    "ICE cannot use macro parameter in pattern"
-                );
+                context
+                    .core
+                    .assert_has_errors("ICE cannot use macro parameter in pattern");
                 *p_ = MP::ErrorPat;
             }
         }
@@ -1269,10 +1263,9 @@ fn pat(context: &mut Context, sp!(_, p_): &mut N::MatchPattern) {
         }
         MP::At(var, _unused_var, inner) => {
             if context.all_params.contains_key(&var.value) {
-                assert!(
-                    context.core.env().has_errors(),
-                    "ICE cannot use macro parameter in pattern"
-                );
+                context
+                    .core
+                    .assert_has_errors("ICE cannot use macro parameter in pattern");
             }
             pat(context, inner);
         }

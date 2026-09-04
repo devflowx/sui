@@ -3,12 +3,15 @@
 
 use crate::{
     data_store::PackageStore,
+    execution_mode::ExecutionMode,
     sp,
     static_programmable_transactions::{env, spanned::Spanned, typing::ast as T},
 };
-use sui_types::error::ExecutionError;
 
-pub fn verify(env: &env::Env, tt: &T::Transaction) -> Result<(), ExecutionError> {
+pub fn verify<Mode: ExecutionMode>(
+    env: &env::Env<Mode>,
+    tt: &T::Transaction,
+) -> Result<(), Mode::Error> {
     let check_type = |ty| ensure_type_defining_id_based(env, ty);
     let check_arg = |sp!(_, (_, ty)): &Spanned<_>| ensure_type_defining_id_based(env, ty);
 
@@ -22,6 +25,9 @@ pub fn verify(env: &env::Env, tt: &T::Transaction) -> Result<(), ExecutionError>
     tt.receiving
         .iter()
         .try_for_each(|receiving_input| check_type(&receiving_input.ty))?;
+    tt.withdrawals
+        .iter()
+        .try_for_each(|withdrawal_input| check_type(&withdrawal_input.ty))?;
 
     // Verify all types in commands are defining-id based.
     tt.commands.iter().try_for_each(|sp!(_, c)| {
@@ -59,7 +65,10 @@ pub fn verify(env: &env::Env, tt: &T::Transaction) -> Result<(), ExecutionError>
     })
 }
 
-fn ensure_type_defining_id_based(env: &env::Env, ty: &T::Type) -> Result<(), ExecutionError> {
+fn ensure_type_defining_id_based<Mode: ExecutionMode>(
+    env: &env::Env<Mode>,
+    ty: &T::Type,
+) -> Result<(), Mode::Error> {
     match ty {
         T::Type::Bool
         | T::Type::U8

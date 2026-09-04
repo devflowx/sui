@@ -7,13 +7,13 @@ use crate::{
         ast as G,
         visitor::{AbsIntVisitorObj, AbstractInterpreterVisitor, CFGIRVisitorObj},
     },
-    command_line as cli,
+    command_line as cli, diag,
     diagnostics::{
-        DiagnosticReporter, Diagnostics, DiagnosticsFormat,
-        codes::{DiagnosticsID, Severity},
-        warning_filters::{
-            FILTER_ALL, FilterName, FilterPrefix, WarningFilter, WarningFiltersBuilder,
-            WarningFiltersScope, WarningFiltersTable,
+        Diagnostic, DiagnosticReporter, Diagnostics, DiagnosticsFormat,
+        codes::{DIAGNOSTIC_FILTER_WILDCARD, DiagnosticsID, Severity},
+        filter::{
+            self, COMPILER_KNOWN_FILTERS, FilterName, FilterPrefix, FilterScope, FilterStack,
+            IDE_KNOWN_FILTERS,
         },
     },
     editions::{Edition, FeatureGate, Flavor, check_feature_or_error, feature_edition_error_msg},
@@ -73,6 +73,24 @@ pub use move_core_types::parsing::parser::{
     NumberFormat, parse_address_number as parse_address, parse_u8, parse_u16, parse_u32, parse_u64,
     parse_u128, parse_u256,
 };
+
+//**************************************************************************************************
+// Spec Deprecation
+//**************************************************************************************************
+
+pub fn spec_deprecated_diag(loc: Loc, is_error: bool) -> Diagnostic {
+    diag!(
+        if is_error {
+            Uncategorized::DeprecatedSpecItem
+        } else {
+            Uncategorized::DeprecatedWillBeRemoved
+        },
+        (
+            loc,
+            "Specification blocks are deprecated and are no longer used"
+        )
+    )
+}
 
 //**************************************************************************************************
 // Address
@@ -220,15 +238,14 @@ pub struct PackagePaths<Path: Into<Symbol> = Symbol, NamedAddress: Into<Symbol> 
 pub struct CompilationEnv {
     flags: Flags,
     modes: BTreeSet<Symbol>,
-    top_level_warning_filter_scope: Option<&'static WarningFiltersBuilder>,
+    root_scope: FilterScope,
     diags: Arc<RwLock<Diagnostics>>,
     visitors: Visitors,
     package_configs: BTreeMap<Symbol, PackageConfig>,
     /// Config for any package not found in `package_configs`, or for inputs without a package.
     default_config: PackageConfig,
-    /// Maps warning filter key (filter name and filter attribute name) to the filter itself.
-    known_filters: BTreeMap<FilterPrefix, BTreeMap<FilterName, BTreeSet<WarningFilter>>>,
-    /// Maps a diagnostics ID to a known filter name.
+    known_filters: BTreeMap<FilterPrefix, BTreeMap<FilterName, Vec<DiagnosticsID>>>,
+    /// Maps a diagnostics ID to a known filter name (for "add #[allow(...)]" hints).
     known_filter_names: BTreeMap<DiagnosticsID, (FilterPrefix, FilterName)>,
     prim_definers: OnceLock<BTreeMap<N::BuiltinTypeName_, E::ModuleIdent>>,
     // TODO(tzakian): Remove the global counter and use this counter instead
@@ -245,7 +262,7 @@ impl CompilationEnv {
         flags: Flags,
         mut visitors: Vec<cli::compiler::Visitor>,
         save_hooks: Vec<SaveHook>,
-        warning_filters: Option<WarningFiltersBuilder>,
+        root_scope: Option<FilterScope>,
         package_configs: BTreeMap<Symbol, PackageConfig>,
         default_config: Option<PackageConfig>,
         files_to_compile: Option<BTreeSet<PathBuf>>,
@@ -254,27 +271,34 @@ impl CompilationEnv {
             sui_mode::id_leak::IDLeakVerifier.visitor(),
             sui_mode::typing::SuiTypeChecks.visitor(),
         ]);
-        let mut known_filters_: BTreeMap<FilterName, BTreeSet<WarningFilter>> =
-            WarningFilter::compiler_known_filters();
-        if flags.ide_mode() {
-            known_filters_.extend(WarningFilter::ide_known_filters());
+
+        let mut known_filters_: BTreeMap<FilterName, Vec<DiagnosticsID>> = BTreeMap::new();
+        for (name, expansion) in COMPILER_KNOWN_FILTERS.iter() {
+            known_filters_
+                .entry(Symbol::from(*name))
+                .or_default()
+                .extend_from_slice(expansion);
         }
-        let known_filters: BTreeMap<FilterPrefix, BTreeMap<FilterName, BTreeSet<WarningFilter>>> =
+        if flags.ide_mode() {
+            for (name, expansion) in IDE_KNOWN_FILTERS.iter() {
+                known_filters_
+                    .entry(Symbol::from(*name))
+                    .or_default()
+                    .extend_from_slice(expansion);
+            }
+        }
+        let known_filters: BTreeMap<FilterPrefix, BTreeMap<FilterName, Vec<DiagnosticsID>>> =
             BTreeMap::from([(None, known_filters_)]);
 
         let known_filter_names: BTreeMap<DiagnosticsID, (FilterPrefix, FilterName)> = known_filters
             .iter()
             .flat_map(|(attr, all_filters)| {
                 all_filters.iter().flat_map(|(name, filters)| {
-                    filters.iter().filter_map(|v| {
-                        if let WarningFilter::Code {
-                            prefix,
-                            category,
-                            code,
-                            ..
-                        } = v
+                    filters.iter().filter_map(|f| {
+                        if f.category != DIAGNOSTIC_FILTER_WILDCARD
+                            && f.code != DIAGNOSTIC_FILTER_WILDCARD
                         {
-                            Some(((*prefix, *category, *code), (*attr, *name)))
+                            Some((*f, (*attr, *name)))
                         } else {
                             None
                         }
@@ -283,18 +307,12 @@ impl CompilationEnv {
             })
             .collect();
 
-        let top_level_warning_filter_opt = if flags.silence_warnings() {
-            let mut f = WarningFiltersBuilder::new_for_source();
-            f.add(WarningFilter::All(None));
-            Some(f)
+        let root_scope = if flags.silence_warnings() {
+            filter::all_filter_scope()
         } else {
-            warning_filters
+            root_scope.unwrap_or_else(filter::empty_filter_scope)
         };
-        let top_level_warning_filter_scope: Option<&'static WarningFiltersBuilder> =
-            top_level_warning_filter_opt.map(|f| {
-                let f: &'static WarningFiltersBuilder = Box::leak(Box::new(f));
-                f
-            });
+
         let mut diags = Diagnostics::new();
         if flags.json_errors() {
             diags.set_format(DiagnosticsFormat::JSON);
@@ -305,7 +323,7 @@ impl CompilationEnv {
         Self {
             flags,
             modes,
-            top_level_warning_filter_scope,
+            root_scope,
             diags: Arc::new(RwLock::new(diags)),
             visitors: Visitors::new(visitors),
             package_configs,
@@ -351,21 +369,31 @@ impl CompilationEnv {
         &self.mapped_files
     }
 
-    pub fn diagnostic_reporter_at_top_level(&self) -> DiagnosticReporter {
+    pub fn diagnostic_reporter_at_top_level(&self) -> DiagnosticReporter<'_> {
         DiagnosticReporter::new(
             &self.flags,
             &self.known_filter_names,
             Arc::clone(&self.diags),
             Arc::clone(&self.ide_information),
-            WarningFiltersScope::root(self.top_level_warning_filter_scope),
+            FilterStack::root(self.root_scope.clone()),
         )
     }
 
-    pub fn dummy_diagnostic_reporter(&self) -> DiagnosticReporter {
+    pub fn dummy_diagnostic_reporter(&self) -> DiagnosticReporter<'_> {
         DiagnosticReporter::dummy_reporter(
             &self.flags,
             &self.known_filter_names,
-            WarningFiltersScope::root(self.top_level_warning_filter_scope),
+            FilterStack::root(self.root_scope.clone()),
+        )
+    }
+
+    pub fn ide_diagnostic_reporter(&self) -> DiagnosticReporter<'_> {
+        DiagnosticReporter::new(
+            &self.flags,
+            &self.known_filter_names,
+            Arc::new(RwLock::new(Diagnostics::new())),
+            Arc::clone(&self.ide_information),
+            FilterStack::root(self.root_scope.clone()),
         )
     }
 
@@ -426,7 +454,7 @@ impl CompilationEnv {
         &self,
         prefix: Option<impl Into<Symbol>>,
         name: impl Into<Symbol>,
-    ) -> BTreeSet<WarningFilter> {
+    ) -> Vec<DiagnosticsID> {
         self.known_filters
             .get(&prefix.map(|p| p.into()))
             .and_then(|filters| filters.get(&name.into()).cloned())
@@ -436,41 +464,21 @@ impl CompilationEnv {
     pub fn add_custom_known_filters(
         &mut self,
         attr_name: FilterPrefix,
-        filters: Vec<WarningFilter>,
-    ) -> anyhow::Result<()> {
+        filters: Vec<(FilterName, Vec<DiagnosticsID>)>,
+    ) {
         let filter_attr = self.known_filters.entry(attr_name).or_default();
-        for filter in filters {
-            let (prefix, n) = match filter {
-                WarningFilter::All(prefix) => (prefix, Symbol::from(FILTER_ALL)),
-                WarningFilter::Category { name, prefix, .. } => {
-                    let Some(n) = name else {
-                        anyhow::bail!("A known Category warning filter must have a name specified");
-                    };
-                    (prefix, Symbol::from(n))
+        for (name, ids) in filters {
+            let existing = filter_attr.entry(name).or_default();
+            for f in ids {
+                if f.category != DIAGNOSTIC_FILTER_WILDCARD && f.code != DIAGNOSTIC_FILTER_WILDCARD
+                {
+                    self.known_filter_names.insert(f, (attr_name, name));
                 }
-                WarningFilter::Code {
-                    prefix,
-                    category,
-                    code,
-                    name,
-                } => {
-                    let Some(n) = name else {
-                        anyhow::bail!("A known Code warning filter must have a name specified");
-                    };
-                    let n = Symbol::from(n);
-                    self.known_filter_names
-                        .insert((prefix, category, code), (attr_name, n));
-                    (prefix, n)
+                if !existing.contains(&f) {
+                    existing.push(f);
                 }
-            };
-            anyhow::ensure!(
-                attr_name.is_some() == prefix.is_some(),
-                "If the attribute name is specified, e.g. Some(_), the external prefix must also \
-                be specified. attribute name: {attr_name:?}, external prefix: {prefix:?}",
-            );
-            filter_attr.entry(n).or_default().insert(filter);
+            }
         }
-        Ok(())
     }
 
     pub fn visitors(&self) -> &Visitors {
@@ -603,6 +611,14 @@ impl CompilationEnv {
         self.modes().contains(&ModeAttribute::IDE.into())
     }
 
+    pub fn ide_test_mode(&self) -> bool {
+        debug_assert_eq!(
+            self.flags.ide_test_mode(),
+            self.modes().contains(&ModeAttribute::IDE_TEST.into())
+        );
+        self.modes().contains(&ModeAttribute::IDE_TEST.into())
+    }
+
     pub fn keep_testing_functions(&self) -> bool {
         self.flags.keep_testing_functions()
     }
@@ -729,7 +745,7 @@ pub struct Flags {
     ide_mode: bool,
 
     /// Arbitrary mode -- this will be used to enable or filter user-defined `#[mode(<MODE>)]`
-    /// annodations during compiltaion.
+    /// annotations during compilation.
     #[arg(
         long = "mode",
         value_name = "MODE",
@@ -820,7 +836,7 @@ impl Flags {
     }
 
     pub fn set_modes(self, value: Vec<Symbol>) -> Self {
-        let test = self.test || value.iter().any(|mode| *mode == symbol!("test"));
+        let test = self.test || value.contains(&symbol!("test"));
         Self {
             test,
             modes: value,
@@ -869,7 +885,7 @@ impl Flags {
     }
 
     pub fn mode(&self, mode: Symbol) -> bool {
-        self.modes.iter().any(|m| *m == mode)
+        self.modes.contains(&mode)
     }
 
     pub fn publishable(&self) -> bool {
@@ -886,10 +902,10 @@ fn parse_symbol(s: &str) -> Result<Symbol, String> {
 // Package Level Config
 //**************************************************************************************************
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageConfig {
     pub is_dependency: bool,
-    pub warning_filter: WarningFiltersBuilder,
+    pub warning_filter: FilterScope,
     pub flavor: Flavor,
     pub edition: Edition,
 }
@@ -898,7 +914,7 @@ impl Default for PackageConfig {
     fn default() -> Self {
         Self {
             is_dependency: false,
-            warning_filter: WarningFiltersBuilder::new_for_source(),
+            warning_filter: filter::empty_filter_scope(),
             flavor: Flavor::default(),
             edition: Edition::default(),
         }
@@ -941,8 +957,8 @@ fn check<T: Send + Sync>() {}
 fn check_all() {
     check::<Visitors>();
     check::<&Visitors>();
-    check::<&WarningFiltersTable>();
-    check::<&WarningFiltersScope>();
+    check::<&FilterStack>();
+    check::<&FilterScope>();
     check::<&CompilationEnv>();
 }
 
@@ -1155,11 +1171,11 @@ impl SaveHook {
 ///
 /// * `$e` - The initial expression to start processing.
 /// * `$work_pat` - The pattern used to disassemble entries in the work queue. Note that the work
-///    queue may contain any arbitrary type (such as a tuple of a block and expression), so the
-///    work pattern is used to disassemble and bind component parts.
+///   queue may contain any arbitrary type (such as a tuple of a block and expression), so the
+///   work pattern is used to disassemble and bind component parts.
 /// * `$work_exp` - The actual expression to match on, as defined in the `$work_pat`.
 /// * `$binop_pat` - This is a pattern matched against the `$work_exp` that matches if and only if
-///    the `$work_exp` is in fact a binary operation expression.
+///   the `$work_exp` is in fact a binary operation expression.
 /// * `$bind_rhs` - This block is executed when `$work_exp` matches `$binop_pat`, with any pattern
 ///   binders from `$binop_pat` in scope. This block must return a 3-tuple consisting of the
 ///   left-hand side work queue entry, the `$optype` entry for the operand, and the right-hand side
@@ -1274,3 +1290,89 @@ impl IndexedPhysicalPackagePath {
         })
     }
 }
+
+//**************************************************************************************************
+// Levenshtein Candidate Suggestions
+//**************************************************************************************************
+
+const MAX_EDIT_DISTANCE: usize = 3;
+
+/// Computes the Levenshtein distance between two strings, but stops and returns None if the
+/// distance exceeds the given threshold.
+fn levenshtein_distance_with_threshold(a: &str, b: &str, threshold: usize) -> Option<usize> {
+    if a.len() > b.len() + threshold || b.len() > a.len() + threshold {
+        return None;
+    }
+
+    let mut cost = 0;
+    let mut a = a.chars();
+    let mut b = b.chars();
+    while let (Some(a_head), Some(b_head)) = (a.next(), b.next()) {
+        if a_head != b_head {
+            cost += 1;
+            if cost > threshold {
+                return None;
+            }
+        }
+    }
+    cost = cost + a.count() + b.count();
+    if cost > threshold { None } else { Some(cost) }
+}
+
+/// Suggests a candidate from the given candidates based on Levenshtein distance to the given name.
+/// The `to_string` function is used to convert each candidate to a string for comparison.
+/// Uses MAX_EDIT_DISTANCE as the threshold for suggestions, meaning that only candidates within
+/// that distance will be returned.
+pub(crate) fn suggest_levenshtein_candidate<F>(
+    candidates: impl IntoIterator<Item = F>,
+    name_str: &str,
+    to_string: impl Fn(&F) -> &str,
+) -> Option<F> {
+    let mut cur_candidate = None;
+    for candidate in candidates {
+        let candidate_str = to_string(&candidate);
+        if let Some(dist) =
+            levenshtein_distance_with_threshold(name_str, candidate_str, MAX_EDIT_DISTANCE)
+        {
+            if let Some((best_dist, _)) = &cur_candidate {
+                if dist < *best_dist {
+                    cur_candidate = Some((dist, candidate));
+                }
+            } else {
+                cur_candidate = Some((dist, candidate));
+            }
+        }
+    }
+    cur_candidate.map(|(_, candidate)| candidate)
+}
+
+/// Adds a suggestion to the given diagnostic at the given location, with an optional definition
+/// location.
+/// # Arguments
+/// * `diag` - The diagnostic to add the suggestion to.
+/// * `loc` - The location to add the suggestion at.
+/// * `suggestion` - The name of the suggestion to add.
+/// * `defn_loc` - An optional location of the definition of the suggested item, which will be
+///   indicated in the diagnostic if provided.
+pub(crate) fn add_suggestion(
+    diag: &mut Diagnostic,
+    loc: Loc,
+    suggestion: impl fmt::Display,
+    defn_loc: Option<Loc>,
+) {
+    let msg = format!("Did you mean: '{suggestion}'");
+    diag.add_secondary_label((loc, msg));
+    if let Some(loc) = defn_loc {
+        diag.add_secondary_label((loc, "Similarly named defintion found here"));
+    }
+}
+
+pub(crate) const UPPERCASE_LETTERS: [char; 26] = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+    'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+];
+
+pub(crate) const LOWERCASE_LETTERS: [char; 26] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z',
+];

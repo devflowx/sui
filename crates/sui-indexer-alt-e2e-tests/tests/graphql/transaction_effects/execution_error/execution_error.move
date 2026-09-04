@@ -1,9 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//# init --protocol-version 70 --accounts A B --addresses test=0x0 --simulator
+//# init --protocol-version 108 --accounts A B --addresses test=0x0 --simulator
 
 //# publish
+#[allow(always_errors)]
 module test::execution_error_tests {
     // Different types of clever errors
     #[error]
@@ -77,7 +78,7 @@ module test::execution_error_tests {
     // MovePrimitiveRuntimeError test functions
     public entry fun arithmetic_underflow() {
         // Direct arithmetic error
-        0 - 1;
+        0 - 1u64;
     }
 
     public entry fun arithmetic_overflow() {
@@ -87,12 +88,12 @@ module test::execution_error_tests {
 
     public entry fun division_by_zero() {
         // Direct division by zero
-        1 / 0;
+        1 / 0u64;
     }
 
     public entry fun vector_out_of_bounds() {
         // Direct vector access
-        std::vector::borrow(&vector[0], 1);
+        std::vector::borrow(&vector[0u64], 1);
     }
 }
 
@@ -175,7 +176,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   abort255: transactionEffects(digest: "@{digest_4}") {
     executionError {
       abortCode
@@ -217,7 +218,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   cleverU16: transactionEffects(digest: "@{digest_6}") {
     executionError {
       abortCode
@@ -236,7 +237,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   cleverU64: transactionEffects(digest: "@{digest_7}") {
     executionError {
       abortCode
@@ -255,7 +256,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   cleverAddress: transactionEffects(digest: "@{digest_8}") {
     executionError {
       abortCode
@@ -274,7 +275,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   cleverString: transactionEffects(digest: "@{digest_9}") {
     executionError {
       abortCode
@@ -293,7 +294,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   cleverWithCode: transactionEffects(digest: "@{digest_10}") {
     executionError {
       abortCode
@@ -331,7 +332,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   assertFailure: transactionEffects(digest: "@{digest_12}") {
     executionError {
       abortCode
@@ -392,7 +393,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   arithmeticOverflow: transactionEffects(digest: "@{digest_15}") {
     executionError {
       abortCode
@@ -411,7 +412,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   divisionByZero: transactionEffects(digest: "@{digest_16}") {
     executionError {
       abortCode
@@ -430,7 +431,7 @@ module test::execution_error_tests {
       }
     }
   }
-  
+
   vectorOutOfBounds: transactionEffects(digest: "@{digest_17}") {
     executionError {
       abortCode

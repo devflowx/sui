@@ -5,7 +5,7 @@ info:
   edition: 2024.alpha
   lint: false
 ---
-error[E04007]: incompatible types
+error[EC04007]: incompatible types
    ┌─ tests/move_2024/matching/abc_match_ref_invalid.move:10:21
    │  
 10 │           match (abc) {
@@ -13,7 +13,7 @@ error[E04007]: incompatible types
 11 │ │             ABC::C(x) => x,
 12 │ │             ABC::A(x) => x,
    │ │                    - Found: '&u64'. It is not compatible with the other type.
-13 │ │             ABC::B => 1,
-   │ │                       - Found: integer. It is not compatible with the other type.
+13 │ │             ABC::B => 1u64,
+   │ │                       ---- Found: 'u64'. It is not compatible with the other type.
 14 │ │         }
    │ ╰─────────^ invalid match arm

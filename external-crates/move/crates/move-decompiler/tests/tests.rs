@@ -4,16 +4,13 @@
 use move_decompiler::{generate_from_model, testing::structuring_unit_test};
 
 use move_command_line_common::insta_assert;
-use move_package::{BuildConfig, compilation::model_builder};
+use move_package_alt::{RootPackage, Vanilla};
+use move_package_alt_compilation::{build_config::BuildConfig, model_builder};
 use move_symbol_pool::Symbol;
 
 use tempfile::TempDir;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::BufRead,
-    path::Path,
-};
+use std::{collections::BTreeSet, io::BufRead, path::Path};
 
 // -------------------------------------------------------------------------------------------------
 // Structuring Unit Tests
@@ -38,17 +35,19 @@ fn run_move_test(file_path: &Path) -> datatest_stable::Result<()> {
     let output_dir = TempDir::new()?;
 
     let config = BuildConfig {
-        dev_mode: true,
         install_dir: Some(output_dir.path().to_path_buf()),
         force_recompilation: false,
         ..Default::default()
     };
 
     let mut writer = Vec::new();
-    let resolved_package = config.resolution_graph_for_package(pkg_dir, None, &mut writer)?;
-    let model = model_builder::build(resolved_package, &mut writer)?;
+    let root_pkg: RootPackage<Vanilla> = config
+        .package_loader(pkg_dir, &Vanilla::default_environment(), Vanilla::new())
+        .load_sync()?;
 
-    let bytecode = move_stackless_bytecode_2::from_model(&model, /* optimize */ true)?;
+    let model = model_builder::build(&mut writer, &root_pkg, &config)?;
+
+    let bytecode = move_stackless_bytecode_2::from_model(&model, /* optimize */ false)?;
 
     let test_module_names = std::io::BufReader::new(std::fs::File::open(file_path)?)
         .lines()
@@ -62,11 +61,13 @@ fn run_move_test(file_path: &Path) -> datatest_stable::Result<()> {
 
     for pkg in &bytecode.packages {
         // let pkg_name = pkg.name;
+        let resolved_pkg = model.package(&pkg.address);
         for (module_name, m) in &pkg.modules {
             if test_module_names.contains(module_name) {
                 // FIXME pkg name not coherent, address name returned instead
                 let name = format!("{}", module_name);
-                let module = move_decompiler::translate::module(&config, m.clone());
+                let resolved = resolved_pkg.module(*module_name);
+                let module = move_decompiler::translate::module(&config, resolved, m.clone());
                 let decompiled = format!("{}", module);
                 insta_assert! {
                     input_path: file_path,
@@ -86,17 +87,20 @@ fn run_full_test(file_path: &Path) -> datatest_stable::Result<()> {
     let output_dir = TempDir::new()?;
 
     let config = BuildConfig {
-        dev_mode: true,
         install_dir: Some(output_dir.path().to_path_buf()),
         force_recompilation: false,
-        implicit_dependencies: BTreeMap::new(),
         ..Default::default()
     };
 
     let mut writer = Vec::new();
-    let resolved_package = config.resolution_graph_for_package(pkg_dir, None, &mut writer)?;
-    let root_pkg = resolved_package.root_package();
-    let model = model_builder::build(resolved_package, &mut writer)?;
+    let env = Vanilla::default_environment();
+    let loaded_root_pkg: RootPackage<Vanilla> = config
+        .package_loader(pkg_dir, &env, Vanilla::new())
+        .load_sync()?;
+    let root_pkg_info = loaded_root_pkg.package_info();
+    let root_pkg = root_pkg_info.display_name();
+
+    let model = model_builder::build(&mut writer, &loaded_root_pkg, &config)?;
 
     let output_path = output_dir.path().join("output");
 
@@ -123,6 +127,24 @@ fn run_full_test(file_path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
+fn run_bytecode_test(file_path: &Path) -> datatest_stable::Result<()> {
+    let input = vec![file_path.into()];
+    let output = Path::new("tests/bytecode/output");
+    // invoke decompiler
+    let paths = move_decompiler::generate_from_files(&input, output)?;
+    let [path] = paths.as_slice() else {
+        panic!("Expected exactly one output file, got: {:#?}", paths);
+    };
+    let name = file_path.file_name().unwrap().to_str().unwrap();
+    let decompiled = std::fs::read_to_string(path)?;
+    insta_assert! {
+        input_path: file_path,
+        contents: decompiled,
+        name: format!("{}", name),
+    };
+    Ok(())
+}
+
 // Hand in each move path
 datatest_stable::harness!(
     run_move_test,
@@ -134,4 +156,7 @@ datatest_stable::harness!(
     run_structuring_test,
     "tests/structuring",
     r"\.stt$",
+    run_bytecode_test,
+    "tests/bytecode",
+    r"\.mv$"
 );

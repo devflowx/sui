@@ -13,6 +13,7 @@ use std::sync::Arc;
 use consensus_config::{AuthorityIndex, Committee};
 use consensus_types::block::Round;
 use itertools::Itertools;
+use mysten_common::ZipDebugEqIteratorExt;
 use tracing::{debug, trace};
 
 use crate::{
@@ -37,33 +38,57 @@ use crate::{
 ///   immediately by a quorum.
 pub(crate) type QuorumRound = (Round, Round);
 
-pub(crate) struct PeerRoundTracker {
+pub(crate) struct RoundTracker {
     context: Arc<Context>,
+
+    /// -------- Peer round tracking --------
     /// Highest accepted round per authority from received blocks (included/excluded ancestors)
     block_accepted_rounds: Vec<Vec<Round>>,
     /// Highest accepted round per authority from round prober
     probed_accepted_rounds: Vec<Vec<Round>>,
     /// Highest received round per authority from round prober
     probed_received_rounds: Vec<Vec<Round>>,
+
+    /// -------- Own round tracking --------
+    /// Highest received round per authority tracked locally.
+    /// Updated after blocks are received and verified.
+    local_highest_received_rounds: Vec<Round>,
 }
 
-impl PeerRoundTracker {
-    pub(crate) fn new(context: Arc<Context>) -> Self {
+impl RoundTracker {
+    pub(crate) fn new(context: Arc<Context>, initial_received_rounds: Vec<Round>) -> Self {
         let size = context.committee.size();
+        let local_highest_received_rounds = if initial_received_rounds.is_empty() {
+            vec![0; size]
+        } else {
+            assert_eq!(
+                initial_received_rounds.len(),
+                size,
+                "initial_received_rounds must be empty or have the same size as the committee"
+            );
+            initial_received_rounds
+        };
         Self {
             context,
             block_accepted_rounds: vec![vec![0; size]; size],
             probed_accepted_rounds: vec![vec![0; size]; size],
             probed_received_rounds: vec![vec![0; size]; size],
+            local_highest_received_rounds,
         }
     }
 
     /// Update accepted rounds based on a new block created locally or received from the network
-    /// and its excluded ancestors
-    pub(crate) fn update_from_accepted_block(&mut self, extended_block: &ExtendedBlock) {
+    /// and its excluded ancestors.
+    /// Assumes the block and the excluded ancestors have been verified for validity.
+    /// Also updates the highest received round for the block's author.
+    pub(crate) fn update_from_verified_block(&mut self, extended_block: &ExtendedBlock) {
         let block = &extended_block.block;
         let excluded_ancestors = &extended_block.excluded_ancestors;
         let author = block.author();
+
+        // Update highest received round for this author
+        self.local_highest_received_rounds[author] =
+            self.local_highest_received_rounds[author].max(block.round());
 
         // Update author accepted round from block round
         self.block_accepted_rounds[author][author] =
@@ -93,6 +118,11 @@ impl PeerRoundTracker {
         self.probed_received_rounds = received_rounds;
     }
 
+    /// Returns the highest received round per authority tracked locally.
+    pub(crate) fn local_highest_received_rounds(&self) -> Vec<Round> {
+        self.local_highest_received_rounds.clone()
+    }
+
     // Returns the propagation delay of own blocks.
     pub(crate) fn calculate_propagation_delay(&self, last_proposed_round: Round) -> Round {
         let own_index = self.context.own_index;
@@ -101,7 +131,7 @@ impl PeerRoundTracker {
         let accepted_quorum_rounds = self.compute_accepted_quorum_rounds();
         for ((low, high), (_, authority)) in received_quorum_rounds
             .iter()
-            .zip(self.context.committee.authorities())
+            .zip_debug_eq(self.context.committee.authorities())
         {
             node_metrics
                 .round_tracker_received_quorum_round_gaps
@@ -120,7 +150,7 @@ impl PeerRoundTracker {
 
         for ((low, high), (_, authority)) in accepted_quorum_rounds
             .iter()
-            .zip(self.context.committee.authorities())
+            .zip_debug_eq(self.context.committee.authorities())
         {
             node_metrics
                 .round_tracker_accepted_quorum_round_gaps
@@ -174,11 +204,11 @@ impl PeerRoundTracker {
         let highest_accepted_rounds = self
             .probed_accepted_rounds
             .iter()
-            .zip(self.block_accepted_rounds.iter())
+            .zip_debug_eq(self.block_accepted_rounds.iter())
             .map(|(probed_rounds, block_rounds)| {
                 probed_rounds
                     .iter()
-                    .zip(block_rounds.iter())
+                    .zip_debug_eq(block_rounds.iter())
                     .map(|(probed_round, block_round)| *probed_round.max(block_round))
                     .collect::<Vec<Round>>()
             })
@@ -197,7 +227,7 @@ impl PeerRoundTracker {
             self.context
                 .committee
                 .authorities()
-                .zip(accepted_quorum_rounds.iter())
+                .zip_debug_eq(accepted_quorum_rounds.iter())
                 .map(|((i, _), rounds)| format!("{i}: {rounds:?}"))
                 .join(", ")
         );
@@ -220,7 +250,7 @@ impl PeerRoundTracker {
             self.context
                 .committee
                 .authorities()
-                .zip(received_quorum_rounds.iter())
+                .zip_debug_eq(received_quorum_rounds.iter())
                 .map(|((i, _), rounds)| format!("{i}: {rounds:?}"))
                 .join(", ")
         );
@@ -237,7 +267,7 @@ fn compute_quorum_round(
 ) -> QuorumRound {
     let mut rounds_with_stake = highest_rounds
         .iter()
-        .zip(committee.authorities())
+        .zip_debug_eq(committee.authorities())
         .map(|(rounds, (_, authority))| (rounds[target_index], authority.stake))
         .collect::<Vec<_>>();
     rounds_with_stake.sort();
@@ -276,10 +306,10 @@ mod test {
     use consensus_types::block::{BlockDigest, BlockRef};
 
     use crate::{
+        TestBlock, VerifiedBlock,
         block::ExtendedBlock,
         context::Context,
-        round_tracker::{compute_quorum_round, PeerRoundTracker},
-        TestBlock, VerifiedBlock,
+        round_tracker::{RoundTracker, compute_quorum_round},
     };
 
     #[tokio::test]
@@ -328,7 +358,7 @@ mod test {
         telemetry_subscribers::init_for_testing();
         let (context, _) = Context::new_for_test(4);
         let context = Arc::new(context);
-        let mut round_tracker = PeerRoundTracker::new(context);
+        let mut round_tracker = RoundTracker::new(context.clone(), vec![]);
 
         // Observe latest rounds from peers.
         let highest_received_rounds = vec![
@@ -353,7 +383,7 @@ mod test {
         let (context, _) = Context::new_for_test(NUM_AUTHORITIES);
         let context = Arc::new(context);
         let own_index = context.own_index.value() as u32;
-        let mut round_tracker = PeerRoundTracker::new(context);
+        let mut round_tracker = RoundTracker::new(context.clone(), vec![]);
 
         // Observe latest rounds from peers.
         let highest_accepted_rounds = vec![
@@ -374,7 +404,7 @@ mod test {
             )])
             .build();
         let block = VerifiedBlock::new_for_test(test_block);
-        round_tracker.update_from_accepted_block(&ExtendedBlock {
+        round_tracker.update_from_verified_block(&ExtendedBlock {
             block,
             excluded_ancestors: vec![BlockRef::new(
                 8,
@@ -393,7 +423,7 @@ mod test {
             ])
             .build();
         let block = VerifiedBlock::new_for_test(test_block);
-        round_tracker.update_from_accepted_block(&ExtendedBlock {
+        round_tracker.update_from_verified_block(&ExtendedBlock {
             block,
             excluded_ancestors: vec![BlockRef::new(
                 8,
@@ -440,7 +470,7 @@ mod test {
             vec![0, 0, 0, 0, 0, 0, 0],
         ];
 
-        let mut round_tracker = PeerRoundTracker::new(context.clone());
+        let mut round_tracker = RoundTracker::new(context.clone(), vec![]);
 
         round_tracker.update_from_probe(highest_accepted_rounds, highest_received_rounds);
 
@@ -449,7 +479,7 @@ mod test {
             let round = 110 + (authority as u32 * 10);
             let block =
                 VerifiedBlock::new_for_test(TestBlock::new(round, authority as u32).build());
-            round_tracker.update_from_accepted_block(&ExtendedBlock {
+            round_tracker.update_from_verified_block(&ExtendedBlock {
                 block,
                 excluded_ancestors: vec![],
             });

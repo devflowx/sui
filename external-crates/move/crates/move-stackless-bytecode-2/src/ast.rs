@@ -3,8 +3,10 @@
 
 use crate::utils::comma_separated;
 
-use move_binary_format::normalized::{Constant, FieldRef, ModuleId, StructRef, Type, VariantRef};
-use move_core_types::account_address::AccountAddress;
+use move_binary_format::normalized::{
+    Constant, FieldRef, ModuleId, Signature, StructRef, Type, VariantRef,
+};
+use move_core_types::{account_address::AccountAddress, runtime_value::MoveValue};
 use move_symbol_pool::Symbol;
 
 use std::{collections::BTreeMap, rc::Rc, vec};
@@ -76,7 +78,7 @@ pub enum Instruction {
 #[derive(Debug, Clone)]
 pub enum Trivial {
     Register(Register),
-    Immediate(Value),
+    Immediate(MoveValue),
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,7 @@ pub struct Register {
 pub enum RValue {
     Call {
         target: (ModuleId<Symbol>, Symbol),
+        type_arguments: Signature<Symbol>,
         args: Vec<Trivial>,
     },
     Primitive {
@@ -170,21 +173,6 @@ pub enum DataOp {
     UnpackVariant(Box<VariantRef<Symbol>>),
     UnpackVariantImmRef(Box<VariantRef<Symbol>>),
     UnpackVariantMutRef(Box<VariantRef<Symbol>>),
-}
-
-#[derive(Debug, Clone)]
-pub enum Value {
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    U128(u128),
-    U256(move_core_types::u256::U256), // Representing as two u128s for simplicity
-    Bool(bool),
-    Address(AccountAddress),
-    Empty, // empty added for the pop
-    NotImplemented(String),
-    Vector(Vec<Value>), // Added to represent vector values
 }
 
 pub type Label = usize;
@@ -327,24 +315,6 @@ impl std::fmt::Display for Register {
     }
 }
 
-impl std::fmt::Display for Value {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::U8(n) => write!(f, "U8({n})"),
-            Value::U16(n) => write!(f, "U16({n})"),
-            Value::U32(n) => write!(f, "U32({n})"),
-            Value::U64(n) => write!(f, "U64({n})"),
-            Value::U128(n) => write!(f, "U128({n})"),
-            Value::U256(n) => write!(f, "U256({n})"),
-            Value::Bool(bool) => write!(f, "{bool}"),
-            Value::Empty => write!(f, "Empty"),
-            Value::Address(addr) => write!(f, "Address({})", addr.to_canonical_string(true)),
-            Value::NotImplemented(msg) => write!(f, "NotImplemented({})", msg),
-            Value::Vector(vec) => write!(f, "Vector[{}]", comma_separated(vec)),
-        }
-    }
-}
-
 impl std::fmt::Display for LocalOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -358,8 +328,16 @@ impl std::fmt::Display for LocalOp {
 impl std::fmt::Display for RValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RValue::Call { target, args } => {
-                write!(f, "Call {}::{}(", target.0, target.1)?;
+            RValue::Call {
+                target,
+                type_arguments,
+                args,
+            } => {
+                write!(f, "Call {}::{}", target.0, target.1)?;
+                if !type_arguments.is_empty() {
+                    write!(f, "<{}>", comma_separated(type_arguments))?;
+                }
+                write!(f, "(")?;
                 write!(f, "{}", comma_separated(args))?;
                 write!(f, ")")
             }
@@ -414,7 +392,7 @@ impl std::fmt::Display for DataOp {
                 write!(f, "VecPopBack<{}>", rc_type)
             }
             DataOp::VecUnpack(rc_type) => {
-                write!(f, "VecUnpack<{}>", rc_type)
+                write!(f, "VecUnpack<{rc_type}>")
             }
             DataOp::VecSwap(rc_type) => {
                 write!(f, "VecSwap<{}>", rc_type)

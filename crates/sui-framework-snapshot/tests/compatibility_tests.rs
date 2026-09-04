@@ -2,16 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod compatibility_tests {
-    use move_package::source_package::{
-        manifest_parser::parse_move_manifest_from_file, parsed_manifest::SourceManifest,
-    };
+    use move_package_alt::PackageLoader;
     use std::collections::BTreeMap;
     use std::path::Path;
-    use sui_framework::{compare_system_package, BuiltInFramework};
+    use sui_framework::{BuiltInFramework, compare_system_package};
     use sui_framework_snapshot::{load_bytecode_snapshot, load_bytecode_snapshot_manifest};
-    use sui_move_build::published_at_property;
+    use sui_package_alt::{SuiFlavor, testnet_environment};
     use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
-    use sui_types::execution_config_utils::to_binary_config;
 
     /// The number of bytecode snapshots to backtest against the current framework.
     /// This should be set to a reasonable number to ensure that we are testing against any
@@ -30,7 +27,7 @@ mod compatibility_tests {
         {
             let config =
                 ProtocolConfig::get_for_version(ProtocolVersion::new(*version), Chain::Unknown);
-            let binary_config = to_binary_config(&config);
+            let binary_config = config.binary_config(None);
             let framework = load_bytecode_snapshot(*version).unwrap();
             let old_framework_store: BTreeMap<_, _> = framework
                 .into_iter()
@@ -75,10 +72,9 @@ mod compatibility_tests {
             .map(|p| (&p.id, p))
             .collect();
         assert_eq!(
-                latest_snapshot_ref,
-                current_framework,
-                "The current framework differs the latest bytecode snapshot. Did you forget to upgrade protocol version?"
-            );
+            latest_snapshot_ref, current_framework,
+            "The current framework differs the latest bytecode snapshot. Did you forget to upgrade protocol version?"
+        );
     }
 
     /// This test checks that the `SinglePackage` entries in `manifest.json` match the metadata
@@ -88,24 +84,32 @@ mod compatibility_tests {
     /// within the repo; we check the historical metadata against the current repository. If
     /// needed, we could be more precise by first checking out the revision of the package listed
     /// in the manifest (this should actually be fairly cheap since the git history is present).
-    #[test]
-    fn check_manifest_against_tomls() {
+    #[tokio::test]
+    async fn check_manifest_against_tomls() {
         let manifest = load_bytecode_snapshot_manifest();
         for entry in manifest.values() {
             for package in entry.packages.iter() {
                 // parse package.path/Move.toml
-                let toml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("..")
+                let package_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
                     .join(&package.path);
-                let package_toml: SourceManifest =
-                    parse_move_manifest_from_file(&toml_path).expect("Move.toml exists");
-                // check manifest name field is package.name
-                assert_eq!(package_toml.package.name.to_string(), package.name);
-                // check manifest published-at field is package.id
-                let published_at_field = published_at_property(&package_toml)
-                    .expect("Move.toml file has published-at field");
-                assert_eq!(published_at_field, package.id);
+
+                let root_pkg =
+                    PackageLoader::new(&package_path, testnet_environment(), SuiFlavor::new())
+                        .load()
+                        .await
+                        .expect("can load system packages");
+
+                assert_eq!(root_pkg.package_info().display_name(), package.name);
+                assert_eq!(
+                    root_pkg
+                        .package_info()
+                        .published()
+                        .expect("system packages are published")
+                        .published_at
+                        .0,
+                    *package.id
+                );
             }
         }
     }

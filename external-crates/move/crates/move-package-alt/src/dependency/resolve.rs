@@ -17,29 +17,31 @@ use itertools::Itertools;
 use jsonrpc::Endpoint;
 use thiserror::Error;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
-    dependency::combine::Combined,
-    package::{EnvironmentID, EnvironmentName},
+    logging::user_info,
+    package::EnvironmentName,
     schema::{
-        EXTERNAL_RESOLVE_ARG, PackageName, ResolveRequest, ResolveResponse, ResolverDependencyInfo,
+        EXTERNAL_RESOLVE_ARG, Environment, PackageName, ResolveRequest, ResolveResponse,
+        ResolverDependencyInfo, ResolverName,
     },
 };
 
-use super::{CombinedDependency, Dependency};
+use super::{CombinedDependency, DependencyContext, combine::Combined};
 
-/// A [Dependency<Resolved>] is like a [Dependency<Combined>] except that it no longer has
-/// externally resolved dependencies
-pub type Resolved = ResolverDependencyInfo;
+/// The dep_info type for the resolved stage.
+pub(super) type Resolved = ResolverDependencyInfo;
 
-pub type ResolverName = String;
 pub type ResolverResult<T> = Result<T, ResolverError>;
 
 /// A [ResolvedDependency] is like a [CombinedDependency] except that it no longer has
-/// externally resolved dependencies
+/// externally resolved or system dependencies, and all on-chain dependencies have addresses.
 #[derive(Debug)]
-pub struct ResolvedDependency(pub(super) Dependency<Resolved>);
+pub(super) struct ResolvedDependency {
+    pub(super) context: DependencyContext,
+    pub(super) dep_info: Resolved,
+}
 
 #[derive(Error, Debug)]
 pub enum ResolverError {
@@ -50,6 +52,11 @@ pub enum ResolverError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "External resolver `{resolver}` not found; ensure that it is installed and on your PATH"
+    )]
+    ResolverNotFound { resolver: ResolverName },
 
     /// This indicates that the resolver was faulty
     #[error("`{resolver}` did not follow the external resolver protocol ({message})")]
@@ -78,20 +85,23 @@ pub enum ResolverError {
 impl ResolvedDependency {
     /// Replace all external dependencies in `deps` with internal dependencies by invoking their
     /// resolvers.
+    ///
+    /// Precondition: there are no `System` dependencies (TODO: this needs better design)
     pub async fn resolve(
-        deps: BTreeMap<PackageName, CombinedDependency>,
-        environment_id: &EnvironmentID,
-    ) -> ResolverResult<BTreeMap<PackageName, ResolvedDependency>> {
+        deps: Vec<CombinedDependency>,
+        env: &Environment,
+    ) -> ResolverResult<Vec<ResolvedDependency>> {
         // iterate over [deps] to collect queries for external resolvers
         let mut requests: BTreeMap<ResolverName, BTreeMap<PackageName, ResolveRequest>> =
             BTreeMap::new();
 
-        for (pkg, dep) in deps.iter() {
-            if let Combined::External(ext) = &dep.0.dep_info {
+        for dep in deps.iter() {
+            if let Combined::External(ext) = &dep.dep_info {
                 requests.entry(ext.resolver.clone()).or_default().insert(
-                    pkg.clone(),
+                    dep.context.name.clone(),
                     ResolveRequest {
-                        env: environment_id.clone(),
+                        env: env.id().clone(),
+                        env_name: env.name().clone(),
                         data: ext.data.clone(),
                     },
                 );
@@ -110,20 +120,27 @@ impl ResolvedDependency {
             .collect();
 
         // build the output
-        let mut result = BTreeMap::new();
-        for (pkg, dep) in deps.into_iter() {
-            let ext = responses.remove(&pkg);
-            result.insert(
-                pkg,
-                ResolvedDependency(dep.0.map(|info| match info {
+        let mut result = Vec::new();
+        for dep in deps.into_iter() {
+            let ext = responses.remove(&dep.context.name);
+            result.push(ResolvedDependency {
+                context: dep.context,
+                dep_info: match dep.dep_info {
                     Combined::Local(loc) => Resolved::Local(loc),
                     Combined::Git(git) => Resolved::Git(git),
-                    Combined::OnChain(onchain) => Resolved::OnChain(onchain),
+                    Combined::OnChainPlaceholder(_) => unreachable!(
+                        "on-chain placeholders (on-chain = true) without addresses \
+                         are rejected during combining"
+                    ),
+                    Combined::OnChain(addr) => Resolved::OnChain(addr),
                     Combined::External(_) => {
                         ext.expect("resolve_single outputs same keys as input")
                     }
-                })),
-            );
+                    Combined::System(_) => panic!(
+                        "invariant violation; all system dependencies should already be transformed"
+                    ),
+                },
+            });
         }
         assert!(responses.is_empty());
 
@@ -133,9 +150,15 @@ impl ResolvedDependency {
 
 impl ResolverError {
     pub fn io_error(resolver: &ResolverName, source: std::io::Error) -> Self {
-        Self::IoError {
-            resolver: resolver.clone(),
-            source,
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Self::ResolverNotFound {
+                resolver: resolver.clone(),
+            }
+        } else {
+            Self::IoError {
+                resolver: resolver.clone(),
+                source,
+            }
         }
     }
 
@@ -193,7 +216,7 @@ async fn call_resolver(
     resolver: ResolverName,
     reqs: Vec<ResolveRequest>,
 ) -> ResolverResult<Vec<ResolveResponse>> {
-    let mut command = Command::new(&resolver);
+    let mut command = Command::new(&resolver.to_string());
     command
         .arg(EXTERNAL_RESOLVE_ARG)
         .stdin(Stdio::piped())
@@ -231,7 +254,7 @@ async fn call_resolver(
 
     // dump standard error
     if !output.stderr.is_empty() {
-        info!(
+        user_info!(
             "Output from {resolver}:\n{}",
             String::from_utf8_lossy(&output.stderr)
                 .lines()

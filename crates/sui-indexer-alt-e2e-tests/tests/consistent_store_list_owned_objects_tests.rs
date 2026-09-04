@@ -1,23 +1,38 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, iter};
+use std::collections::BTreeMap;
+use std::iter;
 
-use move_core_types::{ident_str, u256::U256};
-use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::{
-    consistent_service_client::ConsistentServiceClient, owner::OwnerKind, ListOwnedObjectsRequest,
-    Owner,
-};
-use sui_indexer_alt_e2e_tests::{find, FullCluster};
-use sui_types::{
-    base_types::{FullObjectRef, ObjectRef, SuiAddress},
-    crypto::{get_account_key_pair, Signature, Signer},
-    effects::{TransactionEffects, TransactionEffectsAPI},
-    gas_coin::GasCoin,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{Argument, Command, Transaction, TransactionData},
-    TypeTag, SUI_FRAMEWORK_PACKAGE_ID,
-};
+use move_core_types::ident_str;
+use move_core_types::u256::U256;
+use prometheus::Registry;
+use rand::rngs::OsRng;
+use simulacrum::Simulacrum;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::CHECKPOINT_HEIGHT_METADATA;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::ListOwnedObjectsRequest;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::Owner;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::consistent_service_client::ConsistentServiceClient;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::owner::OwnerKind;
+use sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+use sui_types::TypeTag;
+use sui_types::base_types::FullObjectRef;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::Signature;
+use sui_types::crypto::Signer;
+use sui_types::crypto::get_account_key_pair;
+use sui_types::effects::TransactionEffects;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::gas_coin::GasCoin;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::Argument;
+use sui_types::transaction::Command;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::find;
 
 /// 5 SUI gas budget
 const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
@@ -53,9 +68,10 @@ async fn test_address_owner() {
         });
 
         if let Some(checkpoint) = checkpoint {
-            request
-                .metadata_mut()
-                .insert("x-sui-checkpoint", checkpoint.to_string().parse().unwrap());
+            request.metadata_mut().insert(
+                CHECKPOINT_HEIGHT_METADATA,
+                checkpoint.to_string().parse().unwrap(),
+            );
         }
 
         let response = client.list_owned_objects(request).await?.into_inner();
@@ -183,13 +199,13 @@ async fn test_address_owner() {
     for (i, coin) in coins {
         let fx = transfer_object(&mut cluster, a, &akp, a_gas, coin, c);
         objects.insert((!i, coin.0), find::address_mutated(&fx).unwrap());
-        a_gas = fx.gas_object().0;
+        a_gas = fx.gas_object().unwrap().0;
     }
 
     for bag in bags.into_values() {
         let fx = transfer_object(&mut cluster, b, &bkp, b_gas, bag, c);
         objects.insert((0, bag.0), find::address_mutated(&fx).unwrap());
-        b_gas = fx.gas_object().0;
+        b_gas = fx.gas_object().unwrap().0;
     }
 
     cluster.create_checkpoint().await;
@@ -534,6 +550,117 @@ async fn test_shared_immutable_filters() {
         .await
         .unwrap(),
         (frozen.values().rev().map(repr).collect(), None),
+    );
+}
+
+#[tokio::test]
+async fn test_coin_balance_change_cleanup() {
+    // Bound the protocol version below 28 when Effects v2 was introduced, because this is a
+    // regression test for a behaviour that only existed when indexing V1 transaction effects.
+    //
+    // In effects v1, a modified object would appear without its input state's digest, and a
+    // previous implementation required both the input state's version and digest to treat the
+    // object as modified, rather than created, causing a bug.
+    let mut cluster = FullCluster::new_with_configs(
+        Simulacrum::new_with_protocol_version(OsRng, 27.into()),
+        Default::default(),
+        &Registry::new(),
+    )
+    .await
+    .unwrap();
+
+    let (a, akp) = get_account_key_pair();
+
+    async fn list_owned_objects(
+        cluster: &FullCluster,
+        owner: SuiAddress,
+    ) -> Result<Vec<(String, u64, String)>, tonic::Status> {
+        let mut client =
+            ConsistentServiceClient::connect(cluster.consistent_store_url().to_string())
+                .await
+                .expect("Failed to connect to Consistent Store");
+
+        let response = client
+            .list_owned_objects(ListOwnedObjectsRequest {
+                owner: Some(Owner {
+                    kind: Some(OwnerKind::Address.into()),
+                    address: Some(owner.to_string()),
+                }),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+
+        Ok(response
+            .objects
+            .into_iter()
+            .map(|o| (o.object_id().to_owned(), o.version(), o.digest().to_owned()))
+            .collect())
+    }
+
+    // Create a coin with balance 1000
+    let coin = create_coin(&mut cluster, a, 1000);
+    cluster.create_checkpoint().await;
+
+    // Fund account A so it can make transactions
+    let mut a_gas = find::address_owned(&cluster.request_gas(a, DEFAULT_GAS_BUDGET * 5).unwrap())
+        .expect("Failed to find gas for A");
+    cluster.create_checkpoint().await;
+
+    // A should own the coin and the gas
+    let objects = list_owned_objects(&cluster, a).await.unwrap();
+    assert_eq!(objects.len(), 2, "A should own 2 objects");
+
+    // Merge the coin into gas, changing the gas coin's balance
+    let mut builder = ProgrammableTransactionBuilder::new();
+    builder.transfer_sui(a, Some(500));
+
+    let data = TransactionData::new_programmable(
+        a,
+        vec![a_gas, coin],
+        builder.finish(),
+        DEFAULT_GAS_BUDGET,
+        cluster.reference_gas_price(),
+    );
+
+    let (fx, _) = cluster
+        .execute_transaction(Transaction::from_data_and_signer(data, vec![&akp]))
+        .expect("Failed to execute transaction");
+
+    assert!(fx.status().is_ok(), "Merge transaction failed");
+
+    // Verify we're testing with Effects V1 (the bug only affected V1)
+    assert!(
+        matches!(fx, TransactionEffects::V1(_)),
+        "Test must run with Effects V1 to validate the fix"
+    );
+
+    // Update gas reference
+    a_gas = fx.gas_object().unwrap().0;
+    let new_coin = find::address_owned(&fx).expect("Failed to find new coin");
+
+    cluster.create_checkpoint().await;
+
+    // A should now own updated gas coin, the new smaller coin, but NOT the old versions
+    let objects = list_owned_objects(&cluster, a).await.unwrap();
+    assert_eq!(
+        objects.len(),
+        2,
+        "A should own exactly 2 objects (no duplicates)"
+    );
+
+    // Verify the objects are the new versions
+    let object_ids: Vec<_> = objects
+        .iter()
+        .map(|(id, ver, _)| (id.as_str(), *ver))
+        .collect();
+    assert!(
+        object_ids.contains(&(a_gas.0.to_string().as_str(), a_gas.1.value())),
+        "Should contain new gas coin version"
+    );
+    assert!(
+        object_ids.contains(&(new_coin.0.to_string().as_str(), new_coin.1.value())),
+        "Should contain new coin version"
     );
 }
 

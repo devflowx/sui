@@ -10,11 +10,11 @@ use std::{
 use consensus_config::{AuthorityIndex, Stake};
 use consensus_types::block::Round;
 use parking_lot::RwLock;
-use rand::{prelude::SliceRandom, rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, prelude::SliceRandom, rngs::StdRng};
 
 use crate::{
-    commit::CommitRange, context::Context, dag_state::DagState, leader_scoring::ReputationScores,
-    CommitIndex,
+    CommitIndex, commit::CommitRange, context::Context, dag_state::DagState,
+    leader_scoring::ReputationScores,
 };
 
 /// The `LeaderSchedule` is responsible for producing the leader schedule across
@@ -86,14 +86,6 @@ impl LeaderSchedule {
         self.num_commits_per_schedule
             .checked_sub(subdag_count)
             .unwrap() as usize
-    }
-
-    /// Checks whether the dag state sub dags list is empty. If yes then that means that
-    /// either (1) the system has just started and there is no unscored sub dag available (2) the
-    /// schedule has updated - new scores have been calculated. Both cases we consider as valid cases
-    /// where the schedule has been updated.
-    pub(crate) fn leader_schedule_updated(&self, dag_state: &RwLock<DagState>) -> bool {
-        dag_state.read().is_scoring_subdag_empty()
     }
 
     pub(crate) fn update_leader_schedule_v2(&self, dag_state: &RwLock<DagState>) {
@@ -171,15 +163,13 @@ impl LeaderSchedule {
             .map(|(index, authority)| (index, authority.stake as f32))
             .collect::<Vec<_>>();
 
-        let leader_index = *choices
+        *choices
             .choose_multiple_weighted(&mut rng, self.context.committee.size(), |item| item.1)
             .expect("Weighted choice error: stake values incorrect!")
             .skip(offset as usize)
             .map(|(index, _)| index)
             .next()
-            .unwrap();
-
-        leader_index
+            .unwrap()
     }
 
     /// Atomically updates the `LeaderSwapTable` with the new provided one. Any
@@ -196,7 +186,8 @@ impl LeaderSchedule {
         // preceding commit range of the old swap table.
         if *old_commit_range != CommitRange::default() {
             assert!(
-                old_commit_range.is_next_range(new_commit_range) && old_commit_range.is_equal_size(new_commit_range),
+                old_commit_range.is_next_range(new_commit_range)
+                    && old_commit_range.is_equal_size(new_commit_range),
                 "The new LeaderSwapTable has an invalid CommitRange. Old LeaderSwapTable {old_commit_range:?} vs new LeaderSwapTable {new_commit_range:?}",
             );
         }
@@ -224,10 +215,6 @@ pub(crate) struct LeaderSwapTable {
     /// Storing the hostname & stake along side the authority index for debugging.
     pub(crate) bad_nodes: BTreeMap<AuthorityIndex, (String, Stake)>,
 
-    /// Scores by authority in descending order, needed by other parts of the system
-    /// for a consistent view on how each validator performs in consensus.
-    pub(crate) reputation_scores_desc: Vec<(AuthorityIndex, u64)>,
-
     // The scores for which the leader swap table was built from. This struct is
     // used for debugging purposes. Once `good_nodes` & `bad_nodes` are identified
     // the `reputation_scores` are no longer needed functionally for the swap table.
@@ -244,9 +231,7 @@ impl LeaderSwapTable {
         commit_index: CommitIndex,
         reputation_scores: ReputationScores,
     ) -> Self {
-        let swap_stake_threshold = context
-            .protocol_config
-            .consensus_bad_nodes_stake_threshold();
+        let swap_stake_threshold = context.protocol_config.bad_nodes_stake_threshold();
         Self::new_inner(
             context,
             swap_stake_threshold,
@@ -259,7 +244,7 @@ impl LeaderSwapTable {
         context: Arc<Context>,
         // Ignore linter warning in simtests.
         // TODO: maybe override protocol configs in tests for swap_stake_threshold, and call new().
-        #[allow(unused_variables)] swap_stake_threshold: u64,
+        #[cfg_attr(msim, allow(unused_variables))] swap_stake_threshold: u64,
         commit_index: CommitIndex,
         reputation_scores: ReputationScores,
     ) -> Self {
@@ -285,7 +270,7 @@ impl LeaderSwapTable {
         assert_eq!(authorities_by_score.len(), context.committee.size());
         authorities_by_score.shuffle(&mut rng);
         // Stable sort the authorities by score descending. Order of authorities with the same score is preserved.
-        authorities_by_score.sort_by(|a1, a2| a2.1.cmp(&a1.1));
+        authorities_by_score.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         // Calculating the good nodes
         let good_nodes = Self::retrieve_first_nodes(
@@ -329,7 +314,6 @@ impl LeaderSwapTable {
         Self {
             good_nodes,
             bad_nodes,
-            reputation_scores_desc: authorities_by_score,
             reputation_scores,
         }
     }
@@ -440,7 +424,7 @@ mod tests {
     use crate::{
         block::{TestBlock, VerifiedBlock},
         commit::{CommitDigest, CommitInfo, CommitRef, CommittedSubDag, TrustedCommit},
-        storage::{mem_store::MemStore, Store, WriteBatch},
+        storage::{Store, WriteBatch, mem_store::MemStore},
         test_dag_builder::DagBuilder,
     };
 
@@ -498,7 +482,7 @@ mod tests {
         let mut context = Context::new_for_test(4).0;
         context
             .protocol_config
-            .set_consensus_bad_nodes_stake_threshold_for_testing(33);
+            .set_bad_nodes_stake_threshold_for_testing(33);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
 
@@ -577,7 +561,7 @@ mod tests {
         let mut context = Context::new_for_test(4).0;
         context
             .protocol_config
-            .set_consensus_bad_nodes_stake_threshold_for_testing(33);
+            .set_bad_nodes_stake_threshold_for_testing(33);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
 
@@ -606,7 +590,7 @@ mod tests {
         let mut context = Context::new_for_test(4).0;
         context
             .protocol_config
-            .set_consensus_bad_nodes_stake_threshold_for_testing(33);
+            .set_bad_nodes_stake_threshold_for_testing(33);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
 
@@ -691,7 +675,7 @@ mod tests {
         let mut context = Context::new_for_test(4).0;
         context
             .protocol_config
-            .set_consensus_bad_nodes_stake_threshold_for_testing(33);
+            .set_bad_nodes_stake_threshold_for_testing(33);
         let context = Arc::new(context);
         let leader_schedule = Arc::new(LeaderSchedule::new(
             context.clone(),
@@ -793,9 +777,11 @@ mod tests {
             AuthorityIndex::new_for_test(2)
         );
         assert_eq!(leader_swap_table.bad_nodes.len(), 1);
-        assert!(leader_swap_table
-            .bad_nodes
-            .contains_key(&AuthorityIndex::new_for_test(0)));
+        assert!(
+            leader_swap_table
+                .bad_nodes
+                .contains_key(&AuthorityIndex::new_for_test(0))
+        );
         assert_eq!(
             leader_schedule.elect_leader(4, 0),
             AuthorityIndex::new_for_test(2)
@@ -821,9 +807,11 @@ mod tests {
             AuthorityIndex::new_for_test(3)
         );
         assert_eq!(leader_swap_table.bad_nodes.len(), 1);
-        assert!(leader_swap_table
-            .bad_nodes
-            .contains_key(&AuthorityIndex::new_for_test(0)));
+        assert!(
+            leader_swap_table
+                .bad_nodes
+                .contains_key(&AuthorityIndex::new_for_test(0))
+        );
     }
 
     #[tokio::test]

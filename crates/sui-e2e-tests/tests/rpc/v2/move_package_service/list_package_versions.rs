@@ -2,23 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use move_core_types::ident_str;
-use sui_json_rpc_types::ObjectChange;
 use sui_macros::sim_test;
 use sui_move_build::BuildConfig;
 use sui_rpc::proto::sui::rpc::v2::{
-    move_package_service_client::MovePackageServiceClient, ListPackageVersionsRequest,
+    ListPackageVersionsRequest, move_package_service_client::MovePackageServiceClient,
 };
 use sui_types::{
+    SUI_FRAMEWORK_PACKAGE_ID,
     move_package::UpgradePolicy,
     programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{ObjectArg, TransactionData, TEST_ONLY_GAS_UNIT_FOR_PUBLISH},
-    SUI_FRAMEWORK_PACKAGE_ID,
+    transaction::{ObjectArg, TEST_ONLY_GAS_UNIT_FOR_PUBLISH, TransactionData},
 };
 use test_cluster::TestClusterBuilder;
 
 #[sim_test]
 async fn test_list_package_versions_system_package() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
@@ -41,7 +43,10 @@ async fn test_list_package_versions_system_package() {
 
 #[sim_test]
 async fn test_list_package_versions_with_upgrades() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
@@ -50,7 +55,8 @@ async fn test_list_package_versions_with_upgrades() {
     test_package_path.push("tests/move_test_code");
 
     let compiled_package = BuildConfig::new_for_testing()
-        .build(&test_package_path)
+        .build_async(&test_package_path)
+        .await
         .unwrap();
     let modules = compiled_package.get_package_bytes(false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
@@ -83,35 +89,10 @@ async fn test_list_package_versions_with_upgrades() {
 
     let mut package_ids = vec![];
 
-    let object_changes = response.object_changes.unwrap();
-
-    let initial_package_id = object_changes
-        .iter()
-        .find_map(|object| match object {
-            ObjectChange::Published { package_id, .. } => Some(*package_id),
-            _ => None,
-        })
-        .unwrap();
-
+    let initial_package_id = response.get_new_package_obj().unwrap().0;
     package_ids.push(initial_package_id);
 
-    let mut current_upgrade_cap = object_changes
-        .iter()
-        .find_map(|object| match object {
-            ObjectChange::Created {
-                object_id,
-                object_type,
-                digest,
-                version,
-                ..
-            } if object_type.module.as_str() == "package"
-                && object_type.name.as_str() == "UpgradeCap" =>
-            {
-                Some((*object_id, *version, *digest))
-            }
-            _ => None,
-        })
-        .unwrap();
+    let mut current_upgrade_cap = response.get_new_package_upgrade_cap().unwrap();
 
     let mut request = ListPackageVersionsRequest::default();
     request.package_id = Some(package_ids[0].to_string());
@@ -185,35 +166,10 @@ async fn test_list_package_versions_with_upgrades() {
         .sign_and_execute_transaction(&transaction_data)
         .await;
 
-    let object_changes = response.object_changes.unwrap();
-
-    let new_package_id = object_changes
-        .iter()
-        .find_map(|object| match object {
-            ObjectChange::Published { package_id, .. } => Some(*package_id),
-            _ => None,
-        })
-        .unwrap();
-
+    let new_package_id = response.get_new_package_obj().unwrap().0;
     package_ids.push(new_package_id);
 
-    current_upgrade_cap = object_changes
-        .iter()
-        .find_map(|object| match object {
-            ObjectChange::Mutated {
-                object_id,
-                object_type,
-                digest,
-                version,
-                ..
-            } if object_type.module.as_str() == "package"
-                && object_type.name.as_str() == "UpgradeCap" =>
-            {
-                Some((*object_id, *version, *digest))
-            }
-            _ => None,
-        })
-        .unwrap();
+    current_upgrade_cap = response.get_new_package_upgrade_cap().unwrap();
 
     let grpc_response = service
         .list_package_versions(request.clone())
@@ -289,15 +245,7 @@ async fn test_list_package_versions_with_upgrades() {
         .sign_and_execute_transaction(&transaction_data)
         .await;
 
-    let object_changes = response.object_changes.unwrap();
-
-    let third_package_id = object_changes
-        .iter()
-        .find_map(|object| match object {
-            ObjectChange::Published { package_id, .. } => Some(*package_id),
-            _ => None,
-        })
-        .unwrap();
+    let third_package_id = response.get_new_package_obj().unwrap().0;
 
     package_ids.push(third_package_id);
 
@@ -364,7 +312,10 @@ async fn test_list_package_versions_with_upgrades() {
 
 #[sim_test]
 async fn test_list_package_versions_not_found() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
@@ -379,7 +330,10 @@ async fn test_list_package_versions_not_found() {
 
 #[sim_test]
 async fn test_list_package_versions_invalid_package_id() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
@@ -398,7 +352,10 @@ async fn test_list_package_versions_invalid_package_id() {
 
 #[sim_test]
 async fn test_list_package_versions_missing_package_id() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
@@ -416,7 +373,10 @@ async fn test_list_package_versions_missing_package_id() {
 
 #[sim_test]
 async fn test_list_package_versions_invalid_pagination() {
-    let cluster = TestClusterBuilder::new().build().await;
+    let cluster = TestClusterBuilder::new()
+        .with_num_validators(1)
+        .build()
+        .await;
     let mut service = MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
         .await
         .unwrap();
